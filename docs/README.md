@@ -17,6 +17,11 @@ documented once, here, instead of drifting across three repos.
   shared design. Default vs custom relays, how that single choice also decides
   whether n0 internet discovery is on, relay hints, the shared relay auth token,
   the strict per-relay startup probe, and relay-only mode. **Start here.**
+- **[nat-traversal-and-transport.md](nat-traversal-and-transport.md)** — what the
+  three programs get from `iroh::Endpoint` and never implement themselves:
+  connection establishment, hole punching and relay fallback, NAT traversal by
+  NAT type (including why symmetric NAT and container overlays stay relayed), the
+  QUIC/TLS 1.3 encryption stack, and performance characteristics.
 - **[self-hosting.md](self-hosting.md)** — running your own iroh relay: local
   dev, production with TLS, the single-port Cloudflare Tunnel setup, relay access
   tokens, and how to verify a relay end to end.
