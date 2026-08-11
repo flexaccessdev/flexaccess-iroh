@@ -10,10 +10,14 @@ map iroh uses **and** whether iroh internet discovery (n0 pkarr publish + DNS
 lookup) is enabled. Discovery is *not* independently configurable; it strictly
 follows the relay mode: on for the default relays, off for custom relays.
 
-| | Relay map | n0 pkarr publish | n0 DNS lookup | mDNS | How the dialer finds the peer |
-|---|---|---|---|---|---|
-| **Default** | n0 public relays | with persistent identity only | yes | yes | resolve the published record by endpoint ID |
-| **Custom** | configured relays | never | never | yes | relay hints attached to the peer's `EndpointAddr` |
+| | Relay map | n0 pkarr publish | n0 DNS lookup | How the dialer finds the peer |
+|---|---|---|---|---|
+| **Default** | n0 public relays | with persistent identity only | yes | resolve the published record by endpoint ID |
+| **Custom** | configured relays | never | never | relay hints attached to the peer's `EndpointAddr` |
+
+mDNS is deliberately left out of that table: unlike the n0 lookup stack it does
+**not** follow the relay mode, and it is the one piece of address lookup the
+three programs do not implement alike. See [mDNS](#mdns) below.
 
 ## Background: iroh address lookup
 
@@ -24,8 +28,11 @@ addresses) and publishes it to n0's `iroh-dns-server`; a dialer resolves
 `_iroh.<z32-endpoint-id>.dns.iroh.link TXT` to learn `relay=<url>` / `addr=<addr>`
 and knows where to reach the peer. Two facts matter:
 
-1. An endpoint has **one home relay** at a time. It is reachable for inbound
-   connections only through that relay.
+1. An endpoint has **one home relay** at a time — it holds a persistent
+   connection to exactly one relay, so that relay is its only *relay* route for
+   inbound connections. It is not necessarily the only route: when direct
+   connectivity is available, a dialer can also reach the endpoint through the
+   direct addresses in its published record.
 2. Relay servers are **stateless and independent** — they do not sync who is
    connected where and do not forward to each other. Traffic sent to a relay the
    peer is not connected to goes nowhere.
@@ -69,12 +76,18 @@ failure-mode caveats, and the e2e verification.
 
 ## mDNS
 
-mDNS local-network discovery is independent of the relay mode and stays on in
-both modes. Two exceptions:
+mDNS local-network discovery is independent of the relay mode: where it is
+enabled at all, it stays on in **both** default and custom mode. Unlike the rest
+of the lookup stack, though, it is not uniform across the three programs:
 
-- **iOS**: compiled out — raw multicast requires the
-  `com.apple.developer.networking.multicast` entitlement.
-- **relay-only mode**: skipped along with every other address lookup (see below).
+| Repo | mDNS |
+|---|---|
+| [tunnel-rs] | on in both relay modes; **disabled under `--relay-only`**, which drops every address lookup |
+| [ezvpn] | **never enabled** — the endpoint builder installs no mDNS lookup at all |
+| [flextunnel] | on in both relay modes; **compiled out on iOS**, where raw multicast needs the `com.apple.developer.networking.multicast` entitlement |
+
+So the only place mDNS is switched off *by mode* is tunnel-rs's relay-only mode
+(see below); everywhere else it is a fixed per-program property.
 
 ## Optional shared relay token
 

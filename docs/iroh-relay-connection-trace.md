@@ -42,11 +42,19 @@ proxy between 0.95.x and 1.0.x:
   `Endpoint::online()` now returns only once actually connected to the home
   relay, instead of when net_report merely selected it.
 
-Note: the relay may still log occasional
+Note: the relay may log occasional
 `ERROR iroh_relay::server::http_server: failed to handle connection
 error=Connection did not reach established state within timeout` lines while
-running behind cloudflared. These are harmless — traffic passes and the e2e
-test succeeds despite them.
+running behind cloudflared. These are benign **only when the relay connection and
+the end-to-end health check both succeed** — that is, clients reach `online()`
+and the e2e test passes despite them; they are then just connections (probes,
+scanners, half-open proxy sockets) that never completed the upgrade.
+
+If they persist *and* clients fail to come online, do not dismiss them: the same
+message is what a failed relay handshake, an unreachable relay, or a flaky
+network path produces. Check whether the token is being rejected (see
+[self-hosting.md](self-hosting.md#relay-access-token)) and whether the manual
+upgrade below returns 101.
 
 ## Connection Flow
 
@@ -101,7 +109,15 @@ Upgrade: websocket
 Sec-WebSocket-Key: <random-base64>
 Sec-WebSocket-Version: 13
 Sec-WebSocket-Protocol: iroh-relay-v2, iroh-relay-v1
+Authorization: Bearer <token>          # only when the relay requires a token
 ```
+
+On native targets the relay client sends the token as the `Authorization: Bearer`
+header above. Under Wasm it cannot set request headers, so it appends a
+`?token=<token>` query parameter to the URL instead; the server accepts that as a
+fallback when no `Bearer` header is present. Use the query-parameter form only
+for browser/Wasm checks — native clients and the manual `curl` below should send
+the header.
 
 ### Expected Response
 
@@ -112,6 +128,13 @@ Connection: Upgrade
 Sec-WebSocket-Accept: <computed-hash>
 Sec-WebSocket-Protocol: iroh-relay-v2
 ```
+
+Note the ordering: iroh-relay returns this `101` as soon as the upgrade headers
+check out, **before** the relay handshake and its access-control check. A relay
+with `access.shared_token` configured therefore answers `101` even to a request
+with a wrong or missing token, and drops the connection during the handshake that
+follows. A `101` proves the upgrade path works, not that the token was accepted —
+that is decided in step 5 of `ClientBuilder::connect()` above.
 
 ## Manual verification
 
@@ -131,8 +154,15 @@ curl -v --no-alpn \
   -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
   -H "Sec-WebSocket-Version: 13" \
   -H "Sec-WebSocket-Protocol: iroh-relay-v2, iroh-relay-v1" \
+  -H "Authorization: Bearer $IROH_RELAY_TOKEN" \
   https://relay.example.com/relay
 ```
+
+Drop the `Authorization` header for a relay with no `access.shared_token`. Keep in
+mind it does not change the result either way — as noted above, `101` comes back
+before the token is ever checked, so this command verifies reachability and the
+upgrade, not authorization. For that, run the end-to-end check in
+[self-hosting.md](self-hosting.md#verifying-a-relay).
 
 Caveats confirmed against a live named tunnel (2026-07-19):
 

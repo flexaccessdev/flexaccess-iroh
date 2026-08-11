@@ -20,8 +20,8 @@ documented once, here, instead of drifting across three repos.
 - **[nat-traversal-and-transport.md](nat-traversal-and-transport.md)** — what the
   three programs get from `iroh::Endpoint` and never implement themselves:
   connection establishment, hole punching and relay fallback, NAT traversal by
-  NAT type (including why symmetric NAT and container overlays stay relayed), the
-  QUIC/TLS 1.3 encryption stack, and performance characteristics.
+  NAT type (including why symmetric NAT and container overlays usually stay
+  relayed), the QUIC/TLS 1.3 encryption stack, and performance characteristics.
 - **[self-hosting.md](self-hosting.md)** — running your own iroh relay: local
   dev, production with TLS, the single-port Cloudflare Tunnel setup, relay access
   tokens, and how to verify a relay end to end.
@@ -44,11 +44,13 @@ programs. See [self-hosting.md](self-hosting.md#verifying-a-relay).
 ## Scope
 
 In scope: anything about the iroh transport layer that is (or should be) the same
-in all three — relay configuration and validation, address lookup and discovery,
-NAT traversal behavior, relay operations.
+in all three — **relay configuration and validation**, address lookup and
+discovery, NAT traversal behavior, relay operations.
 
 Out of scope: each program's own architecture, protocol, authentication, and
-configuration. Those stay in their own repos.
+**product-specific configuration** (tunnel sources and targets, VPN addressing,
+proxy listeners, and every other setting that is not the iroh transport). Those
+stay in their own repos.
 
 ## Keeping this in sync
 

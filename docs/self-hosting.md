@@ -26,7 +26,7 @@ in [relays-and-address-lookup.md](relays-and-address-lookup.md#custom-relays).
 ## Quick start: local relay
 
 ```bash
-cargo install iroh-relay
+cargo install iroh-relay --version 1.0.2
 iroh-relay --dev  # local testing on http://localhost:3340
 ```
 
@@ -42,18 +42,26 @@ iroh-relay --dev  # local testing on http://localhost:3340
 > `enable_quic_addr_discovery = true`.
 
 > [!NOTE]
-> **No relay-level client whitelisting.** A self-hosted relay must allow all
-> client IDs (like the public iroh relay), because clients use ephemeral
-> `EndpointId`s that change on each run. Rely on each program's own application
-> authentication for access control — Ed25519 public-key auth in tunnel-rs and
-> flextunnel, the VPN handshake in ezvpn. For relay-level access control, use the
-> shared bearer token below.
+> **Endpoint-ID allowlisting is usually the wrong tool here.** iroh-relay 1.0.2
+> *does* support `access.allowlist` and `access.denylist` (lists of
+> `EndpointId`s), alongside `access.http` for an external authorization endpoint.
+> But all three programs give clients **ephemeral** endpoint identities that
+> change on every run, so a static allowlist cannot enumerate them and would
+> reject legitimate clients — only long-lived identities (a server's
+> `secret_file`) are stable enough to list.
+>
+> Primary access control therefore belongs to each program's own application
+> authentication — Ed25519 public-key auth in tunnel-rs and flextunnel, the VPN
+> handshake in ezvpn — with the [shared bearer token](#relay-access-token) below
+> gating the relay itself. `access.allowlist` / `access.denylist` remain useful as
+> defense in depth where the identities *are* stable (pinning a known set of
+> servers, or blocking a specific abusive endpoint).
 
 ## Production relay with TLS
 
 ```bash
-cargo install iroh-relay
-iroh-relay --config relay.toml
+cargo install iroh-relay --version 1.0.2
+iroh-relay --config-path relay.toml   # -c is the short form; there is no --config
 ```
 
 Example `relay.toml`:
@@ -98,7 +106,9 @@ enable_metrics = false
 # metrics_bind_addr = "127.0.0.1:9099"
 
 # Recommended for a publicly reachable relay: require a bearer token.
-# access.shared_token = ["change-me-to-a-long-random-secret"]
+# Generate a real one before starting (see "Relay access token" below) — never
+# ship the literal placeholder:
+# access.shared_token = ["<paste output of: openssl rand -base64 32>"]
 ```
 
 **1. Run the relay** (no `--dev`):
@@ -148,11 +158,31 @@ cloudflared tunnel run --token <token>
 ## Relay access token
 
 For a publicly reachable relay, require a shared bearer token so only your
-deployments can use it:
+deployments can use it. **Generate a unique secret before first start** — a
+guessable or copy-pasted token is the same as having no access control:
+
+```bash
+openssl rand -base64 32   # or: head -c 32 /dev/urandom | base64
+```
+
+Put it in the config file:
 
 ```toml
-access.shared_token = ["change-me-to-a-long-random-secret"]
+access.shared_token = ["<the generated secret>"]
 ```
+
+…or keep it out of the config entirely by setting the environment variable, which
+**takes precedence over `access.shared_token`** and sets a single allowed token:
+
+```bash
+IROH_RELAY_ACCESS_TOKEN="<the generated secret>" iroh-relay -c relay-prod.toml
+```
+
+Either way the relay refuses to start if the token list is empty or contains an
+empty string, so a misconfigured token fails loudly rather than silently
+disabling access control. Use the config-file form (which accepts a *list*) when
+you need to rotate: serve both the old and new token, migrate the clients, then
+drop the old one.
 
 Then configure the same token on **both** sides of every program. It is only
 ever accepted alongside custom relay URLs — supplying it without them is a hard
@@ -179,6 +209,11 @@ alone is carrying traffic):
 ./test-scripts/run_e2e.sh --relay-url https://relay.example.com --relay-only
 ```
 
+> The snippets in this section assume a **tokenless** relay. If the relay has
+> `access.shared_token` set, the token must also be supplied — for tunnel-rs, via
+> `TUNNEL_RS_RELAY_AUTH_TOKEN` or `--relay-auth-token` (see the table above);
+> without it the relay rejects the connection and startup fails.
+
 **Two-relay failover behavior**, fully offline, against local
 `iroh-relay --dev` instances:
 
@@ -186,8 +221,8 @@ alone is carrying traffic):
 ./test-scripts/run_relay_failover_e2e.sh
 ```
 
-**Just the WebSocket upgrade**, without running a tunnel. `--no-alpn` disables
-the TLS ALPN extension, matching what the iroh relay client sends:
+**Just the HTTP/WebSocket upgrade**, without running a tunnel. `--no-alpn`
+disables the TLS ALPN extension, matching what the iroh relay client sends:
 
 ```bash
 # Should return 101 Switching Protocols
@@ -197,14 +232,30 @@ curl -v --no-alpn \
   -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
   -H "Sec-WebSocket-Version: 13" \
   -H "Sec-WebSocket-Protocol: iroh-relay-v2, iroh-relay-v1" \
+  -H "Authorization: Bearer $IROH_RELAY_TOKEN" \
   https://relay.example.com/relay
 ```
 
+> [!IMPORTANT]
+> **A 101 does not mean your token was accepted.** This checks the HTTP and
+> WebSocket upgrade only — that the relay (and anything proxying it) is reachable
+> and speaks the upgrade correctly. In iroh-relay 1.0.2 the server returns `101
+> Switching Protocols` *before* the relay handshake runs, and the access-control
+> check (`access.shared_token`, `allowlist`, `denylist`, `http`) happens after
+> that, inside the relay protocol handshake. A relay with a token configured
+> answers `101` to this request even with the `Authorization` header omitted or
+> wrong; the connection is dropped a moment later.
+>
+> Validating the token needs a relay-protocol-aware client configured with it —
+> which is exactly what the per-relay startup probe is, so **the end-to-end
+> tunnel-rs run above is the real token check.** Include the header here anyway,
+> so the command matches what a genuine client sends.
+
 A bare `curl https://relay.example.com/relay` returns `400 Bad Request` — that is
 the relay answering any non-WebSocket request, not a proxy problem. Only the full
-upgrade request above is a meaningful health check. The relay's `/healthz` route
-is also unauthenticated, so it confirms the relay is *up* but not that your token
-is accepted.
+upgrade request above is a meaningful reachability check. The relay's `/healthz`
+route is likewise unauthenticated, so it too confirms the relay is *up* and
+nothing more.
 
 ## Using your infrastructure
 
@@ -232,7 +283,10 @@ fallback**:
 
 1. The initial connection goes through the relay for signaling.
 2. iroh attempts coordinated hole punching (similar to libp2p's DCUtR).
-3. If it succeeds (~70% of the time), traffic flows directly between peers.
+3. If it succeeds, traffic flows directly between peers. How often that happens
+   varies with network conditions — NAT type and filtering behavior on both
+   sides, address family, and any upstream CGNAT all matter; see
+   [nat-traversal-and-transport.md](nat-traversal-and-transport.md#nat-traversal-capability-by-nat-type).
 4. If hole punching fails, **traffic continues through the relay**.
 
 > [!NOTE]

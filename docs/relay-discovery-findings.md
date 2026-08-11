@@ -21,9 +21,15 @@ automatically?
 
 It can be disabled. With custom relays on both sides, discovery adds nothing to
 connection establishment, and leaving the default (n0) discovery on was actively
-undesirable: the server published its custom relay URL and addresses to iroh's
-public DNS — an internet dependency and an information leak for otherwise
-self-contained deployments.
+undesirable: an endpoint with a **persistent identity** (the only case in which
+`PkarrPublisher` is installed — see [Default relays][defaults]) published its
+custom relay URL and addresses to iroh's public DNS. That is an internet
+dependency for an otherwise self-contained deployment, and, for those persistent
+endpoints, an information leak. Ephemeral endpoints publish no record either way,
+so the leak never applied to them — but the internet dependency did, since they
+still resolved through `dns.iroh.link`.
+
+[defaults]: relays-and-address-lookup.md#default-relays
 
 ## Mechanism (iroh 1.0.2 internals)
 

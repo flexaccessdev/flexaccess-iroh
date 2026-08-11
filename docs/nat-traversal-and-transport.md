@@ -1,9 +1,17 @@
 # NAT Traversal and the QUIC Transport
 
-What [tunnel-rs], [ezvpn], and [flextunnel] all get from iroh, and behave
-identically in: peer discovery, hole punching, relay fallback, and the QUIC/TLS
-1.3 encryption stack. None of the three implements any of this itself — they
-configure an `iroh::Endpoint` and hand it an ALPN.
+[tunnel-rs], [ezvpn], and [flextunnel] share the same iroh transport stack: hole
+punching, relay fallback, and the QUIC/TLS 1.3 encryption stack are iroh's, and
+none of the three implements any of it itself — they configure an
+`iroh::Endpoint` and hand it an ALPN. Those shared transport primitives are what
+this document describes.
+
+What the three do *not* share is how they configure that endpoint. Address
+lookup, relay-only mode, and platform behavior differ per program — ezvpn runs no
+mDNS at all, tunnel-rs is the only one with a user-facing relay-only mode, and
+flextunnel compiles mDNS out on iOS. See
+[relays-and-address-lookup.md](relays-and-address-lookup.md) for the per-repo
+matrix.
 
 For how relays are *configured* (default vs custom, hints, the startup probe),
 see [relays-and-address-lookup.md](relays-and-address-lookup.md). For running
@@ -51,10 +59,15 @@ sequenceDiagram
     Note over S,C: Encrypted QUIC connection established
 ```
 
-The relay is used for **both** signaling and as a data fallback. The connection
-starts relayed and upgrades to direct in the background if hole punching
-succeeds — an established connection can switch paths mid-life, so all three
-programs log the selected path and re-log on change (relay → direct).
+The relay is used for **both** signaling and as a data fallback. iroh sends the
+QUIC Initials to *all* known paths at once — every candidate direct address and
+every relay hint — so the initially selected path may be either direct or
+relayed, depending on which one answers first. On a LAN, or when a direct address
+is already known and reachable, a connection can be direct from the very first
+packet; where a direct path is not (yet) usable, it starts relayed. Either way an
+established connection can switch paths mid-life, so all three programs log the
+selected path and re-log on change (the relay → direct upgrade after a successful
+hole punch being the common case).
 
 With custom relays there is no discovery step: the dialer supplies the relay
 URLs as hints instead. Everything after that is the same.
@@ -70,11 +83,11 @@ graph LR
         D[Symmetric]
     end
 
-    subgraph "Outcome"
-        E1[Direct, relay fallback]
-        E2[Direct, relay fallback]
-        E3[Direct, relay fallback]
-        E4[Relay only]
+    subgraph "Typical outcome"
+        E1[Direct likely, relay fallback]
+        E2[Direct likely, relay fallback]
+        E3[Direct likely, relay fallback]
+        E4[Direct unlikely, usually relayed]
     end
 
     A --> E1
@@ -88,21 +101,30 @@ graph LR
     style E4 fill:#FFF9C4
 ```
 
-Every NAT type connects; what varies is whether the path can be upgraded to
-direct. Roughly ~70% of connections in the wild reach a direct path.
+Every NAT type **connects** — that part does not vary, because the relay is
+always available as a fallback. What varies is the likelihood that the path can
+be upgraded to direct, and NAT type alone does not decide it: the endpoint's
+port-mapping and filtering behavior, the address family (IPv6 often needs no hole
+punching at all), and any *additional* upstream NAT (CGNAT, a second router) all
+move the outcome. Treat the table as a rule of thumb, not a guarantee — the only
+way to know is to look at the path the program logs.
 
 ### Symmetric NAT and container overlays
 
-Symmetric NAT assigns a different external port per destination, which defeats
-STUN-based hole punching — those connections stay on the relay for their whole
-life. This is not a failure mode to fix, but it does mean **relay bandwidth must
-be sized for the peers that cannot hole-punch**.
+Symmetric NAT assigns a different external port per destination, so the port a
+STUN probe observes is not the port the peer will actually send to. This often
+defeats hole punching and leaves those connections on the relay. It is not a
+failure mode to fix, but it does mean **relay bandwidth must be sized for the
+peers that cannot hole-punch**.
 
 The common surprise here is Kubernetes and similar container overlays: their
-conntrack-based NAT behaves symmetrically, so pods on overlay networking always
-fall back to relay. Running with host networking bypasses the overlay and
-restores hole punching, at the cost of port conflicts and losing network-policy
-enforcement.
+conntrack-based NAT frequently behaves symmetrically, so pods on overlay
+networking commonly fall back to relay. Running with `hostNetwork` puts the
+process in the node's network namespace instead of the pod's, removing the
+overlay from the path — whatever direct connectivity the *node* has then applies,
+which usually restores hole punching but does not guarantee it (the node may
+still sit behind a symmetric NAT of its own). The cost is port conflicts on the
+node and losing pod-level network-policy enforcement.
 
 ## Encryption stack
 
