@@ -101,15 +101,25 @@ graph LR
     style E4 fill:#FFF9C4
 ```
 
-Every NAT type **connects** — that part does not vary, because the relay is
-always available as a fallback. What varies is the likelihood that the path can
-be upgraded to direct, and NAT type alone does not decide it: the endpoint's
-port-mapping and filtering behavior, the address family (IPv6 often needs no hole
-punching at all), and any *additional* upstream NAT (CGNAT, a second router) all
-move the outcome. Treat the table as a rule of thumb, not a guarantee — the only
-way to know is to look at the path the program logs.
+Under **any** NAT type a connection can still be carried by a relay — but only
+when relay mode is enabled *and* at least one configured relay is actually
+reachable from both peers. Neither is automatic: `RelayMode::Disabled` turns
+relaying off entirely (all three programs leave relays on for real endpoints, so
+this is normally a given), and a relay that is down, blocked by an egress
+firewall, or rejecting the auth token is no fallback at all. When there is no
+usable relay and hole punching fails, the connection fails. The per-relay startup
+probe exists precisely to make that failure loud at startup rather than silent
+later; see
+[relays-and-address-lookup.md](relays-and-address-lookup.md#custom-relay-validation-the-per-relay-startup-probe).
 
-### Symmetric NAT and container overlays
+Given a working relay, what the NAT type actually influences is the likelihood of
+upgrading to a *direct* path — and NAT type alone does not decide that either:
+the endpoint's port-mapping and filtering behavior, the address family (IPv6
+often needs no hole punching at all), and any *additional* upstream NAT (CGNAT, a
+second router) all move the outcome. Treat the table as a rule of thumb, not a
+guarantee — the only way to know is to look at the path the program logs.
+
+### Symmetric NAT
 
 Symmetric NAT assigns a different external port per destination, so the port a
 STUN probe observes is not the port the peer will actually send to. This often
@@ -117,14 +127,37 @@ defeats hole punching and leaves those connections on the relay. It is not a
 failure mode to fix, but it does mean **relay bandwidth must be sized for the
 peers that cannot hole-punch**.
 
-The common surprise here is Kubernetes and similar container overlays: their
-conntrack-based NAT frequently behaves symmetrically, so pods on overlay
-networking commonly fall back to relay. Running with `hostNetwork` puts the
-process in the node's network namespace instead of the pod's, removing the
-overlay from the path — whatever direct connectivity the *node* has then applies,
-which usually restores hole punching but does not guarantee it (the node may
-still sit behind a symmetric NAT of its own). The cost is port conflicts on the
-node and losing pod-level network-policy enforcement.
+### Kubernetes and container networking
+
+Kubernetes is where this most often comes up, but "pods are behind symmetric NAT"
+is not a property of Kubernetes — it is a property of the **CNI plugin and the
+path**, and it varies widely:
+
+- Pod egress to the internet is usually **SNAT'd by the node**. Whether that
+  mapping is endpoint-independent (cone-like, hole-punchable) or
+  endpoint-dependent (symmetric-like, not) depends on the CNI, the kube-proxy
+  backend (iptables / IPVS / eBPF), and the node's own conntrack and NAT settings.
+- Some setups have **no overlay NAT at all** on the path — CNIs that give pods
+  natively routable addresses (AWS VPC CNI, Calico with BGP, many IPv6 and
+  dual-stack deployments) can hole-punch from inside a pod.
+- The node itself may sit behind a cloud NAT gateway or CGNAT, so removing the
+  pod-level NAT does not necessarily remove the *last* one.
+- Egress firewalls and `NetworkPolicy` can block the UDP that hole punching needs
+  regardless of NAT type.
+
+So do not treat `hostNetwork: true` as the standing fix. **Diagnose first:**
+identify the CNI and kube-proxy mode in use, then read the path the program logs
+(direct vs. relayed) from inside a normal pod. If pods already go direct, moving
+to host networking buys nothing.
+
+If diagnosis does point at pod-level NAT, `hostNetwork` puts the process in the
+node's network namespace instead of the pod's, removing the overlay from the
+path — whatever direct connectivity the *node* has then applies, which may or may
+not restore hole punching for the reasons above. The costs are real: port
+conflicts on the node, and **`NetworkPolicy` enforcement for host-network pods is
+plugin-dependent and not guaranteed** — several plugins do not apply pod policies
+to host-network traffic at all, so verify against your CNI's documentation rather
+than assuming either way.
 
 ## Encryption stack
 

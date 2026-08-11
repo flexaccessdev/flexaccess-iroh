@@ -20,8 +20,9 @@ documented once, here, instead of drifting across three repos.
 - **[nat-traversal-and-transport.md](nat-traversal-and-transport.md)** — what the
   three programs get from `iroh::Endpoint` and never implement themselves:
   connection establishment, hole punching and relay fallback, NAT traversal by
-  NAT type (including why symmetric NAT and container overlays usually stay
-  relayed), the QUIC/TLS 1.3 encryption stack, and performance characteristics.
+  NAT type (including symmetric NAT, and why Kubernetes networking depends on the
+  CNI rather than on Kubernetes itself), the QUIC/TLS 1.3 encryption stack, and
+  performance characteristics.
 - **[self-hosting.md](self-hosting.md)** — running your own iroh relay: local
   dev, production with TLS, the single-port Cloudflare Tunnel setup, relay access
   tokens, and how to verify a relay end to end.
