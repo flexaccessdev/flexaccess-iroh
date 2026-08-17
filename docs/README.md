@@ -51,7 +51,9 @@ discovery, NAT traversal behavior, relay operations.
 Out of scope: each program's own architecture, protocol, authentication, and
 **product-specific configuration** (tunnel sources and targets, VPN addressing,
 proxy listeners, and every other setting that is not the iroh transport). Those
-stay in their own repos.
+stay in their own repos. The app-independent Ed25519 key format and tooling used
+by those product-specific authentication protocols lives separately in
+[`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys).
 
 ## Keeping this in sync
 
@@ -61,6 +63,6 @@ and note any deliberate per-repo divergence in the "Where this lives in each
 repo" table in
 [relays-and-address-lookup.md](relays-and-address-lookup.md#where-this-lives-in-each-repo).
 
-[tunnel-rs]: https://github.com/andrewtheguy/tunnel-rs
+[tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel

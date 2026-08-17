@@ -101,6 +101,6 @@ INFO tunnel_rs::iroh_mode::endpoint] Internet discovery disabled (custom relays 
 mDNS local-network discovery remains enabled; relay-only mode skips all
 discovery including mDNS.
 
-[tunnel-rs]: https://github.com/andrewtheguy/tunnel-rs
+[tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel

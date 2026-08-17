@@ -176,6 +176,6 @@ Caveats confirmed against a live named tunnel (2026-07-19):
   whenever the client doesn't offer `h2` via ALPN, which the iroh client never
   does.
 
-[tunnel-rs]: https://github.com/andrewtheguy/tunnel-rs
+[tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel

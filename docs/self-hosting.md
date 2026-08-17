@@ -295,6 +295,6 @@ fallback**:
 > cannot be established. Size relay bandwidth for the traffic of peers that
 > cannot hole-punch.
 
-[tunnel-rs]: https://github.com/andrewtheguy/tunnel-rs
+[tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel
