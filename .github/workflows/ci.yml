@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: clippy + test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--all-features"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: Clippy
+        run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+      - name: Test
+        run: cargo test ${{ matrix.features }}
+
+  # The crate declares `iroh` as a range; make sure it still builds against
+  # the lowest version that range admits, so a newer API cannot sneak in
+  # unnoticed (a consumer may lock the minimum).
+  minimum-iroh:
+    name: build against minimum iroh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: minimum-iroh
+      - name: Pin iroh to the lower bound
+        run: |
+          MIN=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].dependencies[] | select(.name == "iroh") | .req' \
+            | grep -oE '>=[0-9]+\.[0-9]+\.[0-9]+' | tr -d '>=')
+          echo "minimum iroh: $MIN"
+          cargo update -p iroh --precise "$MIN"
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-features

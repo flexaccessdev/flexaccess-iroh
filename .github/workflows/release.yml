@@ -1,0 +1,80 @@
+name: Release (Manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::Could not parse version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate tag
+        id: tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Tag and name are always derived from the Cargo.toml version so the
+          # flow is uniform across releases and prereleases. Whether it's a
+          # prerelease is decided purely by the branch this workflow runs
+          # against (anything other than main).
+          echo "release_tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "release_title=Prerelease v$VERSION" >> "$GITHUB_OUTPUT"
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_title=Release v$VERSION" >> "$GITHUB_OUTPUT"
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Abort if tag already exists
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.tag.outputs.release_tag }}" | grep -q .; then
+            echo "::error::Tag ${{ steps.tag.outputs.release_tag }} already exists on remote"
+            exit 1
+          fi
+
+      # A library crate ships no binaries: the tag is the release artifact
+      # (consumers depend on it), so make sure what gets tagged is green.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          args=()
+          if [ "${{ steps.tag.outputs.is_prerelease }}" = "true" ]; then
+            args+=(--prerelease)
+          else
+            # Generate notes against the previous *stable* release, not the latest prerelease.
+            prev_stable=$(gh release list --exclude-pre-releases --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName // empty')
+            if [ -n "$prev_stable" ]; then
+              args+=(--notes-start-tag "$prev_stable")
+            fi
+          fi
+          gh release create "${{ steps.tag.outputs.release_tag }}" \
+            --target "${{ github.sha }}" \
+            --title "${{ steps.tag.outputs.release_title }}" \
+            --generate-notes \
+            "${args[@]}"
