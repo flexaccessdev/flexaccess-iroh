@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use futures::future::join_all;
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, endpoint::presets};
 use log::info;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`Custom`](Self::Custom) uses the configured relays with n0 internet
 /// discovery disabled (dialers use relay hints instead). mDNS local-network
 /// discovery is independent of this choice (see the `mdns` feature).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum RelayConfig {
     /// iroh's default relay map, with n0 address lookup.
     #[default]
@@ -41,6 +42,31 @@ pub enum RelayConfig {
         urls: Vec<RelayUrl>,
         auth_token: Option<String>,
     },
+}
+
+/// Manual `Debug` so the relay auth token is never written to logs or error
+/// messages: `Custom.auth_token` is shown only as a redacted marker (present
+/// vs. absent), while `urls` keep their normal `Debug` formatting.
+impl fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => f.write_str("Default"),
+            Self::Custom { urls, auth_token } => f
+                .debug_struct("Custom")
+                .field("urls", urls)
+                .field("auth_token", &auth_token.as_ref().map(|_| RedactedToken))
+                .finish(),
+        }
+    }
+}
+
+/// Placeholder used in place of the real auth token in `Debug` output.
+struct RedactedToken;
+
+impl fmt::Debug for RedactedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 impl RelayConfig {
@@ -147,7 +173,10 @@ impl RelayConfig {
 /// exactly as it does for the real endpoint, so the probe validates the token
 /// too. iroh's default QUIC transport settings are fine here: the probe only
 /// needs the relay link to come up, never a data path.
-fn probe_endpoint_builder(relay_url: &RelayUrl, auth_token: Option<&str>) -> iroh::endpoint::Builder {
+fn probe_endpoint_builder(
+    relay_url: &RelayUrl,
+    auth_token: Option<&str>,
+) -> iroh::endpoint::Builder {
     let map = RelayMap::from_iter([relay_url.clone()]);
     let map = match auth_token {
         Some(token) => map.with_auth_token(token.to_string()),
@@ -298,10 +327,28 @@ mod tests {
     #[test]
     fn token_is_trimmed_to_none_with_custom_urls() {
         // A blank token alongside custom relays is simply no token, not an error.
-        let cfg =
-            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("  ".to_string())).unwrap();
+        let cfg = RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("  ".to_string()))
+            .unwrap();
         assert!(cfg.is_custom());
         assert_eq!(cfg.relay_auth_token(), None);
+    }
+
+    #[test]
+    fn debug_output_redacts_auth_token() {
+        let cfg =
+            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("secret".to_string()))
+                .unwrap();
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("secret"),
+            "token leaked in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"), "unexpected Debug output: {dbg}");
+        assert!(dbg.contains(RELAY), "urls missing from Debug output: {dbg}");
+
+        let no_token = RelayConfig::from_urls(&[RELAY.to_string()]).unwrap();
+        assert!(format!("{no_token:?}").contains("auth_token: None"));
+        assert_eq!(format!("{:?}", RelayConfig::Default), "Default");
     }
 
     #[test]
