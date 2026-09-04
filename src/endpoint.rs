@@ -1,6 +1,9 @@
 //! Endpoint construction shared by every FlexAccess program: the common
-//! builder, the creation-vs-rebuild policy, a rebuildable endpoint handle, and
-//! the persistent secret-key file loader.
+//! builder, the creation-vs-rebuild policy, and a rebuildable endpoint handle.
+//!
+//! Identity is the application's: it reads and decodes its own secret-key
+//! file (or generates an ephemeral key) and binds the resulting
+//! [`iroh::SecretKey`] on the builder itself.
 //!
 //! Applications layer their own ALPNs, hooks, identity, and QUIC transport
 //! tuning onto the [`iroh::endpoint::Builder`] returned by
@@ -9,15 +12,13 @@
 
 use crate::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig, probe_custom_relays};
 use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use futures::future::BoxFuture;
 use iroh::{
-    Endpoint, EndpointId, SecretKey,
+    Endpoint, EndpointId,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, QuicTransportConfig, presets},
 };
 use log::info;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -263,109 +264,9 @@ impl RebuildableEndpoint {
     }
 }
 
-/// Load a persistent iroh secret key from its key file (see
-/// [`load_secret_from_string`] for the accepted contents).
-///
-/// A missing file is an error naming the path; the application adds its own
-/// "generate one with ..." hint as context.
-pub fn load_secret(path: &Path) -> Result<SecretKey> {
-    if !path.exists() {
-        anyhow::bail!("Secret key file not found: {}", path.display());
-    }
-    let content = std::fs::read_to_string(path).context("Failed to read secret key file")?;
-    load_secret_from_string(&content)
-        .with_context(|| format!("Invalid secret key file {}", path.display()))
-}
-
-/// Load a secret key from its base64 encoding: either the bare key, or a whole
-/// generated key file whose leading `#` headers carry the creation time and
-/// endpoint id. Blank lines are ignored, so the same value works from a file,
-/// an inline config `secret`, or an environment variable.
-pub fn load_secret_from_string(base64_key: &str) -> Result<SecretKey> {
-    let base64_key = base64_key
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .context("No secret key found (expected a base64 key line)")?;
-    let bytes = BASE64
-        .decode(base64_key)
-        .context("Invalid base64 in secret key")?;
-    SecretKey::try_from(&bytes[..]).context("Invalid secret key (must be 32 bytes)")
-}
-
-/// The endpoint id (public key) a secret key gives an endpoint.
-pub fn secret_to_endpoint_id(secret: &SecretKey) -> EndpointId {
-    secret.public()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn load_secret_skips_comment_header() {
-        let secret = SecretKey::generate();
-        let encoded = BASE64.encode(secret.to_bytes());
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "# created: 2026-08-13T01:02:03Z\n# public key: {}\n\n{}",
-            secret.public(),
-            encoded
-        )
-        .unwrap();
-        let loaded = load_secret(file.path()).unwrap();
-        assert_eq!(loaded.public(), secret.public());
-
-        // A bare secret with no comments still loads.
-        let mut bare = tempfile::NamedTempFile::new().unwrap();
-        writeln!(bare, "{encoded}").unwrap();
-        assert_eq!(load_secret(bare.path()).unwrap().public(), secret.public());
-
-        // Comments only — no secret line — is a hard error.
-        let mut empty = tempfile::NamedTempFile::new().unwrap();
-        writeln!(empty, "# created: 2026-08-13T01:02:03Z").unwrap();
-        let err = load_secret(empty.path()).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("No secret key found"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn load_secret_from_string_accepts_a_whole_key_file() {
-        // An inline secret (config value, env var) may be a pasted key file.
-        let secret = SecretKey::generate();
-        let key_file = format!(
-            "# server secret key\n# Created: 2026-08-11T00:00:00Z\n# EndpointId: {}\n\n{}\n",
-            secret.public(),
-            BASE64.encode(secret.to_bytes())
-        );
-        assert_eq!(
-            load_secret_from_string(&key_file).unwrap().public(),
-            secret.public()
-        );
-        let err = load_secret_from_string("# Created: 2026-08-11T00:00:00Z\n").unwrap_err();
-        assert!(err.to_string().contains("No secret key found"), "{err}");
-    }
-
-    #[test]
-    fn load_secret_missing_file_names_the_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.key");
-        let err = load_secret(&path).unwrap_err();
-        assert!(err.to_string().contains("missing.key"), "{err}");
-    }
-
-    #[test]
-    fn load_secret_from_string_rejects_bad_input() {
-        assert!(load_secret_from_string("!!!").is_err());
-        assert!(load_secret_from_string(&BASE64.encode([0u8; 16])).is_err());
-        let secret = SecretKey::generate();
-        let ok = load_secret_from_string(&BASE64.encode(secret.to_bytes())).unwrap();
-        assert_eq!(secret_to_endpoint_id(&ok), secret.public());
-    }
 
     #[tokio::test]
     async fn rebuildable_endpoint_swaps_and_closes_the_old_one() {
