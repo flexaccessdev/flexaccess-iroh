@@ -35,6 +35,12 @@ pub struct EndpointOptions {
     /// resolve it by id; a client that only dials out should not advertise
     /// itself.
     pub publish_address: bool,
+    /// Reach peers **only** through the configured relays: the direct IP
+    /// transports are dropped and no address lookup of any kind (n0 internet
+    /// discovery, mDNS) is added, so nothing can ever produce a direct path.
+    /// A testing and reference mode for a self-hosted relay deployment; only
+    /// meaningful with custom relays (the default relays are rate-limited).
+    pub relay_only: bool,
 }
 
 /// Create a base endpoint builder with the common configuration.
@@ -54,6 +60,9 @@ pub struct EndpointOptions {
 ///
 /// With the `mdns` feature, mDNS local-network discovery is added independent
 /// of the relay mode (except on iOS, where it is compiled out).
+///
+/// [`EndpointOptions::relay_only`] overrides all of that: the IP transports
+/// are cleared and no address lookup at all is added.
 pub fn endpoint_builder(relay_config: &RelayConfig, options: EndpointOptions) -> EndpointBuilder {
     // iroh 1.x requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
@@ -62,6 +71,11 @@ pub fn endpoint_builder(relay_config: &RelayConfig, options: EndpointOptions) ->
         .relay_mode(relay_config.relay_mode())
         .transport_config(options.transport_config)
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
+
+    if options.relay_only {
+        info!("Relay-only mode: no direct paths and no address lookup");
+        return builder.clear_ip_transports();
+    }
 
     if relay_config.is_custom() {
         info!("Internet discovery disabled (custom relays configured)");
@@ -249,9 +263,8 @@ impl RebuildableEndpoint {
     }
 }
 
-/// Load a persistent iroh secret key from its key file: the base64 secret on
-/// the first line that is neither blank nor a `#` comment (generated key files
-/// carry `# created:` / `# public key:` headers above the secret).
+/// Load a persistent iroh secret key from its key file (see
+/// [`load_secret_from_string`] for the accepted contents).
 ///
 /// A missing file is an error naming the path; the application adds its own
 /// "generate one with ..." hint as context.
@@ -260,21 +273,20 @@ pub fn load_secret(path: &Path) -> Result<SecretKey> {
         anyhow::bail!("Secret key file not found: {}", path.display());
     }
     let content = std::fs::read_to_string(path).context("Failed to read secret key file")?;
-    let Some(line) = content
+    load_secret_from_string(&content)
+        .with_context(|| format!("Invalid secret key file {}", path.display()))
+}
+
+/// Load a secret key from its base64 encoding: either the bare key, or a whole
+/// generated key file whose leading `#` headers carry the creation time and
+/// endpoint id. Blank lines are ignored, so the same value works from a file,
+/// an inline config `secret`, or an environment variable.
+pub fn load_secret_from_string(base64_key: &str) -> Result<SecretKey> {
+    let base64_key = base64_key
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
-    else {
-        anyhow::bail!(
-            "No secret key found in {} (only blank lines or `#` comments)",
-            path.display()
-        );
-    };
-    load_secret_from_string(line)
-}
-
-/// Load a secret key from a base64-encoded string.
-pub fn load_secret_from_string(base64_key: &str) -> Result<SecretKey> {
+        .context("No secret key found (expected a base64 key line)")?;
     let bytes = BASE64
         .decode(base64_key)
         .context("Invalid base64 in secret key")?;
@@ -315,6 +327,26 @@ mod tests {
         let mut empty = tempfile::NamedTempFile::new().unwrap();
         writeln!(empty, "# created: 2026-08-13T01:02:03Z").unwrap();
         let err = load_secret(empty.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("No secret key found"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn load_secret_from_string_accepts_a_whole_key_file() {
+        // An inline secret (config value, env var) may be a pasted key file.
+        let secret = SecretKey::generate();
+        let key_file = format!(
+            "# server secret key\n# Created: 2026-08-11T00:00:00Z\n# EndpointId: {}\n\n{}\n",
+            secret.public(),
+            BASE64.encode(secret.to_bytes())
+        );
+        assert_eq!(
+            load_secret_from_string(&key_file).unwrap().public(),
+            secret.public()
+        );
+        let err = load_secret_from_string("# Created: 2026-08-11T00:00:00Z\n").unwrap_err();
         assert!(err.to_string().contains("No secret key found"), "{err}");
     }
 

@@ -32,7 +32,12 @@ pub enum RelayConfig {
     /// iroh's default relay map, with n0 address lookup.
     #[default]
     Default,
-    /// Custom relay set (parsed, sorted, deduped). Never empty.
+    /// Custom relay set (parsed, deduped, in configured order). Never empty.
+    ///
+    /// The configured order is kept because it is meaningful to a relay-only
+    /// dialer, which tries the relays one at a time: the first URL is the
+    /// preferred relay. Only exact duplicates are dropped (first occurrence
+    /// wins).
     ///
     /// `auth_token`, when set, is sent to every custom relay as an
     /// `Authorization: Bearer <token>` header on the WebSocket upgrade (see
@@ -100,15 +105,15 @@ impl RelayConfig {
             }
             return Ok(Self::Default);
         }
-        let mut parsed = urls
-            .iter()
-            .map(|url| {
-                url.parse::<RelayUrl>()
-                    .with_context(|| format!("Invalid relay URL: {url}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        parsed.sort();
-        parsed.dedup();
+        let mut parsed: Vec<RelayUrl> = Vec::with_capacity(urls.len());
+        for url in urls {
+            let url = url
+                .parse::<RelayUrl>()
+                .with_context(|| format!("Invalid relay URL: {url}"))?;
+            if !parsed.contains(&url) {
+                parsed.push(url);
+            }
+        }
         Ok(Self::Custom {
             urls: parsed,
             auth_token,
@@ -154,12 +159,18 @@ impl RelayConfig {
         }
     }
 
-    /// Log which relays are in use (silent for the default relays).
+    /// Log which relays are in use (silent for the default relays). Only ever
+    /// reports *whether* an auth token is set — never the token itself.
     pub fn log_status(&self) {
+        let auth = if self.relay_auth_token().is_some() {
+            " (authenticated)"
+        } else {
+            ""
+        };
         match self.custom_urls().len() {
             0 => {}
-            1 => info!("Using custom relay server"),
-            n => info!("Using {n} custom relay servers (with failover)"),
+            1 => info!("Using custom relay server{auth}"),
+            n => info!("Using {n} custom relay servers with failover{auth}"),
         }
     }
 }
@@ -303,7 +314,9 @@ mod tests {
     }
 
     #[test]
-    fn custom_urls_are_sorted_and_deduped() {
+    fn custom_urls_keep_configured_order_while_deduping() {
+        // A relay-only dialer walks custom_urls() in order, so the configured
+        // order is the failover order and must survive dedup unsorted.
         let cfg = RelayConfig::from_urls(&[
             "https://b.example.com./".to_string(),
             "https://a.example.com./".to_string(),
@@ -311,7 +324,7 @@ mod tests {
         ])
         .unwrap();
         let urls: Vec<String> = cfg.custom_urls().iter().map(ToString::to_string).collect();
-        assert_eq!(urls, ["https://a.example.com./", "https://b.example.com./"]);
+        assert_eq!(urls, ["https://b.example.com./", "https://a.example.com./"]);
     }
 
     #[test]
