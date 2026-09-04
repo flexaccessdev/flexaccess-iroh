@@ -19,7 +19,7 @@ crate all three programs depend on by git tag. It carries `RelayConfig` and the
 per-relay startup probe, the common endpoint builder with the
 creation-vs-rebuild policy (and relay-only mode), a rebuildable endpoint
 handle, the server-side home-relay watchdog, and the endpoint-bound public-key
-auth transcript over [`flexaccess-keys`]. A fix to any of that lands in the
+auth transcript over [`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys). A fix to any of that lands in the
 crate and reaches every program on its next tag bump, instead of being ported
 by hand three times.
 
