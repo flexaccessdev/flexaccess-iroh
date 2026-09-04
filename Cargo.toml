@@ -34,4 +34,4 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 iroh-mdns-address-lookup = { version = "0.5", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["full"] }
