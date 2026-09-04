@@ -185,6 +185,6 @@ startup probe: it runs only when a status snapshot is requested, hits the relay'
 **unauthenticated** HTTP health endpoint, and so confirms the relay is *up*, not
 that the token is accepted. Token validation is the startup probe's job.
 
-[tunnel-rs]: https://github.com/andrewtheguy/tunnel-rs
+[tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel

@@ -228,6 +228,6 @@ connection and is never seen by a relay or an HTTP proxy in front of one — see
 - **Path upgrade** — a connection that starts relayed and later hole-punches
   gets direct-path performance without reconnecting.
 
-[tunnel-rs]: https://github.com/andrewtheguy/tunnel-rs
+[tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel
