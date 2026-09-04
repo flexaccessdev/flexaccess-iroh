@@ -4,10 +4,11 @@
 //! Key management lives in
 //! [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys): the
 //! `ed25519-sec:` / `ed25519-pub:` token format, key files, authorized-keys
-//! parsing, and the `generate-auth-key` / `show-auth-key` CLI. This module
-//! owns the one transcript every FlexAccess program uses to prove a keypair
-//! over an iroh connection; the application supplies only its
-//! domain-separation context.
+//! parsing, and the `generate-auth-key` / `show-auth-key` CLI. Reading key
+//! files is the application's job (with `flexaccess_keys::load_private_key`
+//! and `flexaccess_keys::load_authorized_keys`); this module owns only the one
+//! transcript every FlexAccess program uses to prove a keypair over an iroh
+//! connection, and the application supplies its domain-separation context.
 //!
 //! ## Transcript
 //! The client's iroh endpoint id stays ephemeral. In its handshake the client
@@ -26,7 +27,6 @@ use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use flexaccess_keys::{PrivateKey, PublicKey};
 use iroh::EndpointId;
-use std::path::Path;
 
 pub use flexaccess_keys::AuthorizedKeys;
 
@@ -120,27 +120,11 @@ pub fn verify_endpoint_id_signature(
     public.verify(&auth_message(context, endpoint_id), &bytes)
 }
 
-/// Load a client secret key from a shared-format key file (a bare
-/// `ed25519-sec:...` token, or the token preceded by `#` header lines).
-pub fn load_client_key_from_file(path: &Path) -> Result<ClientKey> {
-    let private = flexaccess_keys::load_private_key(path).map_err(anyhow::Error::from)?;
-    Ok(private.into())
-}
-
-/// Load a server's authorized client public keys (shared authorized-keys
-/// document: one `ed25519-pub:...` per line, optional trailing comment, `#`
-/// lines and blank lines ignored).
-pub fn load_authorized_keys(path: &Path) -> Result<AuthorizedKeys> {
-    flexaccess_keys::load_authorized_keys(path).map_err(anyhow::Error::from)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use flexaccess_keys::{PRIVATE_KEY_PREFIX, PUBLIC_KEY_PREFIX};
     use iroh::SecretKey;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     const CONTEXT: &[u8] = b"test-client-auth-v1";
 
@@ -182,31 +166,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_key_file_reloads() {
-        let key = ClientKey::generate().unwrap();
-        let contents = format!(
-            "# Ed25519 authentication key\n# Public key: {} alice laptop\n{}\n",
-            key.public_str(),
-            key.secret_str()
-        );
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(contents.as_bytes()).unwrap();
-        let loaded = load_client_key_from_file(file.path()).unwrap();
-        assert_eq!(loaded.public_str(), key.public_str());
-    }
-
-    #[test]
-    fn key_file_without_secret_is_rejected() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "# only comments here").unwrap();
-        assert!(load_client_key_from_file(file.path()).is_err());
-
-        let mut bad = NamedTempFile::new().unwrap();
-        writeln!(bad, "not-a-key").unwrap();
-        assert!(load_client_key_from_file(bad.path()).is_err());
-    }
-
-    #[test]
     fn signature_binds_endpoint_id_and_context() {
         let key = ClientKey::generate().unwrap();
         let id = ephemeral_endpoint_id();
@@ -235,38 +194,4 @@ mod tests {
         assert!(!verify_endpoint_id_signature(&key.public_key(), CONTEXT, &id, ""));
     }
 
-    #[test]
-    fn authorized_keys_parsing() {
-        let a = ClientKey::generate().unwrap();
-        let b = ClientKey::generate().unwrap();
-        let c = ClientKey::generate().unwrap();
-
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "# Authorized client keys").unwrap();
-        writeln!(file).unwrap();
-        writeln!(file, "{}", a.public_str()).unwrap();
-        writeln!(file, "{} alice laptop", b.public_str()).unwrap();
-        writeln!(file, "  {}   build server  ", c.public_str()).unwrap();
-
-        let keys = load_authorized_keys(file.path()).unwrap();
-        assert_eq!(keys.len(), 3);
-        assert!(keys.contains(&a.public_key()));
-        assert!(keys.contains(&b.public_key()));
-        assert!(keys.contains(&c.public_key()));
-        assert_eq!(keys.comment(&b.public_key()), Some("alice laptop"));
-    }
-
-    #[test]
-    fn authorized_keys_invalid_key_is_rejected() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "# header").unwrap();
-        writeln!(file, "ed25519-pub:short").unwrap();
-        let err = load_authorized_keys(file.path()).unwrap_err();
-        assert!(err.to_string().contains(":2"), "{err}");
-
-        // A secret key pasted into the authorized-keys file is rejected too.
-        let mut wrong = NamedTempFile::new().unwrap();
-        writeln!(wrong, "{}", ClientKey::generate().unwrap().secret_str()).unwrap();
-        assert!(load_authorized_keys(wrong.path()).is_err());
-    }
 }

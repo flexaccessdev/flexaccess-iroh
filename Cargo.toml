@@ -1,6 +1,6 @@
 [package]
 name = "flexaccess-iroh"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 description = "Shared iroh transport layer for FlexAccess applications: relay configuration and probing, endpoint building and rebuilding, the home-relay watchdog, and the endpoint-bound public-key auth transcript"
 repository = "https://github.com/flexaccessdev/flexaccess-iroh"
@@ -37,5 +37,4 @@ iroh-mdns-address-lookup = { version = "0.5", optional = true }
 # Test double for iroh's `Watcher`-based status APIs (the relay watchdog tests
 # drive a plain `Watchable`); the same crate iroh itself re-exports `Watcher` from.
 n0-watcher = "1"
-tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

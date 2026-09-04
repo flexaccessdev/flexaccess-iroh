@@ -18,13 +18,16 @@ hand into every repo.
 | Module | Contents |
 |---|---|
 | `relay` | `RelayConfig` (default vs custom relays, which also decides whether n0 internet discovery is on), the shared relay auth token, the strict per-relay startup probe |
-| `endpoint` | the common endpoint builder, `create_endpoint` (strict first creation) vs `rebuild_endpoint` (tolerant mid-run replacement), `RebuildableEndpoint`, the persistent secret-key file loader |
+| `endpoint` | the common endpoint builder, `create_endpoint` (strict first creation) vs `rebuild_endpoint` (tolerant mid-run replacement), `RebuildableEndpoint` |
 | `relay_watchdog` | the server-side home-relay watchdog: nudge with `network_change()`, then ask for a rebuild |
 | `auth` | the endpoint-bound public-key auth transcript over the [flexaccess-keys] format; each application passes its own domain-separation context |
 
 Deliberately **not** in it: ALPNs, handshake wire formats, QUIC transport
 tuning, connection-path status UIs, and anything else product-specific. Those
-stay in each application.
+stay in each application. Nor does it load anything: identity and auth key
+files — paths, formats, error hints, permissions — are the application's
+(client key files come through [flexaccess-keys]' own loaders), and the crate
+takes the resulting `iroh::SecretKey` / `flexaccess_keys` values.
 
 [flexaccess-keys]: https://github.com/flexaccessdev/flexaccess-keys
 
@@ -32,9 +35,9 @@ stay in each application.
 
 ```toml
 [dependencies]
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.1" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.3" }
 # or, with mDNS local-network discovery on every endpoint (compiled out on iOS):
-flexaccess-iroh = { git = "...", tag = "v0.0.1", features = ["mdns"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.3", features = ["mdns"] }
 ```
 
 The `flexaccess_keys` crate is re-exported so a consumer signs and verifies

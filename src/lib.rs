@@ -10,9 +10,8 @@
 //!   whether n0 internet discovery is on), the shared relay auth token, and the
 //!   strict per-relay startup probe.
 //! - [`endpoint`]: the common endpoint builder, the bind-and-come-online policy
-//!   for first creation versus a mid-run rebuild, a
-//!   [`endpoint::RebuildableEndpoint`] handle, and the persistent secret-key
-//!   file loader.
+//!   for first creation versus a mid-run rebuild, and a
+//!   [`endpoint::RebuildableEndpoint`] handle.
 //! - [`relay_watchdog`]: the server-side home-relay watchdog that nudges, then
 //!   asks for a rebuild, when iroh silently loses its home relay.
 //! - [`auth`]: the endpoint-bound public-key authentication transcript over the
