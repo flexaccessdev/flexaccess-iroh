@@ -43,9 +43,9 @@ The client-side `RebuildableEndpoint` remains available for reconnect escalation
 
 ```toml
 [dependencies]
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.4" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.5" }
 # or, with mDNS local-network discovery on every endpoint (compiled out on iOS):
-flexaccess-iroh = { git = "...", tag = "v0.0.4", features = ["mdns"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.5", features = ["mdns"] }
 ```
 
 The `flexaccess_keys` crate is re-exported so a consumer signs and verifies

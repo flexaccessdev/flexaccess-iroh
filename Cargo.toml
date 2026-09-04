@@ -1,6 +1,6 @@
 [package]
 name = "flexaccess-iroh"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 description = "Shared iroh transport layer for FlexAccess applications: relay configuration and probing, endpoint building and rebuilding, and the endpoint-bound public-key auth transcript"
 repository = "https://github.com/flexaccessdev/flexaccess-iroh"
