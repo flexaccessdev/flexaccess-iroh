@@ -161,16 +161,31 @@ const REBUILD_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct RebuildableEndpoint {
     /// The live endpoint, swapped by [`Self::rebuild`]. Std lock: accessors
     /// clone the handle out synchronously and never hold it across an await.
-    current: Arc<std::sync::RwLock<Endpoint>>,
+    current: Arc<std::sync::RwLock<Current>>,
     factory: EndpointFactory,
+    /// Serializes [`Self::rebuild`]'s build-and-swap: the handle is shared,
+    /// and two callers noticing the same outage must not each build an
+    /// endpoint and have the second discard (and close) the first's good one.
+    rebuilding: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// The installed endpoint plus how many rebuilds produced it, so a rebuild
+/// caller can tell whether one already happened while it waited its turn.
+struct Current {
+    generation: u64,
+    endpoint: Endpoint,
 }
 
 impl RebuildableEndpoint {
     /// Wrap a bound endpoint with the recipe that rebuilds it.
     pub fn from_parts(endpoint: Endpoint, factory: EndpointFactory) -> Self {
         Self {
-            current: Arc::new(std::sync::RwLock::new(endpoint)),
+            current: Arc::new(std::sync::RwLock::new(Current {
+                generation: 0,
+                endpoint,
+            })),
             factory,
+            rebuilding: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -178,7 +193,7 @@ impl RebuildableEndpoint {
     /// held across a [`Self::rebuild`] keeps pointing at the old, closed
     /// endpoint.
     pub fn endpoint(&self) -> Endpoint {
-        self.current.read().expect("endpoint lock").clone()
+        self.current.read().expect("endpoint lock").endpoint.clone()
     }
 
     /// The current endpoint id. Changes on rebuild for an ephemeral identity;
@@ -187,13 +202,33 @@ impl RebuildableEndpoint {
         self.endpoint().id()
     }
 
+    fn generation(&self) -> u64 {
+        self.current.read().expect("endpoint lock").generation
+    }
+
     /// Swap in a freshly built endpoint and close the old one. On error the
     /// current endpoint stays in place, so the caller can simply retry with it.
+    ///
+    /// Concurrent calls coalesce: a caller that arrives while another rebuild
+    /// is in flight waits for it and, if it installed a fresh endpoint,
+    /// returns `Ok` without building another — its trigger was the same dead
+    /// endpoint, and [`Self::endpoint`] now yields the replacement. Only if
+    /// the in-flight rebuild failed does the waiter build one itself.
     pub async fn rebuild(&self) -> Result<()> {
-        let fresh = (self.factory)().await?;
+        let seen = self.generation();
         let old = {
+            let _serialized = self.rebuilding.lock().await;
+            if self.generation() != seen {
+                info!(
+                    "Endpoint already rebuilt by a concurrent caller; endpoint id: {}",
+                    self.id()
+                );
+                return Ok(());
+            }
+            let fresh = (self.factory)().await?;
             let mut current = self.current.write().expect("endpoint lock");
-            std::mem::replace(&mut *current, fresh)
+            current.generation += 1;
+            std::mem::replace(&mut current.endpoint, fresh)
         };
         // Graceful close on its own task: bounded wait here, but the task is
         // never cancelled (see [`REBUILD_CLOSE_TIMEOUT`]).
@@ -321,5 +356,47 @@ mod tests {
         assert!(first.is_closed(), "the replaced endpoint is closed");
         handle.close().await;
         assert!(handle.endpoint().is_closed());
+    }
+
+    #[tokio::test]
+    async fn concurrent_rebuilds_coalesce_into_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn loopback() -> EndpointBuilder {
+            Endpoint::builder(presets::Empty)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        }
+        let builds = Arc::new(AtomicUsize::new(0));
+        let first = loopback().bind().await.unwrap();
+        let handle = RebuildableEndpoint::from_parts(first.clone(), {
+            let builds = builds.clone();
+            Arc::new(move || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    // Hold the build long enough for the second caller to
+                    // queue behind it.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    loopback().bind().await.map_err(Into::into)
+                })
+            })
+        });
+
+        let a = handle.clone();
+        let b = handle.clone();
+        let (ra, rb) = tokio::join!(a.rebuild(), async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            b.rebuild().await
+        });
+        ra.unwrap();
+        rb.unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "the second caller joined the first");
+        assert!(first.is_closed());
+        assert!(!handle.endpoint().is_closed(), "the one fresh endpoint is live");
+
+        // A rebuild after the coalesced one is a new outage: it builds again.
+        handle.rebuild().await.unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        handle.close().await;
     }
 }
