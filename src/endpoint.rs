@@ -136,8 +136,7 @@ pub async fn create_endpoint(relay_config: &RelayConfig, builder: EndpointBuilde
 ///   would block recovery through the one relay that still answers.
 /// - **The online wait is tolerated failing.** A fresh endpoint is no worse
 ///   than the wedged one it replaces — LAN peers can still find it over mDNS —
-///   and whatever tripped the rebuild (the relay watchdog, a client's
-///   reconnect escalation) trips again if the relays stay unreachable.
+///   and the client's reconnect escalation retries if the relays stay unreachable.
 pub async fn rebuild_endpoint(builder: EndpointBuilder) -> Result<Endpoint> {
     let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
     if let Err(e) = wait_online(&endpoint).await {
@@ -147,8 +146,7 @@ pub async fn rebuild_endpoint(builder: EndpointBuilder) -> Result<Endpoint> {
 }
 
 /// Recipe producing a fresh, fully bound endpoint — how a
-/// [`RebuildableEndpoint`] replaces itself mid-session, or how a server
-/// replaces a wedged endpoint when the relay watchdog gives up on it.
+/// [`RebuildableEndpoint`] replaces itself mid-session.
 pub type EndpointFactory = Arc<dyn Fn() -> BoxFuture<'static, Result<Endpoint>> + Send + Sync>;
 
 /// Bound wait on the old endpoint's graceful close during a rebuild. The close

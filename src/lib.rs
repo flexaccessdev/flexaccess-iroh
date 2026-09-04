@@ -12,8 +12,6 @@
 //! - [`endpoint`]: the common endpoint builder, the bind-and-come-online policy
 //!   for first creation versus a mid-run rebuild, and a
 //!   [`endpoint::RebuildableEndpoint`] handle.
-//! - [`relay_watchdog`]: the server-side home-relay watchdog that nudges, then
-//!   asks for a rebuild, when iroh silently loses its home relay.
 //! - [`auth`]: the endpoint-bound public-key authentication transcript over the
 //!   shared [`flexaccess_keys`] format; each application supplies its own
 //!   domain-separation context.
@@ -32,6 +30,5 @@
 pub mod auth;
 pub mod endpoint;
 pub mod relay;
-pub mod relay_watchdog;
 
 pub use flexaccess_keys;

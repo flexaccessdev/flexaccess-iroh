@@ -5,7 +5,7 @@ Shared iroh transport layer for FlexAccess applications, as a Rust crate.
 The programs built on iroh in this org — [tunnel-rs], [ezvpn], [flextunnel] —
 share one transport foundation. Its design is documented once in
 [iroh-common-architecture]; this crate is that design as code, so a fix to the
-relay watchdog or the relay probe lands here once instead of being ported by
+relay probe or endpoint construction lands here once instead of being ported by
 hand into every repo.
 
 [tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
@@ -19,7 +19,6 @@ hand into every repo.
 |---|---|
 | `relay` | `RelayConfig` (default vs custom relays, which also decides whether n0 internet discovery is on), the shared relay auth token, the strict per-relay startup probe |
 | `endpoint` | the common endpoint builder, `create_endpoint` (strict first creation) vs `rebuild_endpoint` (tolerant mid-run replacement), `RebuildableEndpoint` |
-| `relay_watchdog` | the server-side home-relay watchdog: nudge with `network_change()`, then ask for a rebuild |
 | `auth` | the endpoint-bound public-key auth transcript over the [flexaccess-keys] format; each application passes its own domain-separation context |
 
 Deliberately **not** in it: ALPNs, handshake wire formats, QUIC transport
@@ -31,13 +30,22 @@ takes the resulting `iroh::SecretKey` / `flexaccess_keys` values.
 
 [flexaccess-keys]: https://github.com/flexaccessdev/flexaccess-keys
 
+## Server relay recovery
+
+Servers rely on iroh 1.1.x for relay reconnects and keep the same endpoint
+during relay outages. The former server watchdog has been removed; see the
+[relay recovery history and workaround](https://github.com/flexaccessdev/iroh-common-architecture/blob/9eacd43b80d867a8a4a76e3051237b854b4b0cd5/home-relay-watchdog.md)
+if permanent loss of relay registration recurs.
+
+The client-side `RebuildableEndpoint` remains available for reconnect escalation.
+
 ## Depending on it
 
 ```toml
 [dependencies]
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.3" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.4" }
 # or, with mDNS local-network discovery on every endpoint (compiled out on iOS):
-flexaccess-iroh = { git = "...", tag = "v0.0.3", features = ["mdns"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.4", features = ["mdns"] }
 ```
 
 The `flexaccess_keys` crate is re-exported so a consumer signs and verifies
