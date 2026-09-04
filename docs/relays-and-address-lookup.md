@@ -1,8 +1,9 @@
 # Relays and Address Lookup (Default vs Custom)
 
 How a dialer finds a peer depends on the relay mode. This is the single most
-important shared decision across [tunnel-rs], [ezvpn], and [flextunnel], and all
-three implement it identically.
+important shared decision across [tunnel-rs], [ezvpn], and [flextunnel], and
+one implementation serves all three: the `relay` and `endpoint` modules of
+[`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh).
 
 The default-vs-custom distinction is resolved **once**, at config time, into a
 `RelayConfig` enum — `Default` vs `Custom` — and it selects **both** which relay
@@ -15,9 +16,13 @@ follows the relay mode: on for the default relays, off for custom relays.
 | **Default** | n0 public relays | with persistent identity only | yes | resolve the published record by endpoint ID |
 | **Custom** | configured relays | never | never | relay hints attached to the peer's `EndpointAddr` |
 
+Whether an endpoint publishes at all is the program's call
+(`EndpointOptions::publish_address`): a server with a persistent identity does,
+a client that only dials out never advertises its ephemeral id.
+
 mDNS is deliberately left out of that table: unlike the n0 lookup stack it does
 **not** follow the relay mode, and it is the one piece of address lookup the
-three programs do not implement alike. See [mDNS](#mdns) below.
+three programs do not enable alike. See [mDNS](#mdns) below.
 
 ## Background: iroh address lookup
 
@@ -77,13 +82,14 @@ failure-mode caveats, and the e2e verification.
 ## mDNS
 
 mDNS local-network discovery is independent of the relay mode: where it is
-enabled at all, it stays on in **both** default and custom mode. Unlike the rest
-of the lookup stack, though, it is not uniform across the three programs:
+enabled at all, it stays on in **both** default and custom mode. It is the
+crate's `mdns` feature (which the crate itself compiles out on iOS), and unlike
+the rest of the lookup stack it is not uniform across the three programs:
 
 | Repo | mDNS |
 |---|---|
 | [tunnel-rs] | on in both relay modes; **disabled under `--relay-only`**, which drops every address lookup |
-| [ezvpn] | **never enabled** — the endpoint builder installs no mDNS lookup at all |
+| [ezvpn] | **never enabled** — the `mdns` feature is off |
 | [flextunnel] | on in both relay modes; **compiled out on iOS**, where raw multicast needs the `com.apple.developer.networking.multicast` entitlement |
 
 So the only place mDNS is switched off *by mode* is tunnel-rs's relay-only mode
@@ -106,8 +112,9 @@ private relay must configure the same token.
 
 ## Custom relay validation: the per-relay startup probe
 
-Before binding the real endpoint, each configured relay is probed
-**individually** by binding a throwaway, relay-only endpoint
+Before binding the real endpoint (`flexaccess_iroh::endpoint::create_endpoint`),
+each configured relay is probed **individually** (`relay::probe_custom_relays`)
+by binding a throwaway, relay-only endpoint
 (`clear_ip_transports`, ephemeral identity) for just that one URL and waiting on
 `endpoint.online()`, bounded by a 10 s `RELAY_CONNECT_TIMEOUT`. All probes run in
 parallel. **Startup fails if any relay does not come online.**
@@ -122,7 +129,10 @@ The strictness is deliberate. A configured backup relay that is silently dead is
 worse than a startup failure: it gives false confidence in a failover path that
 does not exist. **Startup is strict; runtime is not** — once a process is
 running, losing a relay is survivable and the endpoint re-homes onto a surviving
-one.
+one. For the same reason a mid-run **rebuild** of an endpoint (see
+[home-relay-watchdog.md](home-relay-watchdog.md)) skips the probe: during an
+outage that strictness would block recovery through the one relay that still
+answers.
 
 `clear_ip_transports()` on the probe endpoint is what makes `online()` a *pure
 relay* reachability signal: a holepunched direct path can never mask a dead or
@@ -130,10 +140,12 @@ auth-rejecting relay.
 
 ## Relay-only mode
 
-Relay-only drops the direct IP transports and every address lookup (including
-mDNS) on the *real* endpoint, so it is reachable only over the configured
-relays. It requires a custom relay set — the rate-limited default relays cannot
-serve it.
+Relay-only (`EndpointOptions::relay_only`) drops the direct IP transports and
+every address lookup (including mDNS) on the *real* endpoint, so it is
+reachable only over the configured relays. It requires a custom relay set — the
+rate-limited default relays cannot serve it. Because a relay-only dialer tries
+the relays one at a time, `RelayConfig` keeps the configured order (deduping
+only exact repeats): the first URL is the preferred relay.
 
 **[tunnel-rs] is the reference program for relay-only setup.** It is the only one
 of the three that exposes relay-only as a first-class user-facing mode
@@ -158,11 +170,15 @@ indefinitely when no path is reachable.
 
 ## Where this lives in each repo
 
+The shared part is one crate; each program keeps a thin layer over its
+builder.
+
 | Repo | Implementation | Notes |
 |---|---|---|
-| [tunnel-rs] | `src/iroh_mode/endpoint.rs` | Adds user-facing `--relay-only` + sequential relay failover dial; mDNS gated off under relay-only |
-| [ezvpn] | `src/transport/endpoint.rs`, `src/transport/paths.rs` | No mDNS at all; also exposes an on-demand `/healthz` per-relay health check for status UIs |
-| [flextunnel] | `crates/flextunnel-core/src/transport/endpoint.rs`, `.../transport/paths.rs` | mDNS on except iOS; outbound bridges attach the same relay hints; on-demand `/healthz` health check |
+| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs` | `RelayConfig`, the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` vs `rebuild_endpoint` |
+| [tunnel-rs] | `src/iroh_mode/endpoint.rs` | `mf/4` ALPN, transport tuning, user-facing `--relay-only` + sequential relay failover dial; `mdns` on |
+| [ezvpn] | `src/transport/endpoint.rs`, `src/transport/paths.rs` | VPN ALPN, transport tuning, bounded connect; `mdns` off; iroh fork via `[patch.crates-io]`; on-demand `/healthz` per-relay health check for status UIs |
+| [flextunnel] | `crates/flextunnel-core/src/transport/endpoint.rs`, `.../transport/paths.rs` | three ALPNs + native allowlist hook; `mdns` on (crate compiles it out on iOS); outbound bridges attach the same relay hints; on-demand `/healthz` health check |
 
 The `/healthz` status check in ezvpn/flextunnel is a *different* thing from the
 startup probe: it runs only when a status snapshot is requested, hits the relay's

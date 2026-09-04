@@ -6,10 +6,11 @@ none of the three implements any of it itself — they configure an
 `iroh::Endpoint` and hand it an ALPN. Those shared transport primitives are what
 this document describes.
 
-What the three do *not* share is how they configure that endpoint. Address
-lookup, relay-only mode, and platform behavior differ per program — ezvpn runs no
-mDNS at all, tunnel-rs is the only one with a user-facing relay-only mode, and
-flextunnel compiles mDNS out on iOS. See
+They configure that endpoint through one shared builder
+([`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh)), but
+what each asks of it differs — ezvpn runs no mDNS at all, tunnel-rs is the only
+one with a user-facing relay-only mode, and flextunnel compiles mDNS out on
+iOS — and the QUIC transport tuning is each program's own. See
 [relays-and-address-lookup.md](relays-and-address-lookup.md) for the per-repo
 matrix.
 

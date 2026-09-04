@@ -11,12 +11,36 @@ documented once, here, instead of drifting across three repos.
 | [ezvpn] | Full VPN (TUN device, IP routing) over iroh |
 | [flextunnel] | SOCKS5/HTTP proxy and port forwarding over iroh |
 
+## The shared crate
+
+Since 2026-09 this design is also **code**, once:
+[`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh), a Rust
+crate all three programs depend on by git tag. It carries `RelayConfig` and the
+per-relay startup probe, the common endpoint builder with the
+creation-vs-rebuild policy (and relay-only mode), a rebuildable endpoint
+handle, the server-side home-relay watchdog, and the endpoint-bound public-key
+auth transcript over [`flexaccess-keys`]. A fix to any of that lands in the
+crate and reaches every program on its next tag bump, instead of being ported
+by hand three times.
+
+What stays in each program is what makes it that program: ALPNs, handshake
+formats, QUIC transport tuning, identity and key *files* (the crate takes
+values, never paths), connection-path status UIs, and the serve loops that
+drive the watchdog. ezvpn, which builds on a fork of iroh, redirects the
+crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
+`iroh`.
+
 ## Contents
 
 - **[relays-and-address-lookup.md](relays-and-address-lookup.md)** — the core
   shared design. Default vs custom relays, how that single choice also decides
   whether n0 internet discovery is on, relay hints, the shared relay auth token,
   the strict per-relay startup probe, and relay-only mode. **Start here.**
+- **[home-relay-watchdog.md](home-relay-watchdog.md)** — the server-side
+  watchdog for a custom-relay server that silently loses its home relay: the
+  nudge-then-rebuild escalation, the creation-vs-rebuild policy behind it, the
+  back-off for a relay that is really down, and how each program's serve loop
+  drives it.
 - **[nat-traversal-and-transport.md](nat-traversal-and-transport.md)** — what the
   three programs get from `iroh::Endpoint` and never implement themselves:
   connection establishment, hole punching and relay fallback, NAT traversal by
@@ -55,10 +79,12 @@ stay in their own repos.
 
 ## Keeping this in sync
 
-The three repos link here rather than duplicating this material. When the shared
-relay/discovery behavior changes in one repo, update it here in the same change
-and note any deliberate per-repo divergence in the "Where this lives in each
-repo" table in
+The three repos link here rather than duplicating this material, and they
+depend on [`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh)
+rather than carrying their own copies of the code. When the shared
+relay/discovery behavior changes, change it in the crate, tag a release, bump
+the tag in each program, and update this repo in the same change. Note any
+deliberate per-repo divergence in the "Where this lives in each repo" table in
 [relays-and-address-lookup.md](relays-and-address-lookup.md#where-this-lives-in-each-repo).
 
 [tunnel-rs]: https://github.com/andrewtheguy/tunnel-rs
