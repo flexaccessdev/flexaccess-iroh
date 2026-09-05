@@ -77,17 +77,19 @@ client would learn the server's current home relay). Hence the guidance in
 
 ## Empirical verification
 
-[tunnel-rs]'s `test-scripts/run_relay_failover_e2e.sh` is fully offline: two
-local `iroh-relay --dev` instances, relay-only mode, internet discovery
-auto-disabled. It covers the startup probe, iroh's own re-homing, and the shared failover:
+[flexaccess-iroh]'s `e2e/run_relay_failover.sh` (it took over from tunnel-rs
+in 2026-09) is fully offline: two local `iroh-relay --dev` instances, internet
+discovery auto-disabled, relay-only except in its last phase. It covers the
+startup probe, iroh's own re-homing, and the shared failover:
 
 | Phase | Scenario |
 |---|---|
-| A | Every configured relay is probed at startup: a server configured with both relays fails to start only when both are down, starts with a warning when one is, and a client with both relays connects through the live one; a single custom relay is rejected as configuration |
+| A | Every configured relay is probed at startup: a server configured with both relays fails to start only when both are down, starts with a warning when one is (bound without it), and a client with both relays connects through the live one; a single custom relay is rejected as configuration |
 | B | Runtime relay loss is survivable: killing the server's home relay leaves the server up, it re-homes onto the surviving relay on its own (observed ≈ the 20–26 s re-probe cycle) and a restarted client with both relays reconnects; with both relays down new clients fail; after both restart, clients connect again |
 | C | The in-place home-relay failover for the case iroh does not recover on its own; see [relay-failover.md](relay-failover.md#verification) |
+| D | The same behind a live direct connection, and a client that starts during the outage; see [relay-failover.md](relay-failover.md#verification) |
 
-`test-scripts/run_e2e.sh --relay-url <r1> --relay-url <r2>` (TCP + UDP) also
+tunnel-rs's `test-scripts/run_e2e.sh --relay-url <r1> --relay-url <r2>` (TCP + UDP) also
 passes against two local relays with no internet discovery, in both normal and
 `--relay-only` mode — previously the multi-relay configuration required public
 discovery.
@@ -104,3 +106,4 @@ discovery including mDNS.
 [tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel
+[flexaccess-iroh]: https://github.com/flexaccessdev/flexaccess-iroh
