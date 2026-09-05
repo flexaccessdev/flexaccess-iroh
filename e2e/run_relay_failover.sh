@@ -66,9 +66,10 @@
 #       shows the new home relay on a connection path; echo passes
 #   D2  the held client disconnects and a client with the SAME two-relay
 #       configuration (relay1 still the fake, direct paths allowed) dials
-#       again, as a LAN client that restarts during the outage would: it must
-#       come online, reach the re-homed server through relay2, and move onto a
-#       direct path again; echo passes
+#       again, as a LAN client that restarts during the outage would: its
+#       startup probe finds relay1 not connectable and it binds without it, so
+#       it comes online on relay2, reaches the re-homed server through relay2,
+#       and moves onto a direct path again; echo passes
 #
 # Requirements: cargo, iroh-relay (cargo install iroh-relay --features server).
 #
@@ -693,6 +694,12 @@ stop_held_client
 start_held_client "$RELAY1_URL" "$PROXY_URL"
 wait_for_log_or_death "$HELD_PID" "$HELD_LOG" "Echo OK" "$READY_TIMEOUT" || {
     note "the redialing client did not connect (rc=$?)"; rc=1; }
+# What makes it possible: the startup probe found relay1 not connectable and
+# the endpoint was bound without it, so it homed on relay2 and came online.
+if [[ "$rc" -eq 0 ]] && ! grep -Eq "Binding without 1 of 2 custom relays: $RELAY1_URL/" "$HELD_LOG"; then
+    note "the redialing client did not leave relay1 out of its relay map"
+    rc=1
+fi
 if [[ "$rc" -eq 0 ]] && ! grep -Eq "Connected to [0-9a-f]+ via Relay $PROXY_URL/" "$HELD_LOG"; then
     note "the redialing client did not connect through relay2"
     rc=1

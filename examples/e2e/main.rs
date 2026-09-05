@@ -25,7 +25,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use flexaccess_iroh::auth::{ClientKey, verify_endpoint_id_signature};
-use flexaccess_iroh::endpoint::{EndpointOptions, create_endpoint, endpoint_builder};
+use flexaccess_iroh::endpoint::{CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder};
 use flexaccess_iroh::flexaccess_keys::{self, AuthorizedKeys, PrivateKey, PublicKey};
 use flexaccess_iroh::relay::RelayConfig;
 use flexaccess_iroh::relay_failover::fail_over_home_relay;
@@ -249,13 +249,16 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let builder = endpoint_builder(&relay_config, args.relay.options(true))
         .alpns(vec![ALPN.to_vec()])
         .secret_key(secret);
-    let endpoint = create_endpoint(&relay_config, builder).await?;
+    let CreatedEndpoint {
+        endpoint,
+        relays_left_out,
+    } = create_endpoint(&relay_config, builder).await?;
     info!("Waiting for clients to connect");
 
     let authorized = Arc::new(authorized);
     let outcome = tokio::select! {
         outcome = accept_loop(&endpoint, &authorized) => outcome,
-        () = fail_over_home_relay(&endpoint, &relay_config) => Ok(()),
+        () = fail_over_home_relay(&endpoint, &relay_config, &relays_left_out) => Ok(()),
     };
     endpoint.close().await;
     outcome
@@ -386,7 +389,9 @@ async fn run_client(args: ClientArgs) -> Result<ExitCode> {
         .into();
     let relay_config = args.relay.resolve()?;
     let builder = endpoint_builder(&relay_config, args.relay.options(false));
-    let endpoint = create_endpoint(&relay_config, builder).await?;
+    // A client runs no failover: a relay left out at startup stays out for
+    // this (short-lived) process.
+    let CreatedEndpoint { endpoint, .. } = create_endpoint(&relay_config, builder).await?;
     let outcome = exchange(&endpoint, &args, &relay_config, &key).await;
     endpoint.close().await;
     outcome
