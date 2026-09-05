@@ -72,7 +72,14 @@ discovery off there is no published record to fall back on.
 > configured with a subset of the server's relays can reach it only while the
 > server's home relay is in that subset. After its home relay goes offline, an
 > endpoint re-homes onto another configured relay within ~30 seconds (net_report
-> re-probes every 20–26 s).
+> re-probes every 20–26 s); when the relay is lost in a way iroh does not
+> recover from, the shared failover moves it after 60 s. See
+> [relay-failover.md](relay-failover.md).
+
+A custom relay set must hold **at least two distinct relays**
+(`relay::MIN_CUSTOM_RELAYS`); `RelayConfig::from_urls_with_token` rejects one.
+Failover is the reason the relay list exists, and one relay leaves nothing to
+fail over to.
 
 A deployment that runs custom relays contacts **no public iroh infrastructure at
 all**. See [relay-discovery-findings.md](relay-discovery-findings.md) for the
@@ -117,22 +124,22 @@ each configured relay is probed **individually** (`relay::probe_custom_relays`)
 by binding a throwaway, relay-only endpoint
 (`clear_ip_transports`, ephemeral identity) for just that one URL and waiting on
 `endpoint.online()`, bounded by a 10 s `RELAY_CONNECT_TIMEOUT`. All probes run in
-parallel. **Startup fails if any relay does not come online.**
+parallel. **Startup fails only if no relay comes online; each relay that does
+not is reported as a warning.**
 
-This is stricter than — and replaces — a single endpoint-wide `online()` wait,
-which only proved that *one* relay (the eventual home relay) connected and so
-gave a misleading all-clear when a backup relay was down. Because the auth token
-rides the relay WebSocket upgrade, this probe also validates the token: a relay
-that rejects it never comes online and startup fails.
+Probing each relay on its own is what makes those warnings possible: a single
+endpoint-wide `online()` wait only proves that *one* relay (the eventual home
+relay) connected and says nothing about the others, so a backup relay that is
+silently dead would give false confidence in a failover path that does not
+exist. Because the auth token rides the relay WebSocket upgrade, the probe also
+validates the token: a relay that rejects it never comes online.
 
-The strictness is deliberate. A configured backup relay that is silently dead is
-worse than a startup failure: it gives false confidence in a failover path that
-does not exist. **Startup is strict; runtime is not** — once a process is
-running, losing a relay is survivable and the endpoint re-homes onto a surviving
-one. For the same reason a mid-run **rebuild** of an endpoint (see
-[home-relay-watchdog.md](home-relay-watchdog.md)) skips the probe: during an
-outage that strictness would block recovery through the one relay that still
-answers.
+Startup does not require every relay, deliberately. Failover is the reason for
+the second relay, and a client that restarts during a relay outage has to be
+able to start on the surviving one; requiring every relay at startup would turn
+a survivable relay outage into an outage of every client that restarts during
+it. The same probe is reused by the failover to decide when a relay it took out
+of the map is connectable again (see [relay-failover.md](relay-failover.md)).
 
 `clear_ip_transports()` on the probe endpoint is what makes `online()` a *pure
 relay* reachability signal: a holepunched direct path can never mask a dead or
@@ -151,9 +158,10 @@ only exact repeats): the first URL is the preferred relay.
 of the three that exposes relay-only as a first-class user-facing mode
 (`--relay-only` on both `server` and `client`, CLI-only so it cannot be switched
 on accidentally from a config file), and it carries the matching sequential
-per-relay failover dial path and a fully offline two-relay e2e suite
-(`test-scripts/run_relay_failover_e2e.sh`). Use it to validate a self-hosted
-relay end to end before pointing other programs at it — see
+per-relay failover dial path and the fully offline two-relay e2e suite
+(`test-scripts/run_relay_failover_e2e.sh`, see
+[relay-failover.md](relay-failover.md#verification)). Use it to validate a
+self-hosted relay end to end before pointing other programs at it — see
 [self-hosting.md](self-hosting.md). ezvpn and flextunnel keep
 `clear_ip_transports()` only inside the startup probe described above.
 
@@ -175,7 +183,7 @@ builder.
 
 | Repo | Implementation | Notes |
 |---|---|---|
-| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs` | `RelayConfig`, the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` vs `rebuild_endpoint` |
+| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs`, `src/relay_failover.rs` | `RelayConfig` (at least two custom relays), the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint`, the in-place home-relay failover |
 | [tunnel-rs] | `src/iroh_mode/endpoint.rs` | `mf/4` ALPN, transport tuning, user-facing `--relay-only` + sequential relay failover dial; `mdns` on |
 | [ezvpn] | `src/transport/endpoint.rs`, `src/transport/paths.rs` | VPN ALPN, transport tuning, bounded connect; `mdns` off; iroh fork via `[patch.crates-io]`; on-demand `/healthz` per-relay health check for status UIs |
 | [flextunnel] | `crates/flextunnel-core/src/transport/endpoint.rs`, `.../transport/paths.rs` | three ALPNs + native allowlist hook; `mdns` on (crate compiles it out on iOS); outbound bridges attach the same relay hints; on-demand `/healthz` health check |

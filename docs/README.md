@@ -15,18 +15,18 @@ documented once, here, instead of drifting across three repos.
 
 Since 2026-09 this design is also **code**, once:
 [`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh), a Rust
-crate all three programs depend on by git tag. It carries `RelayConfig` and the
-per-relay startup probe, the common endpoint builder with the
-creation-vs-rebuild policy (and relay-only mode), a rebuildable endpoint
-handle, the server-side home-relay watchdog, and the endpoint-bound public-key
-auth transcript over [`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys). A fix to any of that lands in the
-crate and reaches every program on its next tag bump, instead of being ported
-by hand three times.
+crate all three programs depend on by git tag. It carries `RelayConfig` (at
+least two custom relays) and the per-relay startup probe, the common endpoint
+builder (and relay-only mode), the server-side in-place home-relay failover,
+and the endpoint-bound public-key auth transcript over
+[`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys). A fix to
+any of that lands in the crate and reaches every program on its next tag bump,
+instead of being ported by hand three times.
 
 What stays in each program is what makes it that program: ALPNs, handshake
 formats, QUIC transport tuning, identity and key *files* (the crate takes
 values, never paths), connection-path status UIs, and the serve loops that
-drive the watchdog. ezvpn, which builds on a fork of iroh, redirects the
+run the failover alongside their accept loops. ezvpn, which builds on a fork of iroh, redirects the
 crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
 `iroh`.
 
@@ -36,11 +36,12 @@ crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
   shared design. Default vs custom relays, how that single choice also decides
   whether n0 internet discovery is on, relay hints, the shared relay auth token,
   the strict per-relay startup probe, and relay-only mode. **Start here.**
-- **[home-relay-watchdog.md](home-relay-watchdog.md)** — the server-side
-  watchdog for a custom-relay server that silently loses its home relay: the
-  nudge-then-rebuild escalation, the creation-vs-rebuild policy behind it, the
-  back-off for a relay that is really down, and how each program's serve loop
-  drives it.
+- **[relay-failover.md](relay-failover.md)** — how a custom-relay server
+  stays reachable when its home relay stops working: what iroh 1.1.0 recovers
+  on its own, the in-place failover for the case it does not (take the wedged
+  relay out of the relay map, restore it once connectable), why that needs at
+  least two custom relays and no address lookup service, and the tunnel-rs
+  e2e suite that proves it.
 - **[nat-traversal-and-transport.md](nat-traversal-and-transport.md)** — what the
   three programs get from `iroh::Endpoint` and never implement themselves:
   connection establishment, hole punching and relay fallback, NAT traversal by
@@ -61,8 +62,9 @@ crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
 
 [tunnel-rs] is the reference implementation for relay-only deployments: it is the
 only one of the three exposing relay-only as a first-class user-facing mode
-(`--relay-only`), it carries the sequential per-relay failover dial path, and it
-ships a fully offline two-relay e2e suite. When bringing up a self-hosted relay,
+(`--relay-only`), it carries the sequential per-relay failover dial path, it is
+the first consumer of the shared relay failover, and it ships the fully offline
+two-relay e2e suite that exercises it. When bringing up a self-hosted relay,
 validate it with tunnel-rs first — the relay it proves out serves all three
 programs. See [self-hosting.md](self-hosting.md#verifying-a-relay).
 
