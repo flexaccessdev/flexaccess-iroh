@@ -46,9 +46,22 @@ declare -a PIDS=()
 
 cleanup() {
     local status=$?
-    for pid in "${PIDS[@]:-}"; do
-        [[ -n "$pid" ]] || continue
+    # Runs once: an INT/TERM handler that exits would fire the EXIT trap again.
+    trap - EXIT INT TERM
+    local pid
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    done
+    # A short grace period for SIGTERM, then SIGKILL whatever is left, so a
+    # child that ignores SIGTERM cannot hang the run.
+    local _
+    for _ in $(seq 1 20); do
+        live_children || break
+        sleep 0.1
+    done
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+        kill -0 "$pid" 2>/dev/null || continue
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null || true
     if [[ "${KEEP_LOGS:-0}" == "1" ]]; then
@@ -59,6 +72,15 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT INT TERM
+
+# True while any process started with start_bg is still alive.
+live_children() {
+    local pid
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+        kill -0 "$pid" 2>/dev/null && return 0
+    done
+    return 1
+}
 
 # Start a background process, in its own session where setsid exists so the
 # whole process group can be killed. Args: <logfile> <command...>. Records

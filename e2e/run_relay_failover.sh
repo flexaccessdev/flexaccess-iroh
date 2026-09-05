@@ -158,13 +158,13 @@ expect_server_start_failure() {
     local pattern="$1"; shift
     local rc=0
     start_server "$@"
+    # rc 0: the expected failure was logged (also when the process exited
+    # right after logging it). rc 1: timed out. rc 2: the process died without
+    # logging it, i.e. it failed for some other reason. Only rc 0 passes, and
+    # only if the server never became ready.
     wait_for_log_or_death "$SERVER_PID" "$SERVER_LOG" "$pattern" "$READY_TIMEOUT" || rc=$?
-    # rc 0 (error logged) or 2 (process died after logging) both mean it gave
-    # up; verify it never became ready.
     if grep -Eq "Waiting for clients to connect" "$SERVER_LOG"; then
         rc=1
-    elif [[ "$rc" -eq 2 ]]; then
-        rc=0
     fi
     [[ "$rc" -eq 0 ]] || dump_log "$SERVER_LOG"
     stop_server
