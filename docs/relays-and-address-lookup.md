@@ -125,7 +125,8 @@ by binding a throwaway, relay-only endpoint
 (`clear_ip_transports`, ephemeral identity) for just that one URL and waiting on
 `endpoint.online()`, bounded by a 10 s `RELAY_CONNECT_TIMEOUT`. All probes run in
 parallel. **Startup fails only if no relay comes online; each relay that does
-not is reported as a warning.**
+not is reported as a warning and left out of the relay map the endpoint is
+bound with.**
 
 Probing each relay on its own is what makes those warnings possible: a single
 endpoint-wide `online()` wait only proves that *one* relay (the eventual home
@@ -138,8 +139,14 @@ Startup does not require every relay, deliberately. Failover is the reason for
 the second relay, and a client that restarts during a relay outage has to be
 able to start on the surviving one; requiring every relay at startup would turn
 a survivable relay outage into an outage of every client that restarts during
-it. The same probe is reused by the failover to decide when a relay it took out
-of the map is connectable again (see [relay-failover.md](relay-failover.md)).
+it. Nor may a relay that failed the probe stay in the map: iroh picks its home
+relay by probe latency, so a relay that answers probes but refuses relay
+connections would be preferred, never connect, and keep `online()` from ever
+resolving. `create_endpoint` therefore binds without those relays and hands
+them back (`CreatedEndpoint::relays_left_out`) for the failover to restore
+once they are connectable, using this same probe; a process that does not run
+the failover keeps them out for its lifetime. See
+[relay-failover.md](relay-failover.md#starting-during-an-outage).
 
 `clear_ip_transports()` on the probe endpoint is what makes `online()` a *pure
 relay* reachability signal: a holepunched direct path can never mask a dead or
@@ -158,11 +165,11 @@ only exact repeats): the first URL is the preferred relay.
 of the three that exposes relay-only as a first-class user-facing mode
 (`--relay-only` on both `server` and `client`, CLI-only so it cannot be switched
 on accidentally from a config file), and it carries the matching sequential
-per-relay failover dial path and the fully offline two-relay e2e suite
-(`test-scripts/run_relay_failover_e2e.sh`, see
-[relay-failover.md](relay-failover.md#verification)). Use it to validate a
-self-hosted relay end to end before pointing other programs at it — see
-[self-hosting.md](self-hosting.md). ezvpn and flextunnel keep
+per-relay failover dial path. The fully offline two-relay e2e suites for the
+relay layer itself live with the crate (`e2e/` in [flexaccess-iroh], see
+[relay-failover.md](relay-failover.md#verification)). Use tunnel-rs to
+validate a self-hosted relay end to end before pointing other programs at it —
+see [self-hosting.md](self-hosting.md). ezvpn and flextunnel keep
 `clear_ip_transports()` only inside the startup probe described above.
 
 ## Connect path
@@ -183,7 +190,7 @@ builder.
 
 | Repo | Implementation | Notes |
 |---|---|---|
-| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs`, `src/relay_failover.rs` | `RelayConfig` (at least two custom relays), the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint`, the in-place home-relay failover |
+| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs`, `src/relay_failover.rs`, `e2e/` | `RelayConfig` (at least two custom relays), the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` (binds without the relays that failed the probe, returns them in `CreatedEndpoint`), the in-place home-relay failover (restores them), and the e2e suites for all of it |
 | [tunnel-rs] | `src/iroh_mode/endpoint.rs` | `mf/4` ALPN, transport tuning, user-facing `--relay-only` + sequential relay failover dial; `mdns` on |
 | [ezvpn] | `src/transport/endpoint.rs`, `src/transport/paths.rs` | VPN ALPN, transport tuning, bounded connect; `mdns` off; iroh fork via `[patch.crates-io]`; on-demand `/healthz` per-relay health check for status UIs |
 | [flextunnel] | `crates/flextunnel-core/src/transport/endpoint.rs`, `.../transport/paths.rs` | three ALPNs + native allowlist hook; `mdns` on (crate compiles it out on iOS); outbound bridges attach the same relay hints; on-demand `/healthz` health check |

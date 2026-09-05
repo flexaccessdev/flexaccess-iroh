@@ -17,11 +17,16 @@ contact with public iroh infrastructure.**
 
 ## Before you start: the startup contract
 
-Every configured custom relay is probed **individually** at startup and **all**
-of them must come online, or the process refuses to start. A dead backup relay
-is a startup failure, not a silent degradation. Plan your relay list
-accordingly, and configure **both sides with the full list** — see the warning
-in [relays-and-address-lookup.md](relays-and-address-lookup.md#custom-relays).
+Every configured custom relay is probed **individually** at startup. The
+process refuses to start only when **none** of them comes online; each relay
+that does not is named in a warning and left out of the relay map until the
+server's failover finds it connectable again (a client keeps it out for its
+lifetime). A dead backup relay is therefore loud at startup but not fatal, so
+watch the logs: a relay list that is only half up has no failover left. Plan
+your relay list accordingly (at least two distinct relays are required), and
+configure **both sides with the full list** — see the warning in
+[relays-and-address-lookup.md](relays-and-address-lookup.md#custom-relays)
+and [relay-failover.md](relay-failover.md).
 
 ## Quick start: local relay
 
@@ -196,7 +201,8 @@ configuration error in all three programs.
 
 The token rides the relay WebSocket upgrade as `Authorization: Bearer <token>`,
 which means the per-relay startup probe validates it: a relay that rejects the
-token never comes online and startup fails with that relay named.
+token never comes online, is named in a warning and left out of the relay map,
+and startup fails once no relay accepts it.
 
 ## Verifying a relay
 
@@ -214,12 +220,14 @@ alone is carrying traffic):
 > `TUNNEL_RS_RELAY_AUTH_TOKEN` or `--relay-auth-token` (see the table above);
 > without it the relay rejects the connection and startup fails.
 
-**Two-relay failover behavior** (iroh's own re-homing and the shared in-place
-failover, see [relay-failover.md](relay-failover.md)), fully offline, against
-local `iroh-relay --dev` instances:
+**Two-relay failover behavior** (iroh's own re-homing, the shared in-place
+failover, and starting during an outage, see
+[relay-failover.md](relay-failover.md)), fully offline, against local
+`iroh-relay --dev` instances. This lives with the crate, not with tunnel-rs:
 
 ```bash
-./test-scripts/run_relay_failover_e2e.sh
+# From a flexaccess-iroh checkout (cargo install iroh-relay --features server first)
+./e2e/run_relay_failover.sh
 ```
 
 **Just the HTTP/WebSocket upgrade**, without running a tunnel. `--no-alpn`

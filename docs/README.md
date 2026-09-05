@@ -17,11 +17,14 @@ Since 2026-09 this design is also **code**, once:
 [`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh), a Rust
 crate all three programs depend on by git tag. It carries `RelayConfig` (at
 least two custom relays) and the per-relay startup probe, the common endpoint
-builder (and relay-only mode), the server-side in-place home-relay failover,
-and the endpoint-bound public-key auth transcript over
+builder (and relay-only mode) that binds without the relays that fail the
+probe, the server-side in-place home-relay failover that restores them, and
+the endpoint-bound public-key auth transcript over
 [`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys). A fix to
 any of that lands in the crate and reaches every program on its next tag bump,
-instead of being ported by hand three times.
+instead of being ported by hand three times. The crate also carries the e2e
+suites for this layer (`e2e/`, run in its CI), so a product's own e2e suite
+only has to cover what the product adds.
 
 What stays in each program is what makes it that program: ALPNs, handshake
 formats, QUIC transport tuning, identity and key *files* (the crate takes
@@ -39,9 +42,11 @@ crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
 - **[relay-failover.md](relay-failover.md)** — how a custom-relay server
   stays reachable when its home relay stops working: what iroh 1.1.0 recovers
   on its own, the in-place failover for the case it does not (take the wedged
-  relay out of the relay map, restore it once connectable), why that needs at
-  least two custom relays and no address lookup service, and the tunnel-rs
-  e2e suite that proves it.
+  relay out of the relay map, restore it once connectable), how a process
+  that starts during such an outage still comes online (bind without the
+  relay the probe cannot connect), why that needs at least two custom relays
+  and no address lookup service, and the crate's e2e suite that proves it,
+  behind a relay-only and a live direct connection alike.
 - **[nat-traversal-and-transport.md](nat-traversal-and-transport.md)** — what the
   three programs get from `iroh::Endpoint` and never implement themselves:
   connection establishment, hole punching and relay fallback, NAT traversal by
@@ -62,11 +67,13 @@ crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
 
 [tunnel-rs] is the reference implementation for relay-only deployments: it is the
 only one of the three exposing relay-only as a first-class user-facing mode
-(`--relay-only`), it carries the sequential per-relay failover dial path, it is
-the first consumer of the shared relay failover, and it ships the fully offline
-two-relay e2e suite that exercises it. When bringing up a self-hosted relay,
-validate it with tunnel-rs first — the relay it proves out serves all three
-programs. See [self-hosting.md](self-hosting.md#verifying-a-relay).
+(`--relay-only`), it carries the sequential per-relay failover dial path, and it
+is the first consumer of the shared relay failover. The fully offline two-relay
+suites that exercise the relay layer itself live with the crate
+(`e2e/` in flexaccess-iroh); tunnel-rs's `run_e2e.sh --relay-only` is the
+check that a real tunnel runs over a relay. When bringing up a self-hosted
+relay, validate it with tunnel-rs first — the relay it proves out serves all
+three programs. See [self-hosting.md](self-hosting.md#verifying-a-relay).
 
 ## Scope
 
