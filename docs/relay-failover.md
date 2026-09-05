@@ -188,8 +188,8 @@ the crate's CI on every push.
 |---|---|---|
 | [flexaccess-iroh] | `src/relay_failover.rs`; `MIN_CUSTOM_RELAYS` and the tolerant probe in `src/relay.rs`; the startup exclusion and `CreatedEndpoint` in `src/endpoint.rs`; the e2e suite above in `e2e/` | — |
 | [tunnel-rs] | crate, on v0.0.8 (tunnel-rs v0.6.4): in-place failover and the startup exclusion; `create_server_endpoint` returns `CreatedEndpoint` and the client keeps a relay it could not probe out for its lifetime | `run_multi_source_server` in `src/iroh_mode/multi_source.rs`, selected alongside the accept loop, fed `relays_left_out`. **First consumer** |
-| [ezvpn] | still on v0.0.3, i.e. the watchdog; both the failover and the startup exclusion arrive with the bump | `VpnServer::run` in `src/tunnel/server.rs` |
-| [flextunnel] | still on v0.0.3, i.e. the watchdog; both arrive with the bump | `crates/flextunnel-cli/src/main.rs` |
+| [ezvpn] | crate, on v0.0.8 (ezvpn v0.0.47): in-place failover and the startup exclusion | `VpnServer::run` in `src/tunnel/server.rs`, selected alongside the accept loop, fed `relays_left_out`; the endpoint watch channel that let the TUN reader follow a rebuilt endpoint is gone |
+| [flextunnel] | crate, on v0.0.8 (flextunnel v0.0.76): in-place failover and the startup exclusion. The **client's** rebuildable endpoint (`ClientEndpoint`, its reconnect loop's every-third-attempt rebuild for a wedged client endpoint) is flextunnel's own code now that the crate carries no rebuild | `run_server` in `crates/flextunnel-cli/src/main.rs`, selected alongside `ProxyServer::run`, fed `relays_left_out` |
 
 ## History
 

@@ -193,7 +193,7 @@ builder.
 | [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs`, `src/relay_failover.rs`, `e2e/` | `RelayConfig` (at least two custom relays), the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` (binds without the relays that failed the probe, returns them in `CreatedEndpoint`), the in-place home-relay failover (restores them), and the e2e suites for all of it |
 | [tunnel-rs] | `src/iroh_mode/endpoint.rs` | `mf/4` ALPN, transport tuning, user-facing `--relay-only` + sequential relay failover dial; `mdns` on |
 | [ezvpn] | `src/transport/endpoint.rs`, `src/transport/paths.rs` | VPN ALPN, transport tuning, bounded connect; `mdns` off; iroh fork via `[patch.crates-io]`; on-demand `/healthz` per-relay health check for status UIs |
-| [flextunnel] | `crates/flextunnel-core/src/transport/endpoint.rs`, `.../transport/paths.rs` | three ALPNs + native allowlist hook; `mdns` on (crate compiles it out on iOS); outbound bridges attach the same relay hints; on-demand `/healthz` health check |
+| [flextunnel] | `crates/flextunnel-core/src/transport/endpoint.rs`, `.../transport/paths.rs` | three ALPNs + native allowlist hook; the client's rebuildable endpoint (`ClientEndpoint`, its own since the crate dropped rebuilds); `mdns` on (crate compiles it out on iOS); outbound bridges attach the same relay hints; on-demand `/healthz` health check |
 
 The `/healthz` status check in ezvpn/flextunnel is a *different* thing from the
 startup probe: it runs only when a status snapshot is requested, hits the relay's
