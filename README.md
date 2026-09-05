@@ -82,6 +82,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
+### End-to-end tests
+
+The e2e tests for the shared iroh layer live in [`e2e/`](e2e/README.md), run
+against real relays through a minimal harness (`examples/e2e`) rather than
+through a product: `run_e2e.sh` covers the auth transcript and connectivity
+(default relays, custom relays, relay-only), `run_relay_failover.sh` covers
+the startup probe and the in-place home-relay failover against two local
+`iroh-relay` instances, fully offline. CI runs the offline suites.
+
+```sh
+cargo install iroh-relay --features server   # one-time
+./e2e/run_e2e.sh --local-relays --relay-only
+./e2e/run_relay_failover.sh
+```
+
 To iterate against a consumer before tagging, point the consumer at a local
 checkout without committing it:
 
@@ -89,6 +104,11 @@ checkout without committing it:
 [patch."https://github.com/flexaccessdev/flexaccess-iroh"]
 flexaccess-iroh = { path = "../flexaccess-iroh" }
 ```
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for what is under consideration, including
+folding [flexaccess-keys] into this repository as a subcrate.
 
 ## Releasing
 

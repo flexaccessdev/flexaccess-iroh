@@ -34,6 +34,11 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 iroh-mdns-address-lookup = { version = "0.5", optional = true }
 
 [dev-dependencies]
+# The e2e harness (`examples/e2e`, driven by the scripts in `e2e/`): a
+# command line and a logger for a server/client pair that exercises this
+# crate over real relays. Dev-only, so consumers never pay for them.
+clap = { version = "4", features = ["derive", "env"] }
+env_logger = "0.11"
 # Test double for iroh's `Watcher`-based status APIs (the relay failover tests
 # drive a plain `Watchable`); the same crate iroh itself re-exports `Watcher` from.
 n0-watcher = "1"
