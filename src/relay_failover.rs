@@ -41,6 +41,11 @@
 //! one), the endpoint is nudged with a no-op relay-map change instead, which
 //! forces a fresh report the same way.
 //!
+//! Relays that failed the startup probe were never in the map
+//! ([`crate::endpoint::create_endpoint`] binds without them, so that a process
+//! starting during an outage comes online on a relay that works). They are
+//! handed in as already removed and get the same restore probe.
+//!
 //! Only the *home* relay matters: non-home relays are connected on demand and
 //! dropped after a minute idle, which is normal and not an outage. With the
 //! default relays the future never resolves and never acts: there
@@ -72,10 +77,17 @@ const RELAY_OUTAGE_LOG_GRACE: Duration = Duration::from_secs(5);
 pub const RELAY_RESTORE_INTERVAL: Duration = Duration::from_secs(90);
 
 /// Watch `endpoint`'s home relay and fail over in place when it is lost for
-/// [`RELAY_OUTAGE_FAILOVER`]; see the module docs. Never resolves: run it
+/// [`RELAY_OUTAGE_FAILOVER`]; see the module docs. `relays_left_out` are the
+/// configured relays the endpoint was bound without
+/// ([`crate::endpoint::CreatedEndpoint::relays_left_out`]); they are probed
+/// for restoration like a relay removed here. Never resolves: run it
 /// alongside the accept loop and drop it with the endpoint. Pending forever
 /// with the default relays.
-pub async fn fail_over_home_relay(endpoint: &Endpoint, relay_config: &RelayConfig) {
+pub async fn fail_over_home_relay(
+    endpoint: &Endpoint,
+    relay_config: &RelayConfig,
+    relays_left_out: &[RelayUrl],
+) {
     let RelayConfig::Custom { urls, auth_token } = relay_config else {
         std::future::pending().await
     };
@@ -89,10 +101,31 @@ pub async fn fail_over_home_relay(endpoint: &Endpoint, relay_config: &RelayConfi
         urls: urls.clone(),
         auth_token: auth_token.clone(),
     };
+    let out: Vec<RelayUrl> = relays_left_out
+        .iter()
+        .filter(|url| {
+            let configured = urls.contains(url);
+            if !configured {
+                log::error!("{url} was left out at startup but is not a configured relay; ignoring it");
+            }
+            configured
+        })
+        .cloned()
+        .collect();
+    if !out.is_empty() {
+        log::info!(
+            "{} relay(s) left out of the relay map at startup will be probed for restoration \
+             every {}s: {}",
+            out.len(),
+            RELAY_RESTORE_INTERVAL.as_secs(),
+            out.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        );
+    }
     run_failover(
         endpoint.home_relay_status(),
         |statuses| describe_statuses(statuses),
         &mut relays,
+        out,
     )
     .await
 }
@@ -330,17 +363,21 @@ async fn fail_over<R: FailoverRelays>(
 }
 
 /// The failover loop proper, generic over the status source and the relay
-/// map so tests can drive it with doubles.
-async fn run_failover<W, D, R>(mut watcher: W, describe: D, relays: &mut R)
+/// map so tests can drive it with doubles. `out_at_start` are relays already
+/// out of the map when the loop starts.
+async fn run_failover<W, D, R>(mut watcher: W, describe: D, relays: &mut R, out_at_start: Vec<RelayUrl>)
 where
     W: Watcher,
     D: Fn(&W::Value) -> HomeRelay,
     R: FailoverRelays,
 {
     let mut outage = Outage::default();
-    // Relays taken out of the map, each with when it is next probed for
+    // Relays out of the map, each with when it is next probed for
     // restoration.
-    let mut removed: Vec<(RelayUrl, Instant)> = Vec::new();
+    let mut removed: Vec<(RelayUrl, Instant)> = out_at_start
+        .into_iter()
+        .map(|url| (url, Instant::now() + RELAY_RESTORE_INTERVAL))
+        .collect();
     let mut value = watcher.get();
     outage.observe(&describe(&value));
     loop {
@@ -523,7 +560,21 @@ mod tests {
 
     /// Run the loop against `status` for `bound` of paused time.
     async fn run_for(status: &Watchable<Status>, relays: &mut FakeRelays, bound: Duration) {
-        let _ = tokio::time::timeout(bound, run_failover(status.watch(), describe, relays)).await;
+        run_for_with(status, relays, bound, Vec::new()).await;
+    }
+
+    /// `run_for` with relays already out of the map at the start.
+    async fn run_for_with(
+        status: &Watchable<Status>,
+        relays: &mut FakeRelays,
+        bound: Duration,
+        out_at_start: Vec<RelayUrl>,
+    ) {
+        let _ = tokio::time::timeout(
+            bound,
+            run_failover(status.watch(), describe, relays, out_at_start),
+        )
+        .await;
     }
 
     const SEC: Duration = Duration::from_secs(1);
@@ -690,6 +741,70 @@ mod tests {
                 Action::Remove {
                     url: relay_a(),
                     at: 260 * SEC,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_left_out_at_startup_is_restored_once_connectable_and_never_removed_again() {
+        // Healthy on B from the start, A left out at startup: A gets the
+        // restore probe (still down at 90 s, back at 180 s) and nothing is
+        // ever removed or nudged.
+        let status = Watchable::new(Status::UpOnB);
+        let mut relays = FakeRelays::new(&status, None);
+        relays.connectable.store(false, Ordering::SeqCst);
+        let connectable = relays.connectable.clone();
+        let flipper = async move {
+            tokio::time::sleep(RELAY_RESTORE_INTERVAL + 5 * SEC).await;
+            connectable.store(true, Ordering::SeqCst);
+        };
+        tokio::join!(
+            run_for_with(
+                &status,
+                &mut relays,
+                RELAY_RESTORE_INTERVAL * 3,
+                vec![relay_a()]
+            ),
+            flipper
+        );
+        assert_eq!(
+            relays.actions(),
+            vec![
+                Action::Restore {
+                    url: relay_a(),
+                    restored: false,
+                    at: RELAY_RESTORE_INTERVAL,
+                },
+                Action::Restore {
+                    url: relay_a(),
+                    restored: true,
+                    at: RELAY_RESTORE_INTERVAL * 2,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_left_out_at_startup_is_not_removed_when_the_home_relay_wedges() {
+        // A left out at startup and unconnectable; the endpoint homed on B,
+        // which wedges: B is removed (C is still in the map), A is not
+        // touched beyond its restore probes.
+        let status = Watchable::new(Status::DownOnB);
+        let mut relays = FakeRelays::new(&status, None);
+        relays.connectable.store(false, Ordering::SeqCst);
+        run_for_with(&status, &mut relays, 100 * SEC, vec![relay_a()]).await;
+        assert_eq!(
+            relays.actions(),
+            vec![
+                Action::Remove {
+                    url: relay_b(),
+                    at: RELAY_OUTAGE_FAILOVER,
+                },
+                Action::Restore {
+                    url: relay_a(),
+                    restored: false,
+                    at: RELAY_RESTORE_INTERVAL,
                 },
             ]
         );

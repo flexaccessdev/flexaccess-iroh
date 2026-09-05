@@ -57,8 +57,9 @@ jobs:
 
   # The end-to-end suites that need no public infrastructure: the auth
   # transcript and connectivity over two local iroh-relay instances, and the
-  # relay failover scenarios (which take ~6 minutes by design: a 60 s outage
-  # window and a 90 s restore probe). See e2e/README.md.
+  # relay failover scenarios (which take ~8 minutes by design: a 60 s outage
+  # window and a 90 s restore probe relay-only, then another 60 s window with
+  # direct paths allowed). See e2e/README.md.
   e2e:
     name: e2e (local relays)
     runs-on: ubuntu-latest

@@ -17,9 +17,9 @@ hand into every repo.
 
 | Module | Contents |
 |---|---|
-| `relay` | `RelayConfig` (default vs custom relays, which also decides whether n0 internet discovery is on; custom relays must number at least two distinct URLs; duplicates are collapsed before the count), the shared relay auth token, the per-relay startup probe (fails only when no relay is reachable) |
-| `endpoint` | the common endpoint builder and `create_endpoint` |
-| `relay_failover` | the server-side home-relay failover: after 60 s without a connected home relay, take the wedged relay out of the relay map so the forced net report homes the endpoint on another configured relay, in place; put it back once a probe shows it connectable |
+| `relay` | `RelayConfig` (default vs custom relays, which also decides whether n0 internet discovery is on; custom relays must number at least two distinct URLs; duplicates are collapsed before the count), the shared relay auth token, the per-relay startup probe (fails only when no relay is reachable, and reports which relays did not come online) |
+| `endpoint` | the common endpoint builder and `create_endpoint`, which binds **without** the relays that failed the startup probe (a relay that answers probes but cannot be connected would otherwise be preferred as home relay and keep the endpoint from ever coming online, so every client restarting during such an outage would fail to start) and hands them back for the failover to restore |
+| `relay_failover` | the server-side home-relay failover: after 60 s without a connected home relay, take the wedged relay out of the relay map so the forced net report homes the endpoint on another configured relay, in place; put it back once a probe shows it connectable (likewise for relays left out at startup) |
 | `auth` | the endpoint-bound public-key auth transcript over the [flexaccess-keys] format; each application passes its own domain-separation context |
 
 Deliberately **not** in it: ALPNs, handshake wire formats, QUIC transport
@@ -35,9 +35,9 @@ takes the resulting `iroh::SecretKey` / `flexaccess_keys` values.
 
 ```toml
 [dependencies]
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.7" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.8" }
 # or, with mDNS local-network discovery on every endpoint (compiled out on iOS):
-flexaccess-iroh = { git = "...", tag = "v0.0.7", features = ["mdns"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.8", features = ["mdns"] }
 ```
 
 The `flexaccess_keys` crate is re-exported so a consumer signs and verifies

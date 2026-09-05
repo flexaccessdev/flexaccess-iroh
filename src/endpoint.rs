@@ -12,11 +12,11 @@
 use crate::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig, probe_custom_relays};
 use anyhow::{Context, Result};
 use iroh::{
-    Endpoint,
+    Endpoint, RelayMode, RelayUrl,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, QuicTransportConfig, presets},
 };
-use log::info;
+use log::{info, warn};
 use std::sync::Arc;
 
 /// What an application decides about every endpoint it builds.
@@ -108,18 +108,66 @@ async fn wait_online(endpoint: &Endpoint) -> Result<()> {
     }
 }
 
+/// What [`create_endpoint`] hands back: the bound, online endpoint and the
+/// custom relays it was bound without.
+#[derive(Debug)]
+pub struct CreatedEndpoint {
+    pub endpoint: Endpoint,
+    /// The configured custom relays that failed the startup probe and were
+    /// left out of the endpoint's relay map (see [`create_endpoint`]). Empty
+    /// with the default relays or when every custom relay probed fine. Hand
+    /// them to [`crate::relay_failover::fail_over_home_relay`], which puts
+    /// each one back into the relay map once it is connectable again; a
+    /// process that does not run the failover keeps them out for its
+    /// lifetime.
+    pub relays_left_out: Vec<RelayUrl>,
+}
+
 /// Create an endpoint: log the relay setup, probe every custom relay (fail
-/// only if none is reachable; see [`probe_custom_relays`]), bind, and require
-/// the endpoint to come online. On failure after binding the endpoint is
-/// closed before the error propagates (dropping a bound endpoint without
-/// `close()` is fatal under `panic = "abort"`).
-pub async fn create_endpoint(relay_config: &RelayConfig, builder: EndpointBuilder) -> Result<Endpoint> {
+/// only if none is reachable; see [`probe_custom_relays`]), bind **without**
+/// the relays that failed the probe, and require the endpoint to come online.
+///
+/// Leaving a failed relay out of the relay map is what lets the endpoint come
+/// online during that relay's outage: iroh picks its home relay by probe
+/// latency, so a relay that still answers probes but cannot be connected (the
+/// outage [`crate::relay_failover`] exists for) would otherwise be preferred,
+/// never connect, and keep [`Endpoint::online`] pending until the timeout
+/// here fails the whole start. The relay comes back through the failover's
+/// restore probe; see [`CreatedEndpoint::relays_left_out`].
+///
+/// On failure after binding the endpoint is closed before the error
+/// propagates (dropping a bound endpoint without `close()` is fatal under
+/// `panic = "abort"`).
+pub async fn create_endpoint(
+    relay_config: &RelayConfig,
+    builder: EndpointBuilder,
+) -> Result<CreatedEndpoint> {
     relay_config.log_status();
-    probe_custom_relays(relay_config).await?;
+    let relays_left_out = probe_custom_relays(relay_config).await?;
+    let builder = if relays_left_out.is_empty() {
+        builder
+    } else {
+        warn!(
+            "Binding without {} of {} custom relays: {}",
+            relays_left_out.len(),
+            relay_config.custom_urls().len(),
+            relays_left_out
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        builder.relay_mode(RelayMode::Custom(
+            relay_config.relay_map_without(&relays_left_out),
+        ))
+    };
     let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
     if let Err(e) = wait_online(&endpoint).await {
         endpoint.close().await;
         return Err(e);
     }
-    Ok(endpoint)
+    Ok(CreatedEndpoint {
+        endpoint,
+        relays_left_out,
+    })
 }

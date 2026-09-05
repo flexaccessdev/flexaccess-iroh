@@ -170,13 +170,22 @@ impl RelayConfig {
         match self {
             Self::Default => RelayMode::Default,
             Self::Custom { urls, auth_token } => {
-                let map = RelayMap::from_iter(urls.iter().cloned());
-                let map = match auth_token {
-                    Some(token) => map.with_auth_token(token.clone()),
-                    None => map,
-                };
-                RelayMode::Custom(map)
+                RelayMode::Custom(relay_map(urls.iter().cloned(), auth_token.as_deref()))
             }
+        }
+    }
+
+    /// The custom relay map without `excluded`: what an endpoint is bound
+    /// with when some configured relays failed the startup probe (see
+    /// [`crate::endpoint::create_endpoint`]). The auth token is applied as in
+    /// [`Self::relay_mode`]. Empty for the default relays.
+    pub fn relay_map_without(&self, excluded: &[RelayUrl]) -> RelayMap {
+        match self {
+            Self::Default => RelayMap::empty(),
+            Self::Custom { urls, auth_token } => relay_map(
+                urls.iter().filter(|url| !excluded.contains(url)).cloned(),
+                auth_token.as_deref(),
+            ),
         }
     }
 
@@ -195,6 +204,15 @@ impl RelayConfig {
     }
 }
 
+/// A relay map of `urls`, with `auth_token` (when set) applied to every relay.
+fn relay_map(urls: impl IntoIterator<Item = RelayUrl>, auth_token: Option<&str>) -> RelayMap {
+    let map = RelayMap::from_iter(urls);
+    match auth_token {
+        Some(token) => map.with_auth_token(token.to_string()),
+        None => map,
+    }
+}
+
 /// Build a minimal, relay-only endpoint for probing a single relay.
 ///
 /// It uses an ephemeral identity (no persistent secret, no address publishing)
@@ -208,11 +226,7 @@ fn probe_endpoint_builder(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
 ) -> iroh::endpoint::Builder {
-    let map = RelayMap::from_iter([relay_url.clone()]);
-    let map = match auth_token {
-        Some(token) => map.with_auth_token(token.to_string()),
-        None => map,
-    };
+    let map = relay_map([relay_url.clone()], auth_token);
     // iroh 1.x requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
@@ -245,21 +259,27 @@ pub(crate) async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) 
 
 /// Probe every configured custom relay individually (in parallel). Startup
 /// fails only if **every** relay is unreachable; each relay that does not
-/// come online is reported as a warning, since the endpoint starts with that
-/// much less failover headroom.
+/// come online is reported as a warning and returned, so the caller can bind
+/// the endpoint without it. Default relays are not probed (returns an empty
+/// list immediately).
 ///
-/// Probing each relay on its own is what makes the warnings possible: a
-/// single endpoint-wide `online()` wait proves only that *one* relay (the
-/// home relay) connected and says nothing about the others. Default relays
-/// are not probed (returns `Ok(())` immediately).
+/// Probing each relay on its own is what makes this possible: a single
+/// endpoint-wide `online()` wait proves only that *one* relay (the home
+/// relay) connected and says nothing about the others.
 ///
 /// A relay that is down at startup must not stop the process: with at least
-/// [`MIN_CUSTOM_RELAYS`] distinct relays configured, the remaining ones carry it, and
-/// refusing to start would turn a survivable relay outage into an outage of
-/// every client that restarts during it.
-pub async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
+/// [`MIN_CUSTOM_RELAYS`] distinct relays configured, the remaining ones carry
+/// it, and refusing to start would turn a survivable relay outage into an
+/// outage of every client that restarts during it. Nor may it stay in the
+/// relay map: iroh picks its home relay by probe latency, and a relay that
+/// answers probes but cannot be connected (the outage shape of
+/// [`crate::relay_failover`]) would be preferred, never connect, and keep the
+/// endpoint from ever coming online — every client that restarts during such
+/// an outage would then fail to start, even though the other relay works and
+/// the server has already failed over to it.
+pub async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<Vec<RelayUrl>> {
     let RelayConfig::Custom { urls, auth_token } = relay_config else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let token = auth_token.as_deref();
     info!("Probing {} custom relays for reachability...", urls.len());
@@ -268,27 +288,36 @@ pub async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
             .map(|url| async move { (url, probe_relay(url, token).await) }),
     )
     .await;
-    let failures: Vec<String> = results
+    let failures: Vec<(RelayUrl, anyhow::Error)> = results
         .into_iter()
-        .filter_map(|(url, res)| res.err().map(|e| format!("{url}: {e}")))
+        .filter_map(|(url, res)| res.err().map(|e| (url.clone(), e)))
         .collect();
+    let describe = |failures: &[(RelayUrl, anyhow::Error)]| {
+        failures
+            .iter()
+            .map(|(url, e)| format!("{url}: {e}"))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    };
     if failures.len() == urls.len() {
         anyhow::bail!(
             "all {} custom relays failed to come online:\n  {}",
             urls.len(),
-            failures.join("\n  ")
+            describe(&failures)
         );
     }
     if !failures.is_empty() {
         warn!(
             "{} of {} custom relays failed to come online; continuing with the rest, but a \
-             further relay failure now has less to fail over to:\n  {}",
+             further relay failure now has less to fail over to. They are left out of the \
+             relay map so the endpoint homes on a relay that works, and are put back once \
+             they are connectable again (see relay_failover):\n  {}",
             failures.len(),
             urls.len(),
-            failures.join("\n  ")
+            describe(&failures)
         );
     }
-    Ok(())
+    Ok(failures.into_iter().map(|(url, _)| url).collect())
 }
 
 #[cfg(test)]
@@ -300,6 +329,21 @@ mod tests {
 
     fn two() -> [String; 2] {
         [RELAY.to_string(), RELAY2.to_string()]
+    }
+
+    #[test]
+    fn relay_map_without_drops_only_the_excluded_relays_and_keeps_the_token() {
+        let cfg = RelayConfig::from_urls_with_token(&two(), Some("secret".to_string())).unwrap();
+        let relay: RelayUrl = RELAY.parse().unwrap();
+        let relay2: RelayUrl = RELAY2.parse().unwrap();
+        let map = cfg.relay_map_without(std::slice::from_ref(&relay));
+        assert!(!map.contains(&relay));
+        assert!(map.contains(&relay2));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&relay2).unwrap().auth_token.as_deref(), Some("secret"));
+        let full = cfg.relay_map_without(&[]);
+        assert_eq!(full.len(), 2);
+        assert!(RelayConfig::Default.relay_map_without(&[relay]).is_empty());
     }
 
     #[test]

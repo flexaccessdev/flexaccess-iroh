@@ -1,3 +1,3 @@
-- strict no backward compatibility
+- strict no backward compatibility or legacy code paths
 - run cargo clippy and test after rust code changes
 - no cargo fmt
