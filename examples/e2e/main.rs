@@ -3,14 +3,17 @@
 //!
 //! It is deliberately not an application. A `server` binds an endpoint with
 //! the shared builder, runs the shared home-relay failover beside its accept
-//! loop, and answers one request per connection: the endpoint-bound auth
-//! transcript from [`flexaccess_iroh::auth`] followed by an echo of the
-//! client's message. A `client` builds an ephemeral endpoint the same way,
-//! dials the server through the configured relays, proves its key, and exits
-//! `0` on a clean echo or [`EXIT_AUTH_REJECTED`] when the server refuses the
-//! key. Everything an application would add on top — a product ALPN, QUIC
-//! tuning, config files, forwarding — is left out so a failure here is a
-//! failure of this crate or of iroh, never of a product.
+//! loop, and answers each connection with the endpoint-bound auth transcript
+//! from [`flexaccess_iroh::auth`] followed by an echo of the client's message,
+//! then echoes every further stream the client opens. A `client` builds an
+//! ephemeral endpoint the same way, dials the server through the configured
+//! relays, proves its key, and exits `0` on a clean echo or
+//! [`EXIT_AUTH_REJECTED`] when the server refuses the key; with `--hold-secs`
+//! it keeps the authenticated connection open and echoes again every few
+//! seconds, logging the path each echo ran over, so a script can watch a live
+//! connection through a relay outage. Everything an application would add on
+//! top — a product ALPN, QUIC tuning, config files, forwarding — is left out
+//! so a failure here is a failure of this crate or of iroh, never of a product.
 //!
 //! The remaining subcommands are the test fixtures the relay-failover suite
 //! needs, kept in Rust so the suite depends on nothing but `cargo` and
@@ -116,6 +119,18 @@ impl RelayArgs {
         if self.relay_only && !config.is_custom() {
             bail!("--relay-only requires custom relays (--relay-url, at least two)");
         }
+        // Everything here runs on one host. With mDNS compiled in, a client
+        // with direct paths allowed would find the server over mDNS and dial
+        // it directly, so the relays (and the failover behind a direct
+        // connection) would never be exercised. Relay-only mode adds no
+        // address lookup at all and is unaffected.
+        if !self.relay_only && cfg!(feature = "mdns") {
+            bail!(
+                "the harness was built with the `mdns` feature; with direct paths allowed, \
+                 mDNS would bypass the relays entirely. Build it without features \
+                 (cargo build --example e2e)"
+            );
+        }
         Ok(config)
     }
 
@@ -157,6 +172,14 @@ struct ClientArgs {
     /// Seconds to wait for the connection to the server.
     #[arg(long, default_value_t = 30)]
     connect_timeout: u64,
+    /// After the first echo, keep the connection open for this many seconds,
+    /// echoing again every `--echo-interval-secs` on a fresh stream and
+    /// logging the path each echo ran over. Any failed echo exits non-zero.
+    #[arg(long)]
+    hold_secs: Option<u64>,
+    /// Seconds between echoes while holding the connection open.
+    #[arg(long, default_value_t = 5)]
+    echo_interval_secs: u64,
 }
 
 #[derive(Args)]
@@ -260,7 +283,8 @@ async fn accept_loop(endpoint: &Endpoint, authorized: &Arc<AuthorizedKeys>) -> R
     bail!("the endpoint stopped accepting connections")
 }
 
-/// One request per connection: the auth line, then the message to echo.
+/// The first stream carries the auth line and the message to echo; every
+/// later stream on the same authenticated connection is echoed as is.
 async fn serve(incoming: Incoming, authorized: &AuthorizedKeys) -> Result<()> {
     let conn: Connection = incoming.await.context("accepting connection")?;
     let remote = conn.remote_id();
@@ -274,25 +298,47 @@ async fn serve(incoming: Incoming, authorized: &AuthorizedKeys) -> Result<()> {
     let auth_line = lines.next().context("request without an auth line")?;
     let message = lines.next().unwrap_or_default();
 
-    let response = match authenticate(auth_line, &remote, authorized) {
-        Ok(comment) => {
-            info!("Client {remote} authenticated successfully as {comment}");
-            format!("OK {comment}\n{message}\n")
-        }
+    let comment = match authenticate(auth_line, &remote, authorized) {
+        Ok(comment) => comment,
         Err(reason) => {
             // The client learns only that its proof failed, never which check.
             warn!("Rejected client {remote}: {reason}");
-            "REJECTED Invalid authentication proof\n".to_string()
+            send.write_all(b"REJECTED Invalid authentication proof\n")
+                .await
+                .context("writing response")?;
+            send.finish().context("finishing response")?;
+            // The client closes once it has read the response; give it a
+            // moment so the response is not lost to an early close from
+            // this side.
+            let _ = tokio::time::timeout(CLIENT_CLOSE_GRACE, conn.closed()).await;
+            return Ok(());
         }
     };
-    send.write_all(response.as_bytes())
+    info!("Client {remote} authenticated successfully as {comment}");
+    send.write_all(format!("OK {comment}\n{message}\n").as_bytes())
         .await
         .context("writing response")?;
     send.finish().context("finishing response")?;
-    // The client closes once it has read the response; give it a moment so
-    // the response is not lost to an early close from this side.
-    let _ = tokio::time::timeout(CLIENT_CLOSE_GRACE, conn.closed()).await;
-    Ok(())
+
+    // Further echoes until the client closes; a one-shot client closes right
+    // after reading its response, a holding client keeps opening streams.
+    let mut echoes = 0u64;
+    loop {
+        let (mut send, mut recv) = match conn.accept_bi().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                info!("Client {remote} disconnected after {echoes} further echo(es) ({e})");
+                return Ok(());
+            }
+        };
+        let payload = recv
+            .read_to_end(MAX_MESSAGE)
+            .await
+            .context("reading echo request")?;
+        send.write_all(&payload).await.context("writing echo")?;
+        send.finish().context("finishing echo")?;
+        echoes += 1;
+    }
 }
 
 /// Check `<public-key> <endpoint-id> <signature>` against the connection's
@@ -384,13 +430,13 @@ async fn exchange(
         .read_to_end(MAX_MESSAGE)
         .await
         .context("reading response")?;
-    conn.close(0u32.into(), b"done");
     let response = String::from_utf8(response).context("response is not UTF-8")?;
 
     let mut lines = response.lines();
     let status = lines.next().context("empty response")?;
     if let Some(reason) = status.strip_prefix("REJECTED ") {
         error!("Authentication rejected: {reason}");
+        conn.close(0u32.into(), b"done");
         return Ok(ExitCode::from(EXIT_AUTH_REJECTED));
     }
     let comment = status
@@ -402,26 +448,98 @@ async fn exchange(
         bail!("echo mismatch: sent {:?}, got {echoed:?}", args.message);
     }
     info!("Echo OK ({} bytes)", args.message.len());
+    if let Some(hold) = args.hold_secs {
+        hold_open(&conn, args, Duration::from_secs(hold)).await?;
+    }
+    conn.close(0u32.into(), b"done");
     Ok(ExitCode::SUCCESS)
 }
 
-/// The selected paths of a connection, e.g. `Relay http://127.0.0.1:3340/`
-/// or `Direct 127.0.0.1:41234`.
+/// Keep the authenticated connection open for `hold`, echoing the message
+/// on a fresh stream every `--echo-interval-secs` and logging the path each
+/// echo ran over (`Echo #n OK via Direct …`). A script watches these lines
+/// to see a live connection ride out a relay outage. The first failed echo
+/// is an error.
+async fn hold_open(conn: &Connection, args: &ClientArgs, hold: Duration) -> Result<()> {
+    let interval = Duration::from_secs(args.echo_interval_secs);
+    let deadline = tokio::time::Instant::now() + hold;
+    info!(
+        "Holding the connection open for {}s, echoing every {}s",
+        hold.as_secs(),
+        interval.as_secs()
+    );
+    let mut echoes = 0u64;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(interval).await;
+        echoes += 1;
+        echo_once(conn, &args.message)
+            .await
+            .with_context(|| format!("echo #{echoes} failed (paths: {})", describe_paths(conn)))?;
+        info!("Echo #{echoes} OK via {}", describe_paths(conn));
+    }
+    info!("Held the connection open for {}s ({echoes} further echoes)", hold.as_secs());
+    Ok(())
+}
+
+/// One echo on a fresh stream of an authenticated connection.
+async fn echo_once(conn: &Connection, message: &str) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await.context("opening stream")?;
+    send.write_all(message.as_bytes())
+        .await
+        .context("sending message")?;
+    send.finish().context("finishing message")?;
+    let echoed = recv
+        .read_to_end(MAX_MESSAGE)
+        .await
+        .context("reading echo")?;
+    if echoed != message.as_bytes() {
+        bail!(
+            "echo mismatch: sent {message:?}, got {:?}",
+            String::from_utf8_lossy(&echoed)
+        );
+    }
+    Ok(())
+}
+
+/// The paths of a connection: the selected one(s) first, as `via Relay
+/// http://127.0.0.1:3340/` or `via Direct 127.0.0.1:41234`, then every path
+/// iroh holds for it (selected or not) with its RTT, e.g. `[paths: Direct
+/// 127.0.0.1:41234 (selected, rtt 1ms), Relay http://127.0.0.1:3340/ (rtt
+/// 2ms)]`. A relay path names the peer's home relay as this side knows it,
+/// so the full list shows a re-home even while a direct path carries the
+/// traffic.
 fn describe_paths(conn: &Connection) -> String {
     let paths = conn.paths();
     let selected: Vec<String> = paths
         .iter()
         .filter(|path| path.is_selected())
-        .map(|path| match path.remote_addr() {
-            TransportAddr::Relay(url) => format!("Relay {url}"),
-            TransportAddr::Ip(addr) => format!("Direct {addr}"),
-            other => format!("{other:?}"),
+        .map(|path| describe_addr(path.remote_addr()))
+        .collect();
+    let all: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            let rtt = path.rtt();
+            let addr = describe_addr(path.remote_addr());
+            if path.is_selected() {
+                format!("{addr} (selected, rtt {rtt:.0?})")
+            } else {
+                format!("{addr} (rtt {rtt:.0?})")
+            }
         })
         .collect();
-    if selected.is_empty() {
+    let selected = if selected.is_empty() {
         "no selected path yet".to_string()
     } else {
         selected.join(", ")
+    };
+    format!("{selected} [paths: {}]", all.join(", "))
+}
+
+fn describe_addr(addr: &TransportAddr) -> String {
+    match addr {
+        TransportAddr::Relay(url) => format!("Relay {url}"),
+        TransportAddr::Ip(addr) => format!("Direct {addr}"),
+        other => format!("{other:?}"),
     }
 }
 
