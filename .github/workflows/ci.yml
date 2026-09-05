@@ -54,3 +54,36 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-features
+
+  # The end-to-end suites that need no public infrastructure: the auth
+  # transcript and connectivity over two local iroh-relay instances, and the
+  # relay failover scenarios (which take ~6 minutes by design: a 60 s outage
+  # window and a 90 s restore probe). See e2e/README.md.
+  e2e:
+    name: e2e (local relays)
+    runs-on: ubuntu-latest
+    env:
+      IROH_RELAY_VERSION: "1.1.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+      - name: Cache iroh-relay
+        id: relay-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/iroh-relay
+          key: iroh-relay-${{ runner.os }}-${{ env.IROH_RELAY_VERSION }}
+      - name: Install iroh-relay
+        if: steps.relay-cache.outputs.cache-hit != 'true'
+        run: cargo install iroh-relay --version "$IROH_RELAY_VERSION" --features server --locked
+      - name: Build the harness
+        run: cargo build --example e2e
+      - name: Auth + connectivity (custom relays)
+        run: ./e2e/run_e2e.sh --local-relays
+      - name: Auth + connectivity (relay-only)
+        run: ./e2e/run_e2e.sh --local-relays --relay-only
+      - name: Relay failover
+        run: ./e2e/run_relay_failover.sh
