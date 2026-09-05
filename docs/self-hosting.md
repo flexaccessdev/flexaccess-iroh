@@ -214,8 +214,9 @@ alone is carrying traffic):
 > `TUNNEL_RS_RELAY_AUTH_TOKEN` or `--relay-auth-token` (see the table above);
 > without it the relay rejects the connection and startup fails.
 
-**Two-relay failover behavior**, fully offline, against local
-`iroh-relay --dev` instances:
+**Two-relay failover behavior** (iroh's own re-homing and the shared in-place
+failover, see [relay-failover.md](relay-failover.md)), fully offline, against
+local `iroh-relay --dev` instances:
 
 ```bash
 ./test-scripts/run_relay_failover_e2e.sh

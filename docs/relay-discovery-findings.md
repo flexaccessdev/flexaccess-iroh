@@ -79,13 +79,13 @@ client would learn the server's current home relay). Hence the guidance in
 
 [tunnel-rs]'s `test-scripts/run_relay_failover_e2e.sh` is fully offline: two
 local `iroh-relay --dev` instances, relay-only mode, internet discovery
-auto-disabled. It covers both halves of the relay contract — **startup is strict,
-runtime is not**:
+auto-disabled. It covers the startup probe, iroh's own re-homing, and the shared failover:
 
 | Phase | Scenario |
 |---|---|
-| A | Every configured relay is probed at startup and all must come online: a server configured with both relays fails to start when either is down; a server and client configured with only the live relay connect; clients naming a dead relay fail to start |
-| B | Runtime relay loss is survivable: killing the relay carrying a live connection leaves the server up, and a restarted client on the surviving relay reconnects once the server re-homes (observed ≈ the 20–26 s re-probe cycle); with both relays down new clients fail; after both restart, clients connect again |
+| A | Every configured relay is probed at startup: a server configured with both relays fails to start only when both are down, starts with a warning when one is, and a client with both relays connects through the live one; a single custom relay is rejected as configuration |
+| B | Runtime relay loss is survivable: killing the server's home relay leaves the server up, it re-homes onto the surviving relay on its own (observed ≈ the 20–26 s re-probe cycle) and a restarted client with both relays reconnects; with both relays down new clients fail; after both restart, clients connect again |
+| C | The in-place home-relay failover for the case iroh does not recover on its own; see [relay-failover.md](relay-failover.md#verification) |
 
 `test-scripts/run_e2e.sh --relay-url <r1> --relay-url <r2>` (TCP + UDP) also
 passes against two local relays with no internet discovery, in both normal and
