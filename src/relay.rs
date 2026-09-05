@@ -1,10 +1,11 @@
-//! Relay configuration, the shared relay auth token, and the per-relay startup
-//! probe.
+//! Relay configuration, the shared relay auth token, the address lookup
+//! service custom relays require, and the per-relay startup probe.
 //!
 //! The design is documented in
 //! <https://github.com/flexaccessdev/iroh-common-architecture> (see
 //! `relays-and-address-lookup.md`); this module is its implementation.
 
+use crate::lookup::LookupConfig;
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, endpoint::presets};
@@ -17,16 +18,35 @@ use std::time::Duration;
 /// online before that is treated as a relay connectivity failure.
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Relay configuration, resolved once from the raw config strings.
+/// The raw relay settings a program collects from its config file, command
+/// line, and environment, before [`RelayConfig::resolve`] validates them.
+///
+/// Blank strings are treated as unset, so a program can pass through empty
+/// config values without normalizing them first.
+#[derive(Debug, Clone, Default)]
+pub struct RelaySettings {
+    /// Custom relay URLs; empty selects the default relays.
+    pub relay_urls: Vec<String>,
+    /// Shared bearer token for the custom relays.
+    pub relay_auth_token: Option<String>,
+    /// Scheme and host of the self-hosted address lookup service.
+    pub lookup_url: Option<String>,
+    /// The lookup service's secret (`lks1-...`).
+    pub lookup_secret: Option<String>,
+}
+
+/// Relay configuration, resolved once from the raw settings.
 ///
 /// This is the single source of the default-vs-custom distinction. It selects
-/// both which relay map iroh uses **and** whether iroh *internet* discovery is
-/// enabled: [`Default`](Self::Default) uses the n0 relays with the n0 lookup
-/// stack (pkarr publishing + DNS resolution of the peer's home relay — see
+/// both which relay map iroh uses **and** where address lookup happens:
+/// [`Default`](Self::Default) uses the n0 relays with the n0 lookup stack
+/// (pkarr publishing + DNS resolution of the peer's home relay — see
 /// <https://docs.iroh.computer/concepts/address-lookup>), while
-/// [`Custom`](Self::Custom) uses the configured relays with n0 internet
-/// discovery disabled (dialers use relay hints instead). mDNS local-network
-/// discovery is independent of this choice (see the `mdns` feature).
+/// [`Custom`](Self::Custom) uses the configured relays with a self-hosted
+/// lookup service in place of n0's, which is why that service is mandatory:
+/// without a publish path a peer that moves to another relay is unreachable,
+/// and the standard iroh failover cannot work. mDNS local-network discovery
+/// is independent of this choice (see the `mdns` feature).
 #[derive(Clone, PartialEq, Eq, Default)]
 pub enum RelayConfig {
     /// iroh's default relay map, with n0 address lookup.
@@ -42,24 +62,34 @@ pub enum RelayConfig {
     /// `auth_token`, when set, is sent to every custom relay as an
     /// `Authorization: Bearer <token>` header on the WebSocket upgrade (see
     /// [`Self::relay_mode`]). It is only ever carried by custom relays — the
-    /// default relays never receive a token (see [`Self::from_urls_with_token`]).
+    /// default relays never receive a token (see [`Self::resolve`]).
+    ///
+    /// `lookup` is the self-hosted address lookup service: servers publish
+    /// their relay URL to it and clients resolve peers from it.
     Custom {
         urls: Vec<RelayUrl>,
         auth_token: Option<String>,
+        lookup: LookupConfig,
     },
 }
 
 /// Manual `Debug` so the relay auth token is never written to logs or error
 /// messages: `Custom.auth_token` is shown only as a redacted marker (present
-/// vs. absent), while `urls` keep their normal `Debug` formatting.
+/// vs. absent), while `urls` keep their normal `Debug` formatting (and the
+/// lookup config redacts its own secret).
 impl fmt::Debug for RelayConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Default => f.write_str("Default"),
-            Self::Custom { urls, auth_token } => f
+            Self::Custom {
+                urls,
+                auth_token,
+                lookup,
+            } => f
                 .debug_struct("Custom")
                 .field("urls", urls)
                 .field("auth_token", &auth_token.as_ref().map(|_| RedactedToken))
+                .field("lookup", lookup)
                 .finish(),
         }
     }
@@ -74,39 +104,60 @@ impl fmt::Debug for RedactedToken {
     }
 }
 
-impl RelayConfig {
-    /// Parse raw config strings with no relay auth token.
-    ///
-    /// Thin wrapper over [`Self::from_urls_with_token`]; see there for behavior.
-    pub fn from_urls(urls: &[String]) -> Result<Self> {
-        Self::from_urls_with_token(urls, None)
-    }
+/// Blank or whitespace-only settings count as unset.
+fn non_blank(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
 
-    /// Parse raw config strings and attach an optional shared relay auth token.
+/// Where the mandatory lookup service is explained.
+const LOOKUP_DOCS: &str =
+    "https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md#custom-relays";
+
+impl RelayConfig {
+    /// Validate the raw settings into a relay configuration.
     ///
-    /// Empty input selects the default relays. Parsing fails on the first
-    /// malformed URL, so config typos surface at resolve time instead of at each
-    /// use site.
-    ///
-    /// The token is normalized (blank/whitespace-only becomes `None`) and is
-    /// **strictly gated to custom relays**: a non-empty token with no custom
-    /// relay URLs is a hard error, since the default iroh relays never take a
-    /// token. This surfaces the misconfiguration before the endpoint starts.
-    pub fn from_urls_with_token(urls: &[String], auth_token: Option<String>) -> Result<Self> {
-        let auth_token = auth_token.and_then(|token| {
-            let token = token.trim();
-            (!token.is_empty()).then(|| token.to_string())
-        });
-        if urls.is_empty() {
+    /// No relay URLs selects the default relays; then the auth token and the
+    /// lookup pair must be unset, since the default relays take no token and
+    /// use n0's lookup. Custom relay URLs are parsed (failing on the first
+    /// malformed one, so config typos surface at resolve time instead of at
+    /// each use site) and **require** both `lookup_url` and `lookup_secret`;
+    /// the secret's checksum is verified here. Every misconfiguration is a
+    /// hard error before any endpoint starts.
+    pub fn resolve(settings: RelaySettings) -> Result<Self> {
+        let auth_token = non_blank(settings.relay_auth_token);
+        let lookup_url = non_blank(settings.lookup_url);
+        let lookup_secret = non_blank(settings.lookup_secret);
+        if settings.relay_urls.is_empty() {
             if auth_token.is_some() {
                 anyhow::bail!(
                     "relay_auth_token requires custom relay_urls; it is not used with the default iroh relays"
                 );
             }
+            if lookup_url.is_some() || lookup_secret.is_some() {
+                anyhow::bail!(
+                    "lookup_url and lookup_secret require custom relay_urls; the default iroh relays use n0's address lookup"
+                );
+            }
             return Ok(Self::Default);
         }
-        let mut parsed: Vec<RelayUrl> = Vec::with_capacity(urls.len());
-        for url in urls {
+        let lookup = match (lookup_url, lookup_secret) {
+            (Some(url), Some(secret)) => LookupConfig::new(&url, &secret)?,
+            (url, secret) => {
+                let missing = match (url.is_some(), secret.is_some()) {
+                    (false, false) => "lookup_url and lookup_secret",
+                    (false, true) => "lookup_url",
+                    _ => "lookup_secret",
+                };
+                anyhow::bail!(
+                    "custom relay_urls require a self-hosted address lookup service: {missing} not set (see {LOOKUP_DOCS})"
+                );
+            }
+        };
+        let mut parsed: Vec<RelayUrl> = Vec::with_capacity(settings.relay_urls.len());
+        for url in &settings.relay_urls {
             let url = url
                 .parse::<RelayUrl>()
                 .with_context(|| format!("Invalid relay URL: {url}"))?;
@@ -117,6 +168,7 @@ impl RelayConfig {
         Ok(Self::Custom {
             urls: parsed,
             auth_token,
+            lookup,
         })
     }
 
@@ -136,6 +188,14 @@ impl RelayConfig {
         }
     }
 
+    /// The self-hosted lookup service (custom relays only).
+    pub fn lookup(&self) -> Option<&LookupConfig> {
+        match self {
+            Self::Default => None,
+            Self::Custom { lookup, .. } => Some(lookup),
+        }
+    }
+
     pub fn is_custom(&self) -> bool {
         matches!(self, Self::Custom { .. })
     }
@@ -148,7 +208,9 @@ impl RelayConfig {
     pub fn relay_mode(&self) -> RelayMode {
         match self {
             Self::Default => RelayMode::Default,
-            Self::Custom { urls, auth_token } => {
+            Self::Custom {
+                urls, auth_token, ..
+            } => {
                 let map = RelayMap::from_iter(urls.iter().cloned());
                 let map = match auth_token {
                     Some(token) => map.with_auth_token(token.clone()),
@@ -159,18 +221,27 @@ impl RelayConfig {
         }
     }
 
-    /// Log which relays are in use (silent for the default relays). Only ever
-    /// reports *whether* an auth token is set — never the token itself.
+    /// Log which relays and lookup service are in use (silent for the default
+    /// relays). Only ever reports *whether* an auth token is set — never the
+    /// token — and names the lookup service by host, never its secret.
     pub fn log_status(&self) {
-        let auth = if self.relay_auth_token().is_some() {
+        let Self::Custom {
+            urls,
+            auth_token,
+            lookup,
+        } = self
+        else {
+            return;
+        };
+        let auth = if auth_token.is_some() {
             " (authenticated)"
         } else {
             ""
         };
-        match self.custom_urls().len() {
-            0 => {}
-            1 => info!("Using custom relay server{auth}"),
-            n => info!("Using {n} custom relay servers with failover{auth}"),
+        let host = lookup.display_host();
+        match urls.len() {
+            1 => info!("Using custom relay server{auth}; address lookup via {host}"),
+            n => info!("Using {n} custom relay servers with failover{auth}; address lookup via {host}"),
         }
     }
 }
@@ -236,7 +307,10 @@ async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) -> Result<(
 /// rebuild's recovery through the one relay that still answers, so
 /// [`crate::endpoint::rebuild_endpoint`] deliberately skips it.
 pub async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
-    let RelayConfig::Custom { urls, auth_token } = relay_config else {
+    let RelayConfig::Custom {
+        urls, auth_token, ..
+    } = relay_config
+    else {
         return Ok(());
     };
     let token = auth_token.as_deref();
@@ -264,39 +338,99 @@ pub async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lookup::LookupSecret;
 
     const RELAY: &str = "https://relay.example.com./";
+    const LOOKUP: &str = "https://lookup.example.com";
 
-    #[test]
-    fn empty_urls_no_token_is_default() {
-        let cfg = RelayConfig::from_urls_with_token(&[], None).unwrap();
-        assert_eq!(cfg, RelayConfig::Default);
-        assert!(!cfg.is_custom());
-        assert_eq!(cfg.relay_auth_token(), None);
+    fn custom(urls: &[&str]) -> RelaySettings {
+        RelaySettings {
+            relay_urls: urls.iter().map(ToString::to_string).collect(),
+            relay_auth_token: None,
+            lookup_url: Some(LOOKUP.to_string()),
+            lookup_secret: Some(LookupSecret::generate().to_string()),
+        }
     }
 
     #[test]
-    fn blank_token_without_urls_is_default() {
-        // A whitespace-only token normalizes to None, so it is not an error.
-        let cfg = RelayConfig::from_urls_with_token(&[], Some("   ".to_string())).unwrap();
+    fn empty_settings_are_default() {
+        let cfg = RelayConfig::resolve(RelaySettings::default()).unwrap();
+        assert_eq!(cfg, RelayConfig::Default);
+        assert!(!cfg.is_custom());
+        assert_eq!(cfg.relay_auth_token(), None);
+        assert!(cfg.lookup().is_none());
+        assert!(matches!(cfg.relay_mode(), RelayMode::Default));
+    }
+
+    #[test]
+    fn blank_values_without_urls_are_default() {
+        // Whitespace-only values normalize to unset, so they are not errors.
+        let cfg = RelayConfig::resolve(RelaySettings {
+            relay_urls: vec![],
+            relay_auth_token: Some("   ".to_string()),
+            lookup_url: Some(" ".to_string()),
+            lookup_secret: Some("".to_string()),
+        })
+        .unwrap();
         assert_eq!(cfg, RelayConfig::Default);
     }
 
     #[test]
     fn token_without_custom_urls_is_error() {
-        let err = RelayConfig::from_urls_with_token(&[], Some("secret".to_string()))
-            .expect_err("token without custom relays must be rejected");
+        let err = RelayConfig::resolve(RelaySettings {
+            relay_auth_token: Some("secret".to_string()),
+            ..RelaySettings::default()
+        })
+        .expect_err("token without custom relays must be rejected");
         assert!(
-            err.to_string()
-                .contains("relay_auth_token requires custom relay_urls"),
+            err.to_string().contains("relay_auth_token requires custom relay_urls"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn malformed_custom_url_is_rejected_without_token() {
-        // Custom relays are always parse-validated, independent of any token.
-        let err = RelayConfig::from_urls_with_token(&["not a url".to_string()], None)
+    fn lookup_without_custom_urls_is_error() {
+        let err = RelayConfig::resolve(RelaySettings {
+            lookup_url: Some(LOOKUP.to_string()),
+            ..RelaySettings::default()
+        })
+        .expect_err("lookup without custom relays must be rejected");
+        assert!(
+            err.to_string().contains("require custom relay_urls"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn custom_urls_require_the_lookup_pair() {
+        let mut settings = custom(&[RELAY]);
+        settings.lookup_secret = None;
+        let err = RelayConfig::resolve(settings).expect_err("missing secret must be rejected");
+        assert!(err.to_string().contains("lookup_secret not set"), "unexpected error: {err}");
+
+        let mut settings = custom(&[RELAY]);
+        settings.lookup_url = None;
+        let err = RelayConfig::resolve(settings).expect_err("missing url must be rejected");
+        assert!(err.to_string().contains("lookup_url not set"), "unexpected error: {err}");
+
+        let mut settings = custom(&[RELAY]);
+        settings.lookup_url = None;
+        settings.lookup_secret = None;
+        let err = RelayConfig::resolve(settings).expect_err("missing pair must be rejected");
+        assert!(
+            err.to_string().contains("lookup_url and lookup_secret not set"),
+            "unexpected error: {err}"
+        );
+
+        let mut settings = custom(&[RELAY]);
+        settings.lookup_secret = Some("lks1-typo".to_string());
+        let err = RelayConfig::resolve(settings).expect_err("bad secret must be rejected");
+        assert!(err.to_string().contains("lookup_secret"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn malformed_custom_url_is_rejected() {
+        let err = RelayConfig::resolve(custom(&["not a url"]))
             .expect_err("malformed relay URL must be rejected");
         assert!(
             err.to_string().contains("Invalid relay URL"),
@@ -305,11 +439,17 @@ mod tests {
     }
 
     #[test]
-    fn custom_urls_without_token() {
-        let cfg = RelayConfig::from_urls_with_token(&[RELAY.to_string()], None).unwrap();
+    fn custom_urls_with_lookup() {
+        let settings = custom(&[RELAY]);
+        let secret = settings.lookup_secret.clone().unwrap();
+        let cfg = RelayConfig::resolve(settings).unwrap();
         assert!(cfg.is_custom());
         assert_eq!(cfg.custom_urls().len(), 1);
         assert_eq!(cfg.relay_auth_token(), None);
+        assert_eq!(
+            cfg.lookup().unwrap().pkarr_url().as_str(),
+            format!("{LOOKUP}/{secret}/pkarr")
+        );
         assert!(matches!(cfg.relay_mode(), RelayMode::Custom(_)));
     }
 
@@ -317,57 +457,46 @@ mod tests {
     fn custom_urls_keep_configured_order_while_deduping() {
         // A relay-only dialer walks custom_urls() in order, so the configured
         // order is the failover order and must survive dedup unsorted.
-        let cfg = RelayConfig::from_urls(&[
-            "https://b.example.com./".to_string(),
-            "https://a.example.com./".to_string(),
-            "https://b.example.com./".to_string(),
-        ])
+        let cfg = RelayConfig::resolve(custom(&[
+            "https://b.example.com./",
+            "https://a.example.com./",
+            "https://b.example.com./",
+        ]))
         .unwrap();
         let urls: Vec<String> = cfg.custom_urls().iter().map(ToString::to_string).collect();
         assert_eq!(urls, ["https://b.example.com./", "https://a.example.com./"]);
     }
 
     #[test]
-    fn custom_urls_with_token_trimmed() {
-        let cfg =
-            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("  secret\n".to_string()))
-                .unwrap();
-        assert!(cfg.is_custom());
+    fn token_is_trimmed() {
+        let mut settings = custom(&[RELAY]);
+        settings.relay_auth_token = Some("  secret\n".to_string());
+        let cfg = RelayConfig::resolve(settings).unwrap();
         assert_eq!(cfg.relay_auth_token(), Some("secret"));
-        assert!(matches!(cfg.relay_mode(), RelayMode::Custom(_)));
-    }
 
-    #[test]
-    fn token_is_trimmed_to_none_with_custom_urls() {
         // A blank token alongside custom relays is simply no token, not an error.
-        let cfg = RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("  ".to_string()))
-            .unwrap();
-        assert!(cfg.is_custom());
+        let mut settings = custom(&[RELAY]);
+        settings.relay_auth_token = Some("  ".to_string());
+        let cfg = RelayConfig::resolve(settings).unwrap();
         assert_eq!(cfg.relay_auth_token(), None);
     }
 
     #[test]
-    fn debug_output_redacts_auth_token() {
-        let cfg =
-            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("secret".to_string()))
-                .unwrap();
+    fn debug_output_redacts_secrets() {
+        let mut settings = custom(&[RELAY]);
+        settings.relay_auth_token = Some("hunter2".to_string());
+        let lookup_secret = settings.lookup_secret.clone().unwrap();
+        let cfg = RelayConfig::resolve(settings).unwrap();
         let dbg = format!("{cfg:?}");
-        assert!(
-            !dbg.contains("secret"),
-            "token leaked in Debug output: {dbg}"
-        );
+        assert!(!dbg.contains("hunter2"), "token leaked in Debug output: {dbg}");
+        assert!(!dbg.contains(&lookup_secret[10..]), "lookup secret leaked: {dbg}");
         assert!(dbg.contains("<redacted>"), "unexpected Debug output: {dbg}");
         assert!(dbg.contains(RELAY), "urls missing from Debug output: {dbg}");
+        assert!(dbg.contains(LOOKUP), "lookup host missing from Debug output: {dbg}");
 
-        let no_token = RelayConfig::from_urls(&[RELAY.to_string()]).unwrap();
+        let no_token = RelayConfig::resolve(custom(&[RELAY])).unwrap();
         assert!(format!("{no_token:?}").contains("auth_token: None"));
         assert_eq!(format!("{:?}", RelayConfig::Default), "Default");
-    }
-
-    #[test]
-    fn from_urls_carries_no_token() {
-        let cfg = RelayConfig::from_urls(&[RELAY.to_string()]).unwrap();
-        assert_eq!(cfg.relay_auth_token(), None);
     }
 
     #[tokio::test]

@@ -7,10 +7,14 @@
 //! across repos:
 //!
 //! - [`relay`]: the default-vs-custom [`relay::RelayConfig`] (which also decides
-//!   whether n0 internet discovery is on), the shared relay auth token, and the
+//!   where address lookup happens), the shared relay auth token, and the
 //!   strict per-relay startup probe.
+//! - [`lookup`]: the self-hosted address lookup service that custom relays
+//!   require — the `lks1-` secret format and the `lookup_url` /
+//!   `lookup_secret` pair.
 //! - [`endpoint`]: the common endpoint builder, the bind-and-come-online policy
-//!   for first creation versus a mid-run rebuild, and a
+//!   for first creation versus a mid-run rebuild (including the foreground
+//!   first publish to the lookup service), and a
 //!   [`endpoint::RebuildableEndpoint`] handle.
 //! - [`auth`]: the endpoint-bound public-key authentication transcript over the
 //!   shared [`flexaccess_keys`] format; each application supplies its own
@@ -29,6 +33,7 @@
 
 pub mod auth;
 pub mod endpoint;
+pub mod lookup;
 pub mod relay;
 
 pub use flexaccess_keys;

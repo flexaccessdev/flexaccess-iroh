@@ -1,8 +1,8 @@
 [package]
 name = "flexaccess-iroh"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
-description = "Shared iroh transport layer for FlexAccess applications: relay configuration and probing, endpoint building and rebuilding, and the endpoint-bound public-key auth transcript"
+description = "Shared iroh transport layer for FlexAccess applications: relay configuration and probing, the self-hosted address lookup custom relays require, endpoint building and rebuilding, and the endpoint-bound public-key auth transcript"
 repository = "https://github.com/flexaccessdev/flexaccess-iroh"
 
 [features]
@@ -20,6 +20,8 @@ base64 = "0.22"
 # consumers see exactly the version this crate signs and verifies with.
 flexaccess-keys = { git = "https://github.com/flexaccessdev/flexaccess-keys", tag = "v0.0.2", default-features = false }
 futures = "0.3"
+# Random bytes for a fresh lookup secret.
+getrandom = "0.4"
 # A range, deliberately: every consumer resolves one `iroh` 1.1.x for its own
 # workspace and this crate compiles against it. A consumer on a fork of iroh
 # redirects this dependency too with `[patch.crates-io]` (see README.md).
@@ -27,6 +29,7 @@ iroh = ">=1.1.0, <1.2.0"
 log = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+url = "2"
 
 # iroh's mDNS lookup sends raw UDP multicast, which iOS rejects without the
 # multicast entitlement, so it is never even a dependency there.
@@ -34,4 +37,8 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 iroh-mdns-address-lookup = { version = "0.5", optional = true }
 
 [dev-dependencies]
+env_logger = "0.11"
+# An in-process relay for the lookup integration test, plain HTTP on
+# localhost (the same server `iroh-relay --dev` runs).
+iroh-relay = { version = ">=1.1.0, <1.2.0", features = ["server"] }
 tokio = { version = "1", features = ["full"] }

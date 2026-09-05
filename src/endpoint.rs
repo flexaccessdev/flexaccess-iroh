@@ -10,17 +10,26 @@
 //! [`endpoint_builder`], then hand it to [`create_endpoint`] (first creation:
 //! strict) or [`rebuild_endpoint`] (mid-run replacement: tolerant).
 
+use crate::lookup::LookupConfig;
 use crate::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig, probe_custom_relays};
 use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use iroh::{
-    Endpoint, EndpointId,
-    address_lookup::{DnsAddressLookup, PkarrPublisher},
+    Endpoint, EndpointId, TransportAddr,
+    address_lookup::{
+        DEFAULT_PKARR_TTL, DnsAddressLookup, EndpointData, EndpointInfo, PkarrPublisher,
+        PkarrRelayClient, PkarrResolver,
+    },
     endpoint::{Builder as EndpointBuilder, QuicTransportConfig, presets},
 };
 use log::info;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How long the first publish of a server's address record may take. It is a
+/// single HTTP PUT to the lookup service; a Cloudflare-tunnelled service
+/// answers in well under a second.
+pub const LOOKUP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What an application decides about every endpoint it builds.
 #[derive(Debug, Clone)]
@@ -30,40 +39,44 @@ pub struct EndpointOptions {
     /// product-specific by design — a VPN's datagram path and a proxy's
     /// stream path want different settings.
     pub transport_config: QuicTransportConfig,
-    /// Whether to publish this endpoint's address to n0's pkarr DNS when on the
-    /// default relays (a no-op with custom relays, where internet discovery is
-    /// off). A server with a persistent identity publishes so clients can
-    /// resolve it by id; a client that only dials out should not advertise
-    /// itself.
+    /// Whether to publish this endpoint's address record: to n0's pkarr
+    /// service on the default relays, to the configured lookup service with
+    /// custom relays. A server with a persistent identity publishes so clients
+    /// can resolve it by id; a client that only dials out should not
+    /// advertise itself. Only the relay URL is ever published, never IP
+    /// addresses.
     pub publish_address: bool,
     /// Reach peers **only** through the configured relays: the direct IP
-    /// transports are dropped and no address lookup of any kind (n0 internet
-    /// discovery, mDNS) is added, so nothing can ever produce a direct path.
-    /// A testing and reference mode for a self-hosted relay deployment; only
-    /// meaningful with custom relays (the default relays are rate-limited).
+    /// transports are dropped and no local-network discovery (mDNS) is added,
+    /// so nothing can ever produce a direct path. The address lookup service
+    /// stays, since it carries relay URLs only. A testing and reference mode
+    /// for a self-hosted relay deployment; only meaningful with custom relays
+    /// (the default relays are rate-limited).
     pub relay_only: bool,
 }
 
 /// Create a base endpoint builder with the common configuration.
 ///
-/// iroh *internet* discovery (n0 pkarr publishing + DNS-based lookup of
-/// `_iroh.<endpoint-id>.dns.iroh.link`, see
-/// <https://docs.iroh.computer/concepts/address-lookup>) follows the relay mode:
+/// Internet address lookup (pkarr publishing of the home relay and
+/// resolution of a peer's, see
+/// <https://docs.iroh.computer/concepts/address-lookup>) follows the relay
+/// mode:
 ///
-/// - [`RelayConfig::Default`]: the n0 lookup stack is enabled — DNS resolution
-///   is always on, and pkarr publishing is added only when
-///   [`EndpointOptions::publish_address`] is set.
-/// - [`RelayConfig::Custom`]: n0 internet discovery is disabled — nothing is
-///   published to or resolved from n0's public infrastructure. Dialers reach
-///   peers through relay hints attached to the peer's `EndpointAddr`: iroh
-///   sends QUIC Initials to every configured relay, so the handshake succeeds
-///   via whichever relay the peer is homed on.
+/// - [`RelayConfig::Default`]: the n0 lookup stack — DNS resolution of
+///   `_iroh.<endpoint-id>.dns.iroh.link` is always on, and pkarr publishing
+///   to n0 is added only when [`EndpointOptions::publish_address`] is set.
+/// - [`RelayConfig::Custom`]: the configured self-hosted lookup service —
+///   pkarr resolution over HTTP is always on, and pkarr publishing is added
+///   only when `publish_address` is set. Nothing is published to or resolved
+///   from n0's infrastructure. Dialers may still attach relay hints to the
+///   peer's `EndpointAddr`; the lookup record is what reaches them once the
+///   peer has moved to a relay the hints do not name.
 ///
 /// With the `mdns` feature, mDNS local-network discovery is added independent
 /// of the relay mode (except on iOS, where it is compiled out).
 ///
-/// [`EndpointOptions::relay_only`] overrides all of that: the IP transports
-/// are cleared and no address lookup at all is added.
+/// [`EndpointOptions::relay_only`] then clears the IP transports and skips
+/// mDNS; the internet lookup stays.
 pub fn endpoint_builder(relay_config: &RelayConfig, options: EndpointOptions) -> EndpointBuilder {
     // iroh 1.x requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
@@ -73,18 +86,29 @@ pub fn endpoint_builder(relay_config: &RelayConfig, options: EndpointOptions) ->
         .transport_config(options.transport_config)
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
 
-    if options.relay_only {
-        info!("Relay-only mode: no direct paths and no address lookup");
-        return builder.clear_ip_transports();
+    match relay_config.lookup() {
+        Some(lookup) => {
+            let pkarr_url = lookup.pkarr_url();
+            if options.publish_address {
+                builder = builder.address_lookup(PkarrPublisher::builder(pkarr_url.clone()));
+            }
+            builder = builder.address_lookup(PkarrResolver::builder(pkarr_url));
+            info!(
+                "Address lookup via {} (custom relays; nothing goes to n0)",
+                lookup.display_host()
+            );
+        }
+        None => {
+            if options.publish_address {
+                builder = builder.address_lookup(PkarrPublisher::n0_dns());
+            }
+            builder = builder.address_lookup(DnsAddressLookup::n0_dns());
+        }
     }
 
-    if relay_config.is_custom() {
-        info!("Internet discovery disabled (custom relays configured)");
-    } else {
-        if options.publish_address {
-            builder = builder.address_lookup(PkarrPublisher::n0_dns());
-        }
-        builder = builder.address_lookup(DnsAddressLookup::n0_dns());
+    if options.relay_only {
+        info!("Relay-only mode: no direct paths and no local-network discovery");
+        return builder.clear_ip_transports();
     }
     #[cfg(all(feature = "mdns", not(target_os = "ios")))]
     {
@@ -92,6 +116,60 @@ pub fn endpoint_builder(relay_config: &RelayConfig, options: EndpointOptions) ->
     }
 
     builder
+}
+
+/// Publish the endpoint's address record to the lookup service now, in the
+/// foreground, and fail if the service rejects it.
+///
+/// iroh's own publisher does the same in the background and keeps
+/// republishing for the life of the endpoint, but it only logs failures and
+/// retries forever. A server that cannot publish is unreachable to every
+/// client that does not already know its relay, so the first publish is done
+/// here where a wrong `lookup_secret` (a `404` from the reverse proxy), a
+/// wrong host, or a service that is down stops the program with the reason.
+/// The record carries the relay URLs only, never IP addresses, exactly like
+/// the background publisher's.
+///
+/// Requires the endpoint to be online (it has a home relay to publish).
+pub async fn publish_address_record(endpoint: &Endpoint, lookup: &LookupConfig) -> Result<()> {
+    let addr = endpoint.addr();
+    let relays: Vec<TransportAddr> = addr
+        .relay_urls()
+        .map(|url| TransportAddr::Relay(url.clone()))
+        .collect();
+    if relays.is_empty() {
+        anyhow::bail!("Endpoint has no home relay to publish (is it online?)");
+    }
+    let relay_list: Vec<String> = addr.relay_urls().map(ToString::to_string).collect();
+    let info = EndpointInfo::from_parts(endpoint.id(), EndpointData::new(relays));
+    let packet = info
+        .to_pkarr_signed_packet(endpoint.secret_key(), DEFAULT_PKARR_TTL)
+        .map_err(|e| anyhow::anyhow!("{e:#}"))
+        .context("Failed to sign the address record")?;
+    let dns_resolver = endpoint
+        .dns_resolver()
+        .map_err(|e| anyhow::anyhow!("{e:#}"))
+        .context("Endpoint has no DNS resolver")?
+        .clone();
+    let client = PkarrRelayClient::new(lookup.pkarr_url(), endpoint.tls_config().clone(), dns_resolver);
+    let host = lookup.display_host();
+    match tokio::time::timeout(LOOKUP_PUBLISH_TIMEOUT, client.publish(&packet)).await {
+        Ok(Ok(())) => {
+            info!(
+                "Published address record to the lookup service at {host} (relay: {})",
+                relay_list.join(", ")
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => anyhow::bail!(
+            "Failed to publish the address record to the lookup service at {host}: {e:#}. \
+             Check lookup_url and lookup_secret, and that the service is up (a wrong secret is a 404)"
+        ),
+        Err(_) => anyhow::bail!(
+            "Publishing the address record to the lookup service at {host} timed out after {}s",
+            LOOKUP_PUBLISH_TIMEOUT.as_secs()
+        ),
+    }
 }
 
 /// Wait for a freshly bound endpoint to come online (relay/discovery ready),
@@ -113,15 +191,29 @@ pub async fn wait_online(endpoint: &Endpoint) -> Result<()> {
 }
 
 /// First creation of an endpoint: log the relay setup, probe every custom
-/// relay (fail if any is unreachable — configuration validation), bind, and
-/// require the endpoint to come online. On failure after binding the endpoint
-/// is closed before the error propagates (dropping a bound endpoint without
-/// `close()` is fatal under `panic = "abort"`).
-pub async fn create_endpoint(relay_config: &RelayConfig, builder: EndpointBuilder) -> Result<Endpoint> {
+/// relay (fail if any is unreachable — configuration validation), bind,
+/// require the endpoint to come online, and — for an endpoint that publishes
+/// its address (`publishes_address`, the same value the builder was given as
+/// [`EndpointOptions::publish_address`]) on custom relays — publish its
+/// record to the lookup service in the foreground, failing if the service
+/// rejects it (see [`publish_address_record`]). On failure after binding the
+/// endpoint is closed before the error propagates (dropping a bound endpoint
+/// without `close()` is fatal under `panic = "abort"`).
+pub async fn create_endpoint(
+    relay_config: &RelayConfig,
+    builder: EndpointBuilder,
+    publishes_address: bool,
+) -> Result<Endpoint> {
     relay_config.log_status();
     probe_custom_relays(relay_config).await?;
     let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
     if let Err(e) = wait_online(&endpoint).await {
+        endpoint.close().await;
+        return Err(e);
+    }
+    if publishes_address && let Some(lookup) = relay_config.lookup()
+        && let Err(e) = publish_address_record(&endpoint, lookup).await
+    {
         endpoint.close().await;
         return Err(e);
     }
@@ -137,6 +229,8 @@ pub async fn create_endpoint(relay_config: &RelayConfig, builder: EndpointBuilde
 /// - **The online wait is tolerated failing.** A fresh endpoint is no worse
 ///   than the wedged one it replaces — LAN peers can still find it over mDNS —
 ///   and the client's reconnect escalation retries if the relays stay unreachable.
+/// - **No foreground publish.** A rebuilt endpoint that publishes leaves it
+///   to iroh's background publisher, which retries until the service answers.
 pub async fn rebuild_endpoint(builder: EndpointBuilder) -> Result<Endpoint> {
     let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
     if let Err(e) = wait_online(&endpoint).await {

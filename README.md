@@ -17,8 +17,9 @@ hand into every repo.
 
 | Module | Contents |
 |---|---|
-| `relay` | `RelayConfig` (default vs custom relays, which also decides whether n0 internet discovery is on), the shared relay auth token, the strict per-relay startup probe |
-| `endpoint` | the common endpoint builder, `create_endpoint` (strict first creation) vs `rebuild_endpoint` (tolerant mid-run replacement), `RebuildableEndpoint` |
+| `relay` | `RelayConfig` (default vs custom relays, which also decides where address lookup happens), the shared relay auth token, the strict per-relay startup probe |
+| `lookup` | the self-hosted address lookup service that custom relays **require**: the `lks1-` secret format (lowercase z-base-32 with a CRC-32, so a typo fails at config load) and the `lookup_url` / `lookup_secret` pair the crate turns into `<url>/<secret>/pkarr` |
+| `endpoint` | the common endpoint builder, `create_endpoint` (strict first creation, including the foreground first publish to the lookup service) vs `rebuild_endpoint` (tolerant mid-run replacement), `RebuildableEndpoint` |
 | `auth` | the endpoint-bound public-key auth transcript over the [flexaccess-keys] format; each application passes its own domain-separation context |
 
 Deliberately **not** in it: ALPNs, handshake wire formats, QUIC transport
@@ -30,12 +31,29 @@ takes the resulting `iroh::SecretKey` / `flexaccess_keys` values.
 
 [flexaccess-keys]: https://github.com/flexaccessdev/flexaccess-keys
 
+## Custom relays need a lookup service
+
+Custom relays turn n0's address lookup off, so without a replacement a
+server that moves to another relay is unreachable to every client that only
+knows the old one. `RelayConfig::resolve` therefore **rejects** custom relay
+URLs without a `lookup_url` and `lookup_secret`: one self-hosted
+`iroh-dns-server` behind a reverse proxy that only serves
+`/<lookup_secret>/…`. Servers publish their relay URL there at startup (in the
+foreground, so a wrong secret or a dead service stops the program with the
+reason) and iroh keeps republishing; clients resolve peers from it. The
+deployment recipe is in
+[self-hosting.md](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/self-hosting.md),
+the design in
+[relays-and-address-lookup.md](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md#custom-relays).
+
 ## Server relay recovery
 
-Servers rely on iroh 1.1.x for relay reconnects and keep the same endpoint
-during relay outages. The former server watchdog has been removed; see the
-[relay recovery history and workaround](https://github.com/flexaccessdev/iroh-common-architecture/blob/9eacd43b80d867a8a4a76e3051237b854b4b0cd5/home-relay-watchdog.md)
-if permanent loss of relay registration recurs.
+Servers rely on iroh 1.1.x for relay reconnects and re-homing, and on the
+lookup service to tell clients where they went; they keep the same endpoint
+during relay outages. The former server watchdog has been removed. Its
+history, the failure it covered, and the conditions for bringing it back are
+in
+[home-relay-watchdog.md](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/home-relay-watchdog.md).
 
 The client-side `RebuildableEndpoint` remains available for reconnect escalation.
 
@@ -43,9 +61,9 @@ The client-side `RebuildableEndpoint` remains available for reconnect escalation
 
 ```toml
 [dependencies]
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.5" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.6" }
 # or, with mDNS local-network discovery on every endpoint (compiled out on iOS):
-flexaccess-iroh = { git = "...", tag = "v0.0.5", features = ["mdns"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.6", features = ["mdns"] }
 ```
 
 The `flexaccess_keys` crate is re-exported so a consumer signs and verifies
