@@ -7,8 +7,9 @@
 //! across repos:
 //!
 //! - [`relay`]: the default-vs-custom [`relay::RelayConfig`] (which also decides
-//!   whether n0 internet discovery is on, and requires at least two custom
-//!   relays), the shared relay auth token, and the per-relay startup probe.
+//!   whether n0 internet discovery is on, and requires at least two distinct
+//!   custom relays, duplicates collapsed), the shared relay auth token, and the
+//!   per-relay startup probe.
 //! - [`endpoint`]: the common endpoint builder and the bind-and-come-online
 //!   policy.
 //! - [`relay_failover`]: the server-side home-relay failover that moves the

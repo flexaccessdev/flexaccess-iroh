@@ -25,7 +25,7 @@
 //! its direct paths, and every established connection stay as they are; a
 //! connection whose only path ran through the dead relay times out on its own
 //! and that client redials. This is why a custom relay set is required to hold
-//! at least [`crate::relay::MIN_CUSTOM_RELAYS`] relays.
+//! at least [`crate::relay::MIN_CUSTOM_RELAYS`] distinct relays.
 //!
 //! The removed relay is put back once a probe (the same relay-only probe used
 //! at startup) shows it connectable again, checked every

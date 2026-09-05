@@ -96,9 +96,10 @@ impl RelayConfig {
     /// Empty input selects the default relays. Parsing fails on the first
     /// malformed URL, so config typos surface at resolve time instead of at each
     /// use site. Custom relays must number at least [`MIN_CUSTOM_RELAYS`]
-    /// after deduplication: one relay leaves a server nothing to fail over to
-    /// when it stops working, which is rejected up front rather than
-    /// discovered during an outage.
+    /// distinct URLs after deduplication (listing the same relay twice counts
+    /// once): one relay leaves a server nothing to fail over to when it stops
+    /// working, which is rejected up front rather than discovered during an
+    /// outage.
     ///
     /// The token is normalized (blank/whitespace-only becomes `None`) and is
     /// **strictly gated to custom relays**: a non-empty token with no custom
@@ -253,7 +254,7 @@ pub(crate) async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) 
 /// are not probed (returns `Ok(())` immediately).
 ///
 /// A relay that is down at startup must not stop the process: with at least
-/// [`MIN_CUSTOM_RELAYS`] relays configured, the remaining ones carry it, and
+/// [`MIN_CUSTOM_RELAYS`] distinct relays configured, the remaining ones carry it, and
 /// refusing to start would turn a survivable relay outage into an outage of
 /// every client that restarts during it.
 pub async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
