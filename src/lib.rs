@@ -7,13 +7,13 @@
 //! across repos:
 //!
 //! - [`relay`]: the default-vs-custom [`relay::RelayConfig`] (which also decides
-//!   whether n0 internet discovery is on), the shared relay auth token, and the
-//!   strict per-relay startup probe.
-//! - [`endpoint`]: the common endpoint builder, the bind-and-come-online policy
-//!   for first creation versus a mid-run rebuild, and a
-//!   [`endpoint::RebuildableEndpoint`] handle.
-//! - [`relay_watchdog`]: the server-side home-relay watchdog that nudges, then
-//!   asks for a rebuild, when iroh silently loses its home relay.
+//!   whether n0 internet discovery is on, and requires at least two custom
+//!   relays), the shared relay auth token, and the per-relay startup probe.
+//! - [`endpoint`]: the common endpoint builder and the bind-and-come-online
+//!   policy.
+//! - [`relay_failover`]: the server-side home-relay failover that moves the
+//!   endpoint onto another configured relay, in place, when its home relay is
+//!   lost and iroh does not recover it on its own.
 //! - [`auth`]: the endpoint-bound public-key authentication transcript over the
 //!   shared [`flexaccess_keys`] format; each application supplies its own
 //!   domain-separation context.
@@ -32,6 +32,6 @@
 pub mod auth;
 pub mod endpoint;
 pub mod relay;
-pub mod relay_watchdog;
+pub mod relay_failover;
 
 pub use flexaccess_keys;
