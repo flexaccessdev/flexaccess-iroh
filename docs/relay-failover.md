@@ -187,7 +187,7 @@ the crate's CI on every push.
 | Repo | Failover | Serve loop |
 |---|---|---|
 | [flexaccess-iroh] | `src/relay_failover.rs`; `MIN_CUSTOM_RELAYS` and the tolerant probe in `src/relay.rs`; the startup exclusion and `CreatedEndpoint` in `src/endpoint.rs`; the e2e suite above in `e2e/` | — |
-| [tunnel-rs] | crate, on v0.0.7: in-place failover, not yet the startup exclusion (needs the v0.0.8 bump, which changes `create_endpoint`'s return type and adds `relays_left_out` to `fail_over_home_relay`) | `run_multi_source_server` in `src/iroh_mode/multi_source.rs`, selected alongside the accept loop. **First consumer** |
+| [tunnel-rs] | crate, on v0.0.8 (tunnel-rs v0.6.4): in-place failover and the startup exclusion; `create_server_endpoint` returns `CreatedEndpoint` and the client keeps a relay it could not probe out for its lifetime | `run_multi_source_server` in `src/iroh_mode/multi_source.rs`, selected alongside the accept loop, fed `relays_left_out`. **First consumer** |
 | [ezvpn] | still on v0.0.3, i.e. the watchdog; both the failover and the startup exclusion arrive with the bump | `VpnServer::run` in `src/tunnel/server.rs` |
 | [flextunnel] | still on v0.0.3, i.e. the watchdog; both arrive with the bump | `crates/flextunnel-cli/src/main.rs` |
 
