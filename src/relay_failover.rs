@@ -52,7 +52,7 @@
 //! reachability rests on n0 publishing and resolution, not on one relay
 //! registration.
 
-use crate::relay::{RelayConfig, probe_relay};
+use crate::relay::{RelayConfig, probe_relay, relay_failure};
 use iroh::endpoint::RelayStatus;
 use iroh::{Endpoint, RelayMap, RelayUrl, Watcher};
 use std::time::Duration;
@@ -156,10 +156,7 @@ fn describe_statuses(statuses: &[RelayStatus]) -> HomeRelay {
     };
     let reason = statuses
         .iter()
-        .map(|s| match s.last_error() {
-            Some(e) => format!("{} disconnected ({e:#})", s.url()),
-            None => format!("{} not connected", s.url()),
-        })
+        .map(|s| format!("{} {}", s.url(), relay_failure(s)))
         .collect::<Vec<_>>()
         .join("; ");
     HomeRelay::Down {

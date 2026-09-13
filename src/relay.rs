@@ -7,7 +7,8 @@
 
 use anyhow::{Context, Result};
 use futures::future::join_all;
-use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, endpoint::presets};
+use iroh::endpoint::{RelayStatus, presets};
+use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, Watcher};
 use log::{info, warn};
 use std::fmt;
 use std::sync::Arc;
@@ -248,13 +249,36 @@ pub(crate) async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) 
         .await
         .with_context(|| format!("Failed to bind probe endpoint for relay {relay_url}"))?;
     let outcome = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await;
+    // Read why before closing: the probe map holds this one relay, so its
+    // status (if selected at all) carries the last connection failure.
+    let failure = outcome.is_err().then(|| {
+        endpoint
+            .home_relay_status()
+            .get()
+            .first()
+            .map_or_else(|| "no home relay selected".to_string(), relay_failure)
+    });
     endpoint.close().await;
-    outcome.map_err(|_| {
-        anyhow::anyhow!(
-            "did not come online within {}s (unreachable or rejected the auth token)",
+    match failure {
+        None => Ok(()),
+        Some(failure) => anyhow::bail!(
+            "did not come online within {}s: {failure}",
             RELAY_CONNECT_TIMEOUT.as_secs()
-        )
-    })
+        ),
+    }
+}
+
+/// Why a relay in `status` is not connected, for logs and errors (without the
+/// URL). An authentication denial is called out on its own: unlike a
+/// connection failure it does not clear up by retrying with the same token.
+pub(crate) fn relay_failure(status: &RelayStatus) -> String {
+    if let Some(reason) = status.auth_denied_reason() {
+        format!("authentication denied by the relay ({reason}); check the relay auth token")
+    } else if let Some(e) = status.last_error() {
+        format!("disconnected ({e:#})")
+    } else {
+        "not connected".to_string()
+    }
 }
 
 /// Probe every configured custom relay individually (in parallel). Startup
