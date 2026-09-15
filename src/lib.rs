@@ -24,7 +24,7 @@
 //!
 //! # iroh version
 //!
-//! `iroh` is required as a range (`>=1.1.0, <1.2.0`), never an exact pin, so
+//! `iroh` is required as a range (`>=1.2.0, <1.3.0`), never an exact pin, so
 //! each consumer resolves the single `iroh` its own workspace locks and this
 //! crate compiles against that. A consumer on a fork of iroh redirects this
 //! crate's dependency to the fork as well with a `[patch.crates-io]` entry in
