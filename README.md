@@ -35,9 +35,9 @@ takes the resulting `iroh::SecretKey` / `flexaccess_keys` values.
 
 ```toml
 [dependencies]
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.9" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.10" }
 # or, with mDNS local-network discovery on every endpoint (compiled out on iOS):
-flexaccess-iroh = { git = "...", tag = "v0.0.9", features = ["mdns"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.10", features = ["mdns"] }
 ```
 
 The `flexaccess_keys` crate is re-exported so a consumer signs and verifies
@@ -45,8 +45,8 @@ with exactly the version this crate does.
 
 ## iroh version policy
 
-This crate requires `iroh` as a **range** — currently `>=1.2.0, <1.3.0` —
-never an exact pin. Cargo resolves one `iroh` 1.2.x per consumer workspace and
+This crate requires `iroh` as a **range** — currently `>=1.3.0, <1.4.0` —
+never an exact pin. Cargo resolves one `iroh` 1.3.x per consumer workspace and
 this crate compiles against whatever that is. The obligation on this side is
 to only use APIs present in the minimum version; CI builds against it.
 
@@ -59,7 +59,7 @@ the consumer's **root** manifest, and depend on the crates.io version:
 
 ```toml
 [dependencies]
-iroh = "1.2.0"
+iroh = "1.3.0"
 
 [patch.crates-io]
 iroh = { git = "https://github.com/<you>/iroh.git", branch = "<fork-branch>" }
