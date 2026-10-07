@@ -798,7 +798,7 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "flexaccess-iroh"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1487,9 +1487,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-mdns-address-lookup"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cad3dfcaddd5c3681bf0a42606498fc6e8891de793408dfbc46a9fbe76f370b3"
+version = "0.6.0"
+source = "git+https://github.com/flexaccessdev/iroh-address-lookups?tag=iroh-mdns-address-lookup-v0.6.0-flexaccess.1#aff0d3b5583bdfd49cb229cf6d8b37c8fb82676c"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -3057,8 +3056,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "swarm-discovery"
 version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b4877f20f064de34b77d79237c9caa37c393590af8ef5a2f3253d59be5a338b"
+source = "git+https://github.com/rkuhn/swarm-discovery?rev=b41dbcc431f419ad0cd91f786d4d7c71ec6be9ce#b41dbcc431f419ad0cd91f786d4d7c71ec6be9ce"
 dependencies = [
  "acto",
  "hickory-proto",
