@@ -228,6 +228,40 @@ connection and is never seen by a relay or an HTTP proxy in front of one — see
 - **Path upgrade** — a connection that starts relayed and later hole-punches
   gets direct-path performance without reconnecting.
 
+### Apple: a UDP send that names a destination costs 25–40 µs
+
+On macOS and iOS, XNU's `udp_output` connects and disconnects the socket's
+protocol control block around every `sendmsg`/`sendto` that names a
+destination: a route lookup plus two rehashes of the global UDP PCB table
+under its lock, per datagram. Measured on an M2 (virtualized, 2026-10):
+25–40 µs per 1280-byte datagram, against about 5 µs on a `connect(2)`ed
+socket. Batching with the private `sendmsg_x` does not amortize it (25 µs per
+datagram at 64 per call; 1.9 µs per datagram connected), and control messages
+(TOS, PKTINFO) make no difference. A connected receive also costs about half
+of an unconnected one.
+
+A QUIC endpoint sends one datagram per packet from an unconnected socket, so
+this caps a data path at roughly 25k packets/s per core — about 250 Mbit/s at
+a 1280-byte MTU — and because the connection driver holds the connection lock
+across each send, everything feeding it waits too. Upstream iroh pays this on
+every Apple client.
+
+The fix pattern, implemented in ezvpn's netwatch fork
+([`netwatch/src/udp/peers.rs`](https://github.com/flexaccessdev/net-tools/blob/ezvpn-bufforce-0.19.3/netwatch/src/udp/peers.rs)):
+a peer that receives a sustained flow (64 sends within a second) gets its own
+socket, bound with `SO_REUSEPORT` to the main socket's address and port and
+connected to the peer. The kernel steers that peer's inbound datagrams to it
+(an exact four-tuple match beats the wildcard binding; verified, including
+that other peers still reach the main socket and that the source address and
+`IP_RECVDSTADDR` are still reported), so the receive loop polls the peer
+sockets alongside the main one. The peer sees the same port throughout, so
+nothing changes on the wire or in hole punching. ezvpn measured upload
+136 → 230 Mbit/s and download 550 → 1000 Mbit/s from this alone on that VM;
+the rest of its Apple data-path work is in its
+[Architecture.md](https://github.com/flexaccessdev/ezvpn/blob/main/docs/Architecture.md)
+under "Throughput Design". tunnel-rs and flextunnel build on upstream iroh and
+pay the cost until they take the fork or upstream adopts the pattern.
+
 [tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel
