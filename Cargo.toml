@@ -1,6 +1,6 @@
 [package]
 name = "flexaccess-iroh"
-version = "0.0.11"
+version = "0.0.12"
 edition = "2024"
 description = "Shared iroh transport layer for FlexAccess applications: relay configuration and probing, endpoint building, in-place home-relay failover, and the endpoint-bound public-key auth transcript"
 repository = "https://github.com/flexaccessdev/flexaccess-iroh"
@@ -10,7 +10,7 @@ default = []
 # mDNS local-network address lookup on every endpoint built by
 # `endpoint::endpoint_builder`. Compiled out on iOS regardless (raw multicast
 # needs the `com.apple.developer.networking.multicast` entitlement there).
-mdns = ["dep:iroh-mdns-address-lookup"]
+mdns = ["dep:iroh-mdns-address-lookup", "dep:swarm-discovery"]
 
 [dependencies]
 anyhow = "1"
@@ -20,10 +20,10 @@ base64 = "0.22"
 # consumers see exactly the version this crate signs and verifies with.
 flexaccess-keys = { git = "https://github.com/flexaccessdev/flexaccess-keys", tag = "v0.0.2", default-features = false }
 futures = "0.3"
-# A range, deliberately: every consumer resolves one `iroh` 1.3.x for its own
+# A range, deliberately: every consumer resolves one `iroh` 1.4.x for its own
 # workspace and this crate compiles against it. A consumer on a fork of iroh
 # redirects this dependency too with `[patch.crates-io]` (see README.md).
-iroh = ">=1.3.0, <1.4.0"
+iroh = ">=1.4.0, <1.5.0"
 log = "0.4"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
@@ -31,16 +31,15 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 # iroh's mDNS lookup sends raw UDP multicast, which iOS rejects without the
 # multicast entitlement, so it is never even a dependency there.
 #
-# From the flexaccessdev fork, deliberately: it is upstream 0.6.0 with
-# `swarm-discovery` pinned past 0.6.3, whose updater GC task reschedules itself
-# every 10ms forever once the discovery is dropped — one spinning task leaked
-# per closed endpoint, so a client that rebuilds its endpoint through a long
-# outage burns CPU that grows with every rebuild. A git dependency rather than
-# a `[patch]` so the fix reaches every consumer through this crate's tag.
-# Back to crates.io once swarm-discovery publishes the fix
+# `swarm-discovery` is never used directly: it is a floor on the version
+# iroh-mdns-address-lookup resolves. Before 0.6.5 its updater GC task
+# reschedules itself every 10ms forever once the discovery is dropped — one
+# spinning task leaked per closed endpoint, so a client that rebuilds its
+# endpoint through a long outage burns CPU that grows with every rebuild
 # (rkuhn/swarm-discovery#27).
 [target.'cfg(not(target_os = "ios"))'.dependencies]
-iroh-mdns-address-lookup = { git = "https://github.com/flexaccessdev/iroh-address-lookups", tag = "iroh-mdns-address-lookup-v0.6.0-flexaccess.1", optional = true }
+iroh-mdns-address-lookup = { version = "0.6.1", optional = true }
+swarm-discovery = { version = "0.6.5", optional = true }
 
 [dev-dependencies]
 # The e2e harness (`examples/e2e`, driven by the scripts in `e2e/`): a
