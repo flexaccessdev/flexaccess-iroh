@@ -23,7 +23,7 @@ futures = "0.3"
 # A range, deliberately: every consumer resolves one `iroh` 1.4.x for its own
 # workspace and this crate compiles against it. A consumer on a fork of iroh
 # redirects this dependency too with `[patch.crates-io]` (see README.md).
-iroh = ">=1.4.0, <1.5.0"
+iroh = ">=1.4.1, <1.5.0"
 log = "0.4"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
