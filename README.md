@@ -115,3 +115,7 @@ folding [flexaccess-keys] into this repository as a subcrate.
 Bump `version` in `Cargo.toml`, merge, and run the **Release** workflow: it
 tags `v<version>` from `Cargo.toml` and publishes a GitHub release. Consumers
 depend on the tag.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
