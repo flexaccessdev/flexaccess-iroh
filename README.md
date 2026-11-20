@@ -4,14 +4,13 @@ Shared iroh transport layer for FlexAccess applications, as a Rust crate.
 
 The programs built on iroh in this org — [tunnel-rs], [ezvpn], [flextunnel] —
 share one transport foundation. Its design is documented once in
-[iroh-common-architecture]; this crate is that design as code, so a fix to the
-relay failover or the relay probe lands here once instead of being ported by
-hand into every repo.
+[`docs/`](docs/README.md); this crate is that design as code, so a fix to the
+relay failover or the relay probe lands here once, together with its
+documentation, instead of being ported by hand into every repo.
 
 [tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel
-[iroh-common-architecture]: https://github.com/flexaccessdev/iroh-common-architecture
 
 ## What is in it
 
@@ -74,6 +73,20 @@ the fork commit exactly as a direct git dependency would.
 Bump the lower bound only when this crate starts using an API introduced in
 that version; bump the upper bound once every consumer has moved past it.
 Either is a release of this crate.
+
+## Design notes and operating guides
+
+[`docs/`](docs/README.md) holds the design of this layer and the guides for
+operating it:
+
+| Document | What it covers |
+|---|---|
+| [relays-and-address-lookup.md](docs/relays-and-address-lookup.md) | default vs custom relays, how that choice also decides n0 internet discovery, relay hints, the relay auth token, the startup probe, relay-only mode — start here |
+| [relay-failover.md](docs/relay-failover.md) | how a custom-relay server stays reachable when its home relay stops working, and the e2e suite that proves it |
+| [nat-traversal-and-transport.md](docs/nat-traversal-and-transport.md) | what the programs get from `iroh::Endpoint`: hole punching, relay fallback, NAT types, the QUIC/TLS 1.3 stack, performance |
+| [self-hosting.md](docs/self-hosting.md) | running your own iroh relay, from local dev to production, and verifying it |
+| [relay-discovery-findings.md](docs/relay-discovery-findings.md) | the analysis behind tying internet discovery to the relay mode |
+| [iroh-relay-connection-trace.md](docs/iroh-relay-connection-trace.md) | what happens on `endpoint.online()`, and troubleshooting a relay by hand |
 
 ## Development
 

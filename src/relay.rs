@@ -1,9 +1,8 @@
 //! Relay configuration, the shared relay auth token, and the per-relay startup
 //! probe.
 //!
-//! The design is documented in
-//! <https://github.com/flexaccessdev/iroh-common-architecture> (see
-//! `relays-and-address-lookup.md`); this module is its implementation.
+//! The design is documented in this repository's
+//! `docs/relays-and-address-lookup.md`; this module is its implementation.
 
 use anyhow::{Context, Result};
 use futures::future::join_all;

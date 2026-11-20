@@ -1,8 +1,8 @@
 //! Shared iroh transport layer for FlexAccess applications.
 //!
 //! The programs built on iroh in this org (tunnel-rs, ezvpn, flextunnel) share
-//! one transport foundation, documented once in
-//! <https://github.com/flexaccessdev/iroh-common-architecture>. This crate is
+//! one transport foundation, documented once in this repository's
+//! [`docs/`](https://github.com/flexaccessdev/flexaccess-iroh/tree/main/docs). This crate is
 //! that foundation as code, so a fix lands once instead of being ported by hand
 //! across repos:
 //!
