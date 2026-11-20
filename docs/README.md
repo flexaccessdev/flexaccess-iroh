@@ -1,9 +1,10 @@
-# iroh Common Architecture
+# Shared iroh transport: design notes and operating guides
 
-Shared design notes and operational guides for the iroh-based programs in this
-org. These three ship different products but share one transport foundation —
-iroh endpoints, relays, address lookup, and NAT traversal — so that layer is
-documented once, here, instead of drifting across three repos.
+Design notes and operational guides for the iroh-based programs in this org.
+These three ship different products but share one transport foundation — iroh
+endpoints, relays, address lookup, and NAT traversal — so that layer is
+documented once, here, next to the crate that implements it, instead of
+drifting across three repos.
 
 | Repo | What it is |
 |---|---|
@@ -13,9 +14,9 @@ documented once, here, instead of drifting across three repos.
 
 ## The shared crate
 
-Since 2026-09 this design is also **code**, once:
-[`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh), a Rust
-crate all three programs depend on by git tag. It carries `RelayConfig` (at
+This design is also **code**, once: [`flexaccess-iroh`](../README.md), the
+Rust crate in this repository, which all three programs depend on by git tag.
+It carries `RelayConfig` (at
 least two custom relays) and the per-relay startup probe, the common endpoint
 builder (and relay-only mode) that binds without the relays that fail the
 probe, the server-side in-place home-relay failover that restores them, and
@@ -23,8 +24,8 @@ the endpoint-bound public-key auth transcript over
 [`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys). A fix to
 any of that lands in the crate and reaches every program on its next tag bump,
 instead of being ported by hand three times. The crate also carries the e2e
-suites for this layer (`e2e/`, run in its CI), so a product's own e2e suite
-only has to cover what the product adds.
+suites for this layer ([`e2e/`](../e2e/README.md), run in its CI), so a
+product's own e2e suite only has to cover what the product adds.
 
 What stays in each program is what makes it that program: ALPNs, handshake
 formats, QUIC transport tuning, identity and key *files* (the crate takes
@@ -70,7 +71,7 @@ only one of the three exposing relay-only as a first-class user-facing mode
 (`--relay-only`), it carries the sequential per-relay failover dial path, and it
 is the first consumer of the shared relay failover. The fully offline two-relay
 suites that exercise the relay layer itself live with the crate
-(`e2e/` in flexaccess-iroh); tunnel-rs's `run_e2e.sh --relay-only` is the
+([`e2e/`](../e2e/README.md)); tunnel-rs's `run_e2e.sh --relay-only` is the
 check that a real tunnel runs over a relay. When bringing up a self-hosted
 relay, validate it with tunnel-rs first — the relay it proves out serves all
 three programs. See [self-hosting.md](self-hosting.md#verifying-a-relay).
@@ -91,10 +92,10 @@ by those product-specific authentication protocols lives separately in
 ## Keeping this in sync
 
 The three repos link here rather than duplicating this material, and they
-depend on [`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh)
-rather than carrying their own copies of the code. When the shared
-relay/discovery behavior changes, change it in the crate, tag a release, bump
-the tag in each program, and update this repo in the same change. Note any
+depend on [`flexaccess-iroh`](../README.md) rather than carrying their own
+copies of the code. When the shared relay/discovery behavior changes, change
+the crate and these documents in the same pull request, tag a release, and
+bump the tag in each program. Note any
 deliberate per-repo divergence in the "Where this lives in each repo" table in
 [relays-and-address-lookup.md](relays-and-address-lookup.md#where-this-lives-in-each-repo).
 

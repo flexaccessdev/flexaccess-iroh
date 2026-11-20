@@ -7,7 +7,7 @@ none of the three implements any of it itself — they configure an
 this document describes.
 
 They configure that endpoint through one shared builder
-([`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh)), but
+([`flexaccess-iroh`](../README.md)), but
 what each asks of it differs — ezvpn runs no mDNS at all, tunnel-rs is the only
 one with a user-facing relay-only mode, and flextunnel compiles mDNS out on
 iOS — and the QUIC transport tuning is each program's own. See

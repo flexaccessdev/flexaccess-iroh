@@ -106,4 +106,4 @@ discovery including mDNS.
 [tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel
-[flexaccess-iroh]: https://github.com/flexaccessdev/flexaccess-iroh
+[flexaccess-iroh]: ../README.md

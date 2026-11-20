@@ -3,7 +3,7 @@
 How a dialer finds a peer depends on the relay mode. This is the single most
 important shared decision across [tunnel-rs], [ezvpn], and [flextunnel], and
 one implementation serves all three: the `relay` and `endpoint` modules of
-[`flexaccess-iroh`](https://github.com/flexaccessdev/flexaccess-iroh).
+[`flexaccess-iroh`](../README.md).
 
 The default-vs-custom distinction is resolved **once**, at config time, into a
 `RelayConfig` enum — `Default` vs `Custom` — and it selects **both** which relay

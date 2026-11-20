@@ -223,7 +223,7 @@ relays, on the premise that failover needed a publish path; it does not, see
 above).
 
 [#4435]: https://github.com/n0-computer/iroh/pull/4435
-[flexaccess-iroh]: https://github.com/flexaccessdev/flexaccess-iroh
+[flexaccess-iroh]: ../README.md
 [tunnel-rs]: https://github.com/flexaccessdev/tunnel-rs
 [ezvpn]: https://github.com/flexaccessdev/ezvpn
 [flextunnel]: https://github.com/flexaccessdev/flextunnel
