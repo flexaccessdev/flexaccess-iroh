@@ -800,9 +800,12 @@ dependencies = [
  "iroh-mdns-address-lookup",
  "log",
  "n0-watcher",
+ "reqwest",
  "rustls",
+ "serde",
  "swarm-discovery",
  "tokio",
+ "webpki-roots",
 ]
 
 [[package]]

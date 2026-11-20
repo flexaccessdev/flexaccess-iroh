@@ -12,6 +12,10 @@ default = []
 # `endpoint::endpoint_builder`. Compiled out on iOS regardless (raw multicast
 # needs the `com.apple.developer.networking.multicast` entitlement there).
 mdns = ["dep:iroh-mdns-address-lookup", "dep:swarm-discovery"]
+# The on-demand `/healthz` check of the custom relays for status UIs
+# (`relay_health`). Off by default: it is the only part that makes plain HTTP
+# requests, so a consumer without a status view does not pay for it.
+relay-health = ["dep:reqwest", "dep:serde", "dep:webpki-roots"]
 
 [dependencies]
 anyhow = "1"
@@ -26,8 +30,19 @@ futures = "0.3"
 # redirects this dependency too with `[patch.crates-io]` (see README.md).
 iroh = ">=1.5.0, <1.6.0"
 log = "0.4"
+# `relay-health` only. `rustls-no-provider` is the exact reqwest feature iroh
+# already enables, so this adds no new TLS backend (no openssl / aws-lc); the
+# probe hands reqwest a ring + webpki-roots config, so the platform verifier is
+# never built into the client.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"], optional = true }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+# `relay-health` only: the status type crosses process boundaries (status
+# sockets, FFI JSON) in the applications.
+serde = { version = "1", features = ["derive"], optional = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+# `relay-health` only: the embedded Mozilla roots, the same ones iroh verifies
+# the relay connection with.
+webpki-roots = { version = "1", optional = true }
 
 # iroh's mDNS lookup sends raw UDP multicast, which iOS rejects without the
 # multicast entitlement, so it is never even a dependency there.
