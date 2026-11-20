@@ -15,6 +15,9 @@
 //! - [`relay_failover`]: the server-side home-relay failover that moves the
 //!   endpoint onto another configured relay, in place, when its home relay is
 //!   lost and iroh does not recover it on its own.
+//! - `relay_health` (feature `relay-health`): the on-demand `/healthz` check of
+//!   the custom relays that status UIs show, made under each relay URL's path
+//!   prefix.
 //! - [`auth`]: the endpoint-bound public-key authentication transcript over the
 //!   shared [`flexaccess_keys`] format; each application supplies its own
 //!   domain-separation context.
@@ -34,5 +37,7 @@ pub mod auth;
 pub mod endpoint;
 pub mod relay;
 pub mod relay_failover;
+#[cfg(feature = "relay-health")]
+pub mod relay_health;
 
 pub use flexaccess_keys;
