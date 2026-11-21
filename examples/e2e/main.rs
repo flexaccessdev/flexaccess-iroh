@@ -25,7 +25,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use flexaccess_iroh::auth::{ClientKey, verify_endpoint_id_signature};
-use flexaccess_iroh::endpoint::{CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder};
+use flexaccess_iroh::endpoint::{
+    CreatedEndpoint, EndpointOptions, PendingCloses, create_endpoint, endpoint_builder,
+};
 use flexaccess_iroh::flexaccess_keys::{self, AuthorizedKeys, PrivateKey, PublicKey};
 use flexaccess_iroh::relay::RelayConfig;
 use flexaccess_iroh::relay_failover::fail_over_home_relay;
@@ -252,7 +254,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let CreatedEndpoint {
         endpoint,
         relays_left_out,
-    } = create_endpoint(&relay_config, builder).await?;
+    } = create_endpoint(&relay_config, builder, &PendingCloses::new()).await?;
     info!("Waiting for clients to connect");
 
     let authorized = Arc::new(authorized);
@@ -389,11 +391,21 @@ async fn run_client(args: ClientArgs) -> Result<ExitCode> {
         .into();
     let relay_config = args.relay.resolve()?;
     let builder = endpoint_builder(&relay_config, args.relay.options(false));
-    // A client runs no failover: a relay left out at startup stays out for
-    // this (short-lived) process.
-    let CreatedEndpoint { endpoint, .. } = create_endpoint(&relay_config, builder).await?;
-    let outcome = exchange(&endpoint, &args, &relay_config, &key).await;
-    endpoint.close().await;
+    // The process ends with this one exchange, and its runtime with it: the
+    // closes the endpoint's creation stopped waiting for are seen through
+    // first, whether it succeeded or not.
+    let closes = PendingCloses::new();
+    let outcome = async {
+        // A client runs no failover: a relay left out at startup stays out
+        // for this (short-lived) process.
+        let CreatedEndpoint { endpoint, .. } =
+            create_endpoint(&relay_config, builder, &closes).await?;
+        let outcome = exchange(&endpoint, &args, &relay_config, &key).await;
+        endpoint.close().await;
+        outcome
+    }
+    .await;
+    closes.finished().await;
     outcome
 }
 

@@ -4,6 +4,7 @@
 //! The design is documented in this repository's
 //! `docs/relays-and-address-lookup.md`; this module is its implementation.
 
+use crate::endpoint::PendingCloses;
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use iroh::endpoint::{RelayStatus, presets};
@@ -243,8 +244,13 @@ fn probe_endpoint_builder(
 /// relay connected (and accepted the auth token, if any); otherwise the error
 /// describes the failure. The probe endpoint is always closed before
 /// returning, with a bounded wait for the close (see
-/// [`crate::endpoint::close_endpoint`]).
-pub(crate) async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) -> Result<()> {
+/// [`crate::endpoint::close_endpoint`]); a close that outlives the wait is
+/// kept in `closes`.
+pub(crate) async fn probe_relay(
+    relay_url: &RelayUrl,
+    auth_token: Option<&str>,
+    closes: &PendingCloses,
+) -> Result<()> {
     let endpoint = probe_endpoint_builder(relay_url, auth_token)
         .bind()
         .await
@@ -259,7 +265,7 @@ pub(crate) async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) 
             .first()
             .map_or_else(|| "no home relay selected".to_string(), relay_failure)
     });
-    crate::endpoint::close_endpoint(endpoint).await;
+    crate::endpoint::close_endpoint(endpoint, closes).await;
     match failure {
         None => Ok(()),
         Some(failure) => anyhow::bail!(
@@ -302,7 +308,13 @@ pub(crate) fn relay_failure(status: &RelayStatus) -> String {
 /// endpoint from ever coming online — every client that restarts during such
 /// an outage would then fail to start, even though the other relay works and
 /// the server has already failed over to it.
-pub async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<Vec<RelayUrl>> {
+///
+/// Each probe endpoint is closed with a bounded wait; a close that outlives
+/// it keeps running and is kept in `closes` (see [`PendingCloses`]).
+pub async fn probe_custom_relays(
+    relay_config: &RelayConfig,
+    closes: &PendingCloses,
+) -> Result<Vec<RelayUrl>> {
     let RelayConfig::Custom { urls, auth_token } = relay_config else {
         return Ok(Vec::new());
     };
@@ -310,7 +322,7 @@ pub async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<Vec<Relay
     info!("Probing {} custom relays for reachability...", urls.len());
     let results = join_all(
         urls.iter()
-            .map(|url| async move { (url, probe_relay(url, token).await) }),
+            .map(|url| async move { (url, probe_relay(url, token, closes).await) }),
     )
     .await;
     let failures: Vec<(RelayUrl, anyhow::Error)> = results
@@ -491,7 +503,7 @@ mod tests {
         // Must return immediately without touching the network.
         tokio::time::timeout(
             Duration::from_millis(100),
-            probe_custom_relays(&RelayConfig::Default),
+            probe_custom_relays(&RelayConfig::Default, &PendingCloses::new()),
         )
         .await
         .expect("no probe for the default relays")
