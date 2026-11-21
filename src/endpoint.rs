@@ -11,6 +11,8 @@
 
 use crate::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig, probe_custom_relays};
 use anyhow::{Context, Result};
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared, join_all};
 use iroh::{
     Endpoint, RelayMode, RelayUrl,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
@@ -41,7 +43,11 @@ pub(crate) const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// lasts has nothing to do with them — they finish by themselves — and can
 /// drop the set, which leaves them running. Clones share one set.
 #[derive(Debug, Clone, Default)]
-pub struct PendingCloses(Arc<Mutex<Vec<JoinHandle<()>>>>);
+pub struct PendingCloses(Arc<Mutex<Vec<KeptClose>>>);
+
+/// A close left running, as every waiter can wait for it: it stays in the set
+/// until it is over, whoever is waiting and whether they keep waiting.
+type KeptClose = Shared<BoxFuture<'static, ()>>;
 
 impl PendingCloses {
     pub fn new() -> Self {
@@ -49,21 +55,28 @@ impl PendingCloses {
     }
 
     fn keep(&self, close: JoinHandle<()>) {
+        // A close that panicked or was aborted is over all the same.
+        let close = async move { drop(close.await) }.boxed().shared();
         self.0.lock().expect("pending closes lock").push(close);
     }
 
     /// Wait until every close kept here has finished, those added meanwhile
     /// included. Returns at once when there are none.
+    ///
+    /// Any number of callers can wait at once, and a wait that is dropped
+    /// loses nothing: a close leaves the set only once it is over, so the
+    /// next wait still finds it.
     pub async fn finished(&self) {
         loop {
-            let closes = std::mem::take(&mut *self.0.lock().expect("pending closes lock"));
+            let closes = {
+                let mut kept = self.0.lock().expect("pending closes lock");
+                kept.retain(|close| close.peek().is_none());
+                kept.clone()
+            };
             if closes.is_empty() {
                 return;
             }
-            for close in closes {
-                // A close that panicked or was aborted is over all the same.
-                let _ = close.await;
-            }
+            join_all(closes).await;
         }
     }
 }
@@ -332,5 +345,47 @@ mod tests {
         finished.await.unwrap();
         // And they are forgotten once finished.
         closes.finished().await;
+    }
+
+    /// A close still running is still there for whoever waits next: a second
+    /// waiter beside the first, or a wait taken up again after one was given
+    /// up on. Neither finds an empty set and reports the closes finished.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_is_waited_for_by_every_waiter() {
+        let slow_close = |closes: &PendingCloses| {
+            let (release, released) = tokio::sync::oneshot::channel::<()>();
+            closes.keep(tokio::spawn(async move {
+                let _ = released.await;
+            }));
+            release
+        };
+        async fn still_waiting(finished: &mut JoinHandle<()>) -> bool {
+            tokio::time::timeout(Duration::from_secs(60), finished).await.is_err()
+        }
+
+        // Two waiters at once.
+        let closes = PendingCloses::new();
+        let release = slow_close(&closes);
+        let (first, second) = (closes.clone(), closes.clone());
+        let mut first = tokio::spawn(async move { first.finished().await });
+        let mut second = tokio::spawn(async move { second.finished().await });
+        assert!(still_waiting(&mut first).await, "the close is still running");
+        assert!(still_waiting(&mut second).await, "for the second waiter too");
+        release.send(()).unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        // A wait given up on, and taken up again.
+        let closes = PendingCloses::new();
+        let release = slow_close(&closes);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), closes.finished()).await.is_err(),
+            "the close is still running"
+        );
+        let again = closes.clone();
+        let mut again = tokio::spawn(async move { again.finished().await });
+        assert!(still_waiting(&mut again).await, "and still is for the next wait");
+        release.send(()).unwrap();
+        again.await.unwrap();
     }
 }
