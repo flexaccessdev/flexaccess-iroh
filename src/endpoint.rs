@@ -17,7 +17,40 @@ use iroh::{
     endpoint::{Builder as EndpointBuilder, QuicTransportConfig, presets},
 };
 use log::{info, warn};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Bound wait on the graceful close of an endpoint this crate bound and is
+/// giving up on: one that never came online, or a relay probe's. iroh's close
+/// has no deadline of its own, and both are closed exactly when the network
+/// is not answering — a start must fail with its reason, and a probe report
+/// its relay, not sit behind a teardown. The close runs as its own task and
+/// is never cancelled by this wait.
+pub(crate) const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Close `endpoint` gracefully, waiting at most [`ENDPOINT_CLOSE_TIMEOUT`]
+/// for it. A slower close is left to finish in the background.
+///
+/// Either way the close has begun by the time this returns, which is what a
+/// bound endpoint needs before it is dropped: iroh aborts one that is dropped
+/// without `close()` having been called (fatal under `panic = "abort"`), and
+/// leaves alone one that is already closing.
+pub(crate) async fn close_endpoint(endpoint: Endpoint) {
+    let id = endpoint.id();
+    if !closed_within(ENDPOINT_CLOSE_TIMEOUT, async move { endpoint.close().await }).await {
+        warn!(
+            "Endpoint {id} is slow to close; leaving it to finish in the background"
+        );
+    }
+}
+
+/// Run `close` on a task of its own and wait up to `limit` for it. Returns
+/// whether it finished in time; when it did not, it keeps running.
+async fn closed_within(limit: Duration, close: impl Future<Output = ()> + Send + 'static) -> bool {
+    let mut close = tokio::spawn(close);
+    tokio::time::timeout(limit, &mut close).await.is_ok()
+}
 
 /// What an application decides about every endpoint it builds.
 #[derive(Debug, Clone)]
@@ -137,7 +170,8 @@ pub struct CreatedEndpoint {
 ///
 /// On failure after binding the endpoint is closed before the error
 /// propagates (dropping a bound endpoint without `close()` is fatal under
-/// `panic = "abort"`).
+/// `panic = "abort"`). The close is waited for up to
+/// [`ENDPOINT_CLOSE_TIMEOUT`], so a slow teardown cannot keep the error back.
 pub async fn create_endpoint(
     relay_config: &RelayConfig,
     builder: EndpointBuilder,
@@ -163,11 +197,53 @@ pub async fn create_endpoint(
     };
     let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
     if let Err(e) = wait_online(&endpoint).await {
-        endpoint.close().await;
+        close_endpoint(endpoint).await;
         return Err(e);
     }
     Ok(CreatedEndpoint {
         endpoint,
         relays_left_out,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A close that takes its time is waited for up to the limit and no
+    /// longer — and goes on by itself, rather than being cut off.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_close_is_waited_for_only_so_long() {
+        assert!(closed_within(ENDPOINT_CLOSE_TIMEOUT, async {}).await);
+
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (done, mut finished) = tokio::sync::oneshot::channel::<()>();
+        let started = tokio::time::Instant::now();
+        let in_time = closed_within(ENDPOINT_CLOSE_TIMEOUT, async move {
+            let _ = released.await;
+            let _ = done.send(());
+        })
+        .await;
+        assert!(!in_time);
+        assert_eq!(started.elapsed(), ENDPOINT_CLOSE_TIMEOUT);
+        assert!(finished.try_recv().is_err(), "still closing");
+
+        release.send(()).unwrap();
+        finished.await.expect("the close ran to its end");
+    }
+
+    /// An endpoint handed over for closing is closed: nothing is left for its
+    /// drop to abort.
+    #[tokio::test]
+    async fn an_endpoint_given_up_on_is_closed() {
+        let endpoint = Endpoint::builder(presets::Empty)
+            .relay_mode(RelayMode::Disabled)
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .bind()
+            .await
+            .unwrap();
+        let handle = endpoint.clone();
+        close_endpoint(endpoint).await;
+        assert!(handle.is_closed());
+    }
 }
