@@ -241,7 +241,9 @@ fn probe_endpoint_builder(
 /// Probe a single custom relay by binding a relay-only endpoint and waiting for
 /// it to come online, bounded by [`RELAY_CONNECT_TIMEOUT`]. `Ok(())` means the
 /// relay connected (and accepted the auth token, if any); otherwise the error
-/// describes the failure. The probe endpoint is always closed before returning.
+/// describes the failure. The probe endpoint is always closed before
+/// returning, with a bounded wait for the close (see
+/// [`crate::endpoint::close_endpoint`]).
 pub(crate) async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) -> Result<()> {
     let endpoint = probe_endpoint_builder(relay_url, auth_token)
         .bind()
@@ -257,7 +259,7 @@ pub(crate) async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) 
             .first()
             .map_or_else(|| "no home relay selected".to_string(), relay_failure)
     });
-    endpoint.close().await;
+    crate::endpoint::close_endpoint(endpoint).await;
     match failure {
         None => Ok(()),
         Some(failure) => anyhow::bail!(
