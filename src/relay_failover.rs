@@ -52,6 +52,7 @@
 //! reachability rests on n0 publishing and resolution, not on one relay
 //! registration.
 
+use crate::endpoint::PendingCloses;
 use crate::relay::{RelayConfig, probe_relay, relay_failure};
 use iroh::endpoint::RelayStatus;
 use iroh::{Endpoint, RelayMap, RelayUrl, Watcher};
@@ -222,7 +223,9 @@ impl FailoverRelays for EndpointRelays<'_> {
     }
 
     async fn restore(&mut self, url: &RelayUrl) -> bool {
-        match probe_relay(url, self.auth_token.as_deref()).await {
+        // The failover lives on the process's runtime, where a slow close of
+        // the probe endpoint finishes by itself: nothing waits for it.
+        match probe_relay(url, self.auth_token.as_deref(), &PendingCloses::new()).await {
             Ok(()) => {
                 let Some(config) = self.configured.get(url) else {
                     log::error!(
