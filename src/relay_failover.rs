@@ -54,6 +54,13 @@
 //! A relay is put back probed for QUIC address discovery only if the restore
 //! probe found it serves it, the same check the startup probe makes; a relay
 //! re-inserted unchanged keeps what the endpoint was last told about it.
+//! The relays in the map not found serving it are probed again every
+//! [`QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL`] with that same probe, and get it
+//! once one finds they serve it: the startup answer holds only for the
+//! network the process started on. The recheck runs in the loop like a
+//! restore probe, so the relay map cannot change under it. An endpoint
+//! without IP transports (relay-only) cannot use QUIC address discovery and
+//! is never rechecked.
 //!
 //! Only the *home* relay matters: non-home relays are connected on demand and
 //! dropped after a minute idle, which is normal and not an outage. With the
@@ -88,6 +95,10 @@ const RELAY_OUTAGE_LOG_GRACE: Duration = Duration::from_secs(5);
 /// actor, so a relay that comes back is dialed by a fresh actor rather than
 /// the one that was stuck on it.
 pub const RELAY_RESTORE_INTERVAL: Duration = Duration::from_secs(90);
+
+/// How often the relays in the map not found serving QUIC address discovery
+/// are probed for it again (see the module docs).
+pub const QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Watch `endpoint`'s home relay and fail over in place when it is lost for
 /// [`RELAY_OUTAGE_FAILOVER`]; see the module docs. `relays` is the startup
@@ -198,6 +209,10 @@ trait FailoverRelays {
     /// Put a removed relay back if it is connectable again. Returns whether
     /// it is back in the map.
     async fn restore(&mut self, url: &RelayUrl) -> bool;
+
+    /// Probe the relays in the map (all but `out`) not found serving QUIC
+    /// address discovery, and turn it on for those that serve it now.
+    async fn recheck_quic_addr_discovery(&mut self, out: &[RelayUrl]);
 }
 
 /// The real endpoint's relay map.
@@ -207,10 +222,10 @@ struct EndpointRelays<'a> {
     urls: Vec<RelayUrl>,
     auth_token: Option<String>,
     /// Whether the endpoint has IP transports, without which it cannot use
-    /// QUIC address discovery and restore probes do not check for it.
+    /// QUIC address discovery and no probe checks for it.
     ip_transports: bool,
     /// The relays last found serving QUIC address discovery: at startup, then
-    /// by each restore probe.
+    /// by each restore probe and recheck.
     quic_addr_discovery: Vec<RelayUrl>,
 }
 
@@ -281,6 +296,34 @@ impl FailoverRelays for EndpointRelays<'_> {
                     RELAY_RESTORE_INTERVAL.as_secs()
                 );
                 false
+            }
+        }
+    }
+
+    async fn recheck_quic_addr_discovery(&mut self, out: &[RelayUrl]) {
+        if !self.ip_transports {
+            return;
+        }
+        let unserved: Vec<RelayUrl> = in_map(&self.urls, out)
+            .into_iter()
+            .filter(|url| !self.quic_addr_discovery.contains(url))
+            .collect();
+        // As in `restore`, nothing waits for a slow close of a probe endpoint.
+        let closes = PendingCloses::new();
+        let token = self.auth_token.as_deref();
+        let probes = futures::future::join_all(
+            unserved.iter().map(|url| probe_relay(url, token, true, &closes)),
+        )
+        .await;
+        for (url, probe) in unserved.into_iter().zip(probes) {
+            match probe {
+                Ok(probe) if probe.quic_addr_discovery => {
+                    log::info!("{url} now serves QUIC address discovery; turning it on");
+                    self.quic_addr_discovery.push(url.clone());
+                    self.insert(&url).await;
+                }
+                Ok(_) => log::debug!("{url} still does not serve QUIC address discovery"),
+                Err(e) => log::debug!("Cannot recheck {url} for QUIC address discovery: {e:#}"),
             }
         }
     }
@@ -429,6 +472,7 @@ where
         .into_iter()
         .map(|url| (url, Instant::now() + RELAY_RESTORE_INTERVAL))
         .collect();
+    let mut recheck_at = Instant::now() + QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
     let mut value = watcher.get();
     outage.observe(&describe(&value));
     loop {
@@ -474,6 +518,10 @@ where
                         removed.push((url, now + RELAY_RESTORE_INTERVAL));
                     }
                 }
+            }
+            () = tokio::time::sleep_until(recheck_at) => {
+                relays.recheck_quic_addr_discovery(&out).await;
+                recheck_at = Instant::now() + QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
             }
             next = next_value(&mut watcher) => {
                 value = next;
@@ -546,6 +594,7 @@ mod tests {
         Remove { url: RelayUrl, at: Duration },
         Nudge { url: RelayUrl, at: Duration },
         Restore { url: RelayUrl, restored: bool, at: Duration },
+        Recheck { out: Vec<RelayUrl>, at: Duration },
     }
 
     #[derive(Clone)]
@@ -613,6 +662,13 @@ mod tests {
                 at: self.started.elapsed(),
             });
             restored
+        }
+
+        async fn recheck_quic_addr_discovery(&mut self, out: &[RelayUrl]) {
+            self.actions.lock().unwrap().push(Action::Recheck {
+                out: out.to_vec(),
+                at: self.started.elapsed(),
+            });
         }
     }
 
@@ -907,6 +963,38 @@ mod tests {
                     url: relay_c(),
                     at: 180 * SEC,
                 },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quic_addr_discovery_is_rechecked_on_schedule_with_the_relays_out_then() {
+        // A wedges after the first recheck and stays out of the map.
+        let status = Watchable::new(Status::UpOnA);
+        let mut relays = FakeRelays::new(&status, Some(Status::UpOnB));
+        relays.connectable.store(false, Ordering::SeqCst);
+        let first = QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
+        let flipper = {
+            let status = status.clone();
+            async move {
+                tokio::time::sleep(first + 5 * SEC).await;
+                status.set(Status::DownOnA).ok();
+            }
+        };
+        tokio::join!(
+            run_for(&status, &mut relays, first * 2 + SEC),
+            flipper
+        );
+        let rechecks: Vec<Action> = relays
+            .actions()
+            .into_iter()
+            .filter(|action| matches!(action, Action::Recheck { .. }))
+            .collect();
+        assert_eq!(
+            rechecks,
+            vec![
+                Action::Recheck { out: Vec::new(), at: first },
+                Action::Recheck { out: vec![relay_a()], at: first * 2 },
             ]
         );
     }
