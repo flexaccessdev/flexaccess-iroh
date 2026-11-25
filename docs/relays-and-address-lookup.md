@@ -158,18 +158,10 @@ when it answered then; a relay re-inserted unchanged keeps what it had. The
 default relays are not probed: n0's relays serve QAD, and iroh uses it there
 as before.
 
-A miss at startup is not final. The startup probe answers only for the
-network the process started on, so the failover (servers) checks the relays
-in the map that were not found serving QAD again every 10 minutes
-(`QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL`), and 5 s after the endpoint's own IP
-addresses change (a network change), and turns QAD on for any that answer
-now. A recheck is the QAD check alone, with 1 s to answer
-(`QUIC_ADDR_DISCOVERY_RECHECK_TIMEOUT`) instead of the startup probe's
-cut-off at the relay connection, so a relay whose answer always lands just
-after its connection is not missed every time; 1 s is still well within the
-3 s that a non-answering relay costs each report. It runs beside the
-failover, which keeps watching the home relay meanwhile. A process without
-the failover (a client) keeps its startup result.
+The answer is not checked again while the process runs: a relay found not
+serving QAD stays without it until the failover takes it out and puts it
+back, or the process restarts. A miss costs only the address that relay's QAD
+would have reported; any other relay that serves QAD still reports it.
 
 A relay-only endpoint (`EndpointOptions::relay_only`) has no IP transports
 and cannot use QAD, so neither the startup probe nor the failover checks for

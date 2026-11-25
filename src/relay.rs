@@ -287,32 +287,6 @@ async fn quic_addr_discovery_answered(endpoint: &Endpoint) {
     }
 }
 
-/// Whether `relay_url` serves QUIC address discovery, answered within `limit`:
-/// the check alone, without the relay probe whose connection cuts off the
-/// startup check (see [`probe_relay`]). `limit` should stay well below iroh's
-/// 3 s probe timeout, since an answer that slow holds the net report back
-/// almost as much as none. `false` also when the check endpoint cannot bind.
-/// Its endpoint is closed before returning, as in [`probe_relay`].
-pub(crate) async fn quic_addr_discovery_served(
-    relay_url: &RelayUrl,
-    auth_token: Option<&str>,
-    limit: Duration,
-    closes: &PendingCloses,
-) -> bool {
-    let endpoint = match qad_endpoint_builder(relay_url, auth_token).bind().await {
-        Ok(endpoint) => endpoint,
-        Err(e) => {
-            warn!("Cannot check {relay_url} for QUIC address discovery: {e:#}");
-            return false;
-        }
-    };
-    let served = tokio::time::timeout(limit, quic_addr_discovery_answered(&endpoint))
-        .await
-        .is_ok();
-    crate::endpoint::close_endpoint(endpoint, closes).await;
-    served
-}
-
 /// What [`probe_relay`] found out about a relay that came online.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RelayProbe {
