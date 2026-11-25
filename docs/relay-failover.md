@@ -125,13 +125,15 @@ an outage.
 - **At least two custom relays for failover.** With one distinct custom
   relay URL the endpoint runs in reduced-redundancy mode
   (`RelayConfig::is_single_relay`): it works and `RelayConfig::log_status`
-  warns at startup, but there is nothing to fail over to. A wedged relay
-  is only nudged (a no-op relay-map change that forces a fresh net report
-  and reconnect). Until that relay works again, new off-LAN dials and
-  connections that run only through it fail, while the endpoint keeps
-  running and connections on a direct path continue (as in Phase D); a
-  process that starts while it is down fails to start.
-  The default relay map is n0's and is not subject to this.
+  warns at startup, but there is nothing to fail over to. An outage is
+  logged as waiting for that relay to reconnect, and after 60 s the relay is
+  only nudged: a no-op relay-map change that forces a fresh net report. When
+  that report picks the same relay, iroh leaves its relay connection on its
+  normal retry schedule, so the nudge forces no reconnect. Until that relay
+  works again, new off-LAN dials and connections that run only through it
+  fail, while the endpoint keeps running and connections on a direct path
+  continue (as in Phase D); a process that starts while it is down fails to
+  start. The default relay map is n0's and is not subject to this.
 - **The startup probe fails only when no relay is reachable**, and the
   relays that fail it are taken out of the relay map (next section). Every
   custom relay is still probed individually, and each unreachable one is a
