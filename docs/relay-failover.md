@@ -127,8 +127,10 @@ an outage.
   (`RelayConfig::is_single_relay`): it works and `RelayConfig::log_status`
   warns at startup, but there is nothing to fail over to. A wedged relay
   is only nudged (a no-op relay-map change that forces a fresh net report
-  and reconnect), the endpoint is reachable off-LAN only once that relay
-  works again, and a process that starts while it is down fails to start.
+  and reconnect). Until that relay works again, new off-LAN dials and
+  connections that run only through it fail, while the endpoint keeps
+  running and connections on a direct path continue (as in Phase D); a
+  process that starts while it is down fails to start.
   The default relay map is n0's and is not subject to this.
 - **The startup probe fails only when no relay is reachable**, and the
   relays that fail it are taken out of the relay map (next section). Every

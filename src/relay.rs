@@ -42,8 +42,9 @@ pub enum RelayConfig {
     /// A server keeps working through a relay outage only by moving onto
     /// another configured relay (see [`crate::relay_failover`]), so a single
     /// relay is reduced-redundancy mode (see [`Self::is_single_relay`]): it
-    /// works, but an outage of that relay leaves the endpoint unreachable
-    /// off-LAN until the relay recovers.
+    /// works, but there is no other relay to move onto. While that relay is
+    /// down, new off-LAN dials and connections that run only through it fail;
+    /// the endpoint keeps running and connections on a direct path continue.
     ///
     /// The configured order is kept because it is meaningful to a relay-only
     /// dialer, which tries the relays one at a time: the first URL is the
@@ -192,8 +193,9 @@ impl RelayConfig {
             0 => {}
             1 => warn!(
                 "Using a single custom relay server{auth}: reduced redundancy, no failover. While \
-                 it is down the endpoint is reachable off-LAN by no one; configure another \
-                 relay_url to ride out a relay outage"
+                 it is down there is no other relay to move onto, so new off-LAN dials and \
+                 connections that run only through it fail (direct connections continue); \
+                 configure another relay_url to ride out a relay outage"
             ),
             n => info!("Using {n} custom relay servers with failover{auth}"),
         }

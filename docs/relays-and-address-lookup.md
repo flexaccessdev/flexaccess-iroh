@@ -80,9 +80,10 @@ A custom relay set should hold **at least two distinct relays**: failover is
 the reason the relay list exists. A single relay is accepted as
 **reduced-redundancy mode** (`RelayConfig::is_single_relay`), for deployments
 that run only one: it works, and `RelayConfig::log_status` warns at startup,
-but there is nothing to fail over to, so while that relay is down the
-endpoint is reachable off-LAN by no one, and a process that starts during the
-outage fails to start.
+but there is nothing to fail over to. While that relay is down, new off-LAN
+dials and connections that run only through it fail; the endpoint keeps
+running, connections on a direct path continue, and a process that starts
+during the outage fails to start.
 
 A deployment that runs custom relays contacts **no public iroh infrastructure at
 all**. See [relay-discovery-findings.md](relay-discovery-findings.md) for the
