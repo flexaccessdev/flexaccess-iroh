@@ -17,11 +17,14 @@ contact with public iroh infrastructure.**
 
 ## Before you start: the startup contract
 
-Every configured custom relay is probed **individually** at startup. The
-process refuses to start only when **none** of them comes online; each relay
-that does not is named in a warning and taken out of the relay map until the
-server's failover finds it connectable again (a client keeps it out for its
-lifetime). A dead backup relay is therefore loud at startup but not fatal, so
+Every configured custom relay is probed **individually** at startup. Each
+relay whose probe fails is named in a warning and taken out of the relay map
+until the server's failover finds it connectable again (a client keeps it out
+for its lifetime), unless the endpoint is connected through it or it is the
+last relay left. The process refuses to start when every probe fails and the
+endpoint is not connected, or when the endpoint is still not online 10 s after
+its relay map last changed; a startup timeout does not by itself mean that
+every relay failed its probe. A dead backup relay is therefore loud at startup but not fatal, so
 watch the logs: a relay list that is only half up has no failover left. Plan
 your relay list accordingly (at least two distinct relays are required), and
 configure **both sides with the full list** — see the warning in

@@ -745,6 +745,9 @@ pub(crate) async fn wait_online_beside(endpoint: &Endpoint, probes: &RelayProbes
             .any(|status| status.is_connected())
     };
     let mut probes = probes.clone();
+    // What the probe found before this wait began is a change like any
+    // other: it may have settled already, every relay failed included.
+    probes.0.mark_changed();
     let timed_out = || {
         anyhow::anyhow!(
             "Endpoint failed to come online after {}s - check relay server connectivity",
@@ -752,8 +755,8 @@ pub(crate) async fn wait_online_beside(endpoint: &Endpoint, probes: &RelayProbes
         )
     };
     let mut deadline = Some(Instant::now() + RELAY_CONNECT_TIMEOUT);
-    let mut left_out = probes.0.borrow().relays.left_out.len();
-    let mut probing = !probes.is_settled();
+    let mut left_out = 0;
+    let mut probing = true;
     let online = endpoint.online();
     tokio::pin!(online);
     loop {
@@ -979,6 +982,42 @@ mod tests {
             .unwrap();
         assert!(has_ip_transports(&direct));
         futures::join!(relay_only.close(), direct.close());
+    }
+
+    /// A probe that has already settled, every relay failed, when the wait
+    /// begins: the start fails at once with why, not after the timeout.
+    #[tokio::test]
+    async fn a_probe_that_failed_before_the_wait_fails_the_start_at_once() {
+        let endpoint = Endpoint::builder(presets::Empty)
+            .relay_mode(RelayMode::Disabled)
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .bind()
+            .await
+            .unwrap();
+        let (tx, rx) = watch::channel(ProbeProgress {
+            total: 2,
+            ..ProbeProgress::default()
+        });
+        tx.send_modify(|progress| {
+            progress.probed = 2;
+            for url in [RELAY, RELAY2] {
+                progress.failures.push((url.parse().unwrap(), "down".to_string()));
+            }
+            progress.released = true;
+        });
+        drop(tx);
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_online_beside(&endpoint, &RelayProbes(rx)),
+        )
+        .await
+        .expect("no wait for the timeout")
+        .expect_err("every relay failed");
+        assert!(
+            err.to_string().contains("all 2 custom relays failed to come online"),
+            "unexpected error: {err}"
+        );
+        endpoint.close().await;
     }
 
     #[tokio::test]

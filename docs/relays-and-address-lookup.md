@@ -175,8 +175,15 @@ it (`relay::RelayProbes`): a throwaway, relay-only endpoint
 (`clear_ip_transports`, ephemeral identity) for just that one URL, waiting on
 `endpoint.online()`, bounded by a 10 s `RELAY_CONNECT_TIMEOUT`. All probes run
 in parallel, and each result is applied to the live endpoint as it lands.
-**Startup fails only if no relay comes online; each relay that does not is
-reported as a warning and taken out of the endpoint's relay map.** Each probe
+**Each relay whose probe fails is reported as a warning and taken out of the
+endpoint's relay map**, unless the endpoint is connected through it or it is
+the last relay left. A probe is a connection of its own, so its result and the
+endpoint's can differ: a probe can fail on a relay the endpoint is connected
+through, which stays, and the endpoint can fail to come online on relays that
+passed. **Startup fails when every probe fails and the endpoint is not
+connected, or when the endpoint is still not online 10 s after its relay map
+last changed**, so a startup timeout does not by itself mean that every relay
+failed its probe. Each probe
 also checks its relay for QUIC address discovery, within the time the probe
 takes anyway (see [above](#quic-address-discovery-on-custom-relays)).
 
