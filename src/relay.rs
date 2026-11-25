@@ -287,6 +287,32 @@ async fn quic_addr_discovery_answered(endpoint: &Endpoint) {
     }
 }
 
+/// Whether `relay_url` serves QUIC address discovery, answered within `limit`:
+/// the check alone, without the relay probe whose connection cuts off the
+/// startup check (see [`probe_relay`]). `limit` should stay well below iroh's
+/// 3 s probe timeout, since an answer that slow holds the net report back
+/// almost as much as none. `false` also when the check endpoint cannot bind.
+/// Its endpoint is closed before returning, as in [`probe_relay`].
+pub(crate) async fn quic_addr_discovery_served(
+    relay_url: &RelayUrl,
+    auth_token: Option<&str>,
+    limit: Duration,
+    closes: &PendingCloses,
+) -> bool {
+    let endpoint = match qad_endpoint_builder(relay_url, auth_token).bind().await {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            warn!("Cannot check {relay_url} for QUIC address discovery: {e:#}");
+            return false;
+        }
+    };
+    let served = tokio::time::timeout(limit, quic_addr_discovery_answered(&endpoint))
+        .await
+        .is_ok();
+    crate::endpoint::close_endpoint(endpoint, closes).await;
+    served
+}
+
 /// What [`probe_relay`] found out about a relay that came online.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RelayProbe {
@@ -313,23 +339,38 @@ pub(crate) struct RelayProbe {
 /// faster than that (a network that drops UDP, a broken IPv6 route) would
 /// slow the report down as well, so it is counted as not serving QAD too.
 ///
+/// The check runs only with `check_quic_addr_discovery`, which the caller
+/// sets when its endpoint has IP transports (see [`has_ip_transports`]): a
+/// relay-only endpoint never probes QAD, and the check would send UDP
+/// datagrams it was configured not to send. Without the check the relay
+/// counts as not serving QAD.
+///
 /// Both endpoints are always closed before returning, with a bounded wait for
 /// the close (see [`crate::endpoint::close_endpoint`]); a close that outlives
 /// the wait is kept in `closes`.
 pub(crate) async fn probe_relay(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
+    check_quic_addr_discovery: bool,
     closes: &PendingCloses,
 ) -> Result<RelayProbe> {
+    let bind_qad = async {
+        match check_quic_addr_discovery {
+            true => Some(qad_endpoint_builder(relay_url, auth_token).bind().await),
+            false => None,
+        }
+    };
     let (endpoint, qad_endpoint) = futures::join!(
         probe_endpoint_builder(relay_url, auth_token).bind(),
-        qad_endpoint_builder(relay_url, auth_token).bind()
+        bind_qad
     );
     // The QAD check is best effort: an endpoint that cannot bind UDP cannot
     // use QAD either.
-    let qad_endpoint = qad_endpoint
-        .inspect_err(|e| warn!("Cannot check {relay_url} for QUIC address discovery: {e:#}"))
-        .ok();
+    let qad_endpoint = qad_endpoint.and_then(|bound| {
+        bound
+            .inspect_err(|e| warn!("Cannot check {relay_url} for QUIC address discovery: {e:#}"))
+            .ok()
+    });
     let endpoint = match endpoint {
         Ok(endpoint) => endpoint,
         Err(e) => {
@@ -388,6 +429,13 @@ pub(crate) async fn probe_relay(
             RELAY_CONNECT_TIMEOUT.as_secs()
         ),
     }
+}
+
+/// Whether `endpoint` has IP transports, and so can use QUIC address
+/// discovery at all. A relay-only endpoint
+/// ([`crate::endpoint::EndpointOptions::relay_only`]) binds no UDP socket.
+pub(crate) fn has_ip_transports(endpoint: &Endpoint) -> bool {
+    !endpoint.bound_sockets().is_empty()
 }
 
 /// Why a relay in `status` is not connected, for logs and errors (without the
@@ -497,6 +545,7 @@ impl RelayProbes {
             slot.clone(),
             urls.clone(),
             auth_token.clone(),
+            has_ip_transports(endpoint),
             closes.clone(),
             tx,
         ));
@@ -589,12 +638,14 @@ fn home_relay_connected(endpoint: &Endpoint, url: &RelayUrl) -> bool {
 /// handle, and a caller that closes the endpoint and binds a new one on the
 /// same port must not find it still taken by a probe of a relay that does not
 /// answer. The probes themselves run to the end either way, so that their own
-/// endpoints are closed.
+/// endpoints are closed. They check for QUIC address discovery only with
+/// `check_quic_addr_discovery` (see [`probe_relay`]).
 async fn apply_relay_probes(
     closed: impl Future<Output = ()>,
     slot: EndpointSlot,
     urls: Vec<RelayUrl>,
     auth_token: Option<String>,
+    check_quic_addr_discovery: bool,
     closes: PendingCloses,
     progress: watch::Sender<ProbeProgress>,
 ) {
@@ -605,7 +656,10 @@ async fn apply_relay_probes(
         .iter()
         .map(|url| {
             let (token, closes) = (auth_token.as_deref(), &closes);
-            async move { (url, probe_relay(url, token, closes).await) }
+            async move {
+                let probe = probe_relay(url, token, check_quic_addr_discovery, closes).await;
+                (url, probe)
+            }
         })
         .collect();
     let mut in_map = urls.len();
@@ -680,6 +734,9 @@ async fn apply_relay_probes(
         );
     }
     let online = progress.total - progress.failures.len();
+    if !check_quic_addr_discovery {
+        return;
+    }
     match progress.relays.quic_addr_discovery.len() {
         0 => info!("None of the {online} reachable custom relays serves QUIC address discovery"),
         n => info!(
@@ -930,6 +987,25 @@ mod tests {
     fn from_urls_carries_no_token() {
         let cfg = RelayConfig::from_urls(&two()).unwrap();
         assert_eq!(cfg.relay_auth_token(), None);
+    }
+
+    #[tokio::test]
+    async fn a_relay_only_endpoint_has_no_ip_transports() {
+        // A relay-only endpoint needs a relay to bind at all; it is never
+        // connected to here.
+        let relay_only = probe_endpoint_builder(&RELAY.parse().unwrap(), None)
+            .bind()
+            .await
+            .unwrap();
+        assert!(!has_ip_transports(&relay_only));
+        let direct = Endpoint::builder(presets::Empty)
+            .relay_mode(RelayMode::Disabled)
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .bind()
+            .await
+            .unwrap();
+        assert!(has_ip_transports(&direct));
+        futures::join!(relay_only.close(), direct.close());
     }
 
     #[tokio::test]
