@@ -70,7 +70,8 @@
 
 use crate::endpoint::PendingCloses;
 use crate::relay::{
-    RelayConfig, RelayProbes, has_ip_transports, probe_relay, relay_entry, relay_failure,
+    RelayConfig, RelayProbe, RelayProbes, has_ip_transports, probe_relay, relay_entry,
+    relay_failure,
 };
 use iroh::endpoint::RelayStatus;
 use iroh::{Endpoint, RelayUrl, Watcher};
@@ -269,11 +270,7 @@ impl FailoverRelays for EndpointRelays<'_> {
     }
 
     async fn restore(&mut self, url: &RelayUrl) -> bool {
-        // The failover lives on the process's runtime, where a slow close of
-        // the probe endpoint finishes by itself: nothing waits for it.
-        let closes = PendingCloses::new();
-        let probe = probe_relay(url, self.auth_token.as_deref(), self.ip_transports, &closes);
-        match probe.await {
+        match probe_detached(url, self.auth_token.as_deref(), self.ip_transports).await {
             Ok(probe) => {
                 if !self.urls.contains(url) {
                     log::error!(
@@ -308,13 +305,10 @@ impl FailoverRelays for EndpointRelays<'_> {
             .into_iter()
             .filter(|url| !self.quic_addr_discovery.contains(url))
             .collect();
-        // As in `restore`, nothing waits for a slow close of a probe endpoint.
-        let closes = PendingCloses::new();
         let token = self.auth_token.as_deref();
-        let probes = futures::future::join_all(
-            unserved.iter().map(|url| probe_relay(url, token, true, &closes)),
-        )
-        .await;
+        let probes =
+            futures::future::join_all(unserved.iter().map(|url| probe_detached(url, token, true)))
+                .await;
         for (url, probe) in unserved.into_iter().zip(probes) {
             match probe {
                 Ok(probe) if probe.quic_addr_discovery => {
@@ -327,6 +321,25 @@ impl FailoverRelays for EndpointRelays<'_> {
             }
         }
     }
+}
+
+/// [`probe_relay`] on a task of its own, so that it runs to the end and closes
+/// its endpoints even when the failover future is dropped mid-probe (the
+/// server's accept loop ended). The failover lives on the process's runtime,
+/// where a slow close of a probe endpoint finishes by itself: nothing waits
+/// for it.
+async fn probe_detached(
+    url: &RelayUrl,
+    auth_token: Option<&str>,
+    check_quic_addr_discovery: bool,
+) -> anyhow::Result<RelayProbe> {
+    let (url, auth_token) = (url.clone(), auth_token.map(str::to_owned));
+    tokio::spawn(async move {
+        let closes = PendingCloses::new();
+        probe_relay(&url, auth_token.as_deref(), check_quic_addr_discovery, &closes).await
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("probe task failed: {e}"))?
 }
 
 /// Outage bookkeeping shared by the loop and its status observer.
@@ -473,9 +486,13 @@ where
         .map(|url| (url, Instant::now() + RELAY_RESTORE_INTERVAL))
         .collect();
     let mut recheck_at = Instant::now() + QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
-    let mut value = watcher.get();
-    outage.observe(&describe(&value));
+    let mut value;
     loop {
+        // The status as it is now, before any deadline acts on it: a restore
+        // probe or recheck awaited in the loop keeps the watcher unpolled, and
+        // a home relay that reconnected meanwhile must not be failed over.
+        value = watcher.get();
+        outage.observe(&describe(&value));
         let check_at = removed.iter().map(|(_, at)| *at).min();
         let out: Vec<RelayUrl> = removed.iter().map(|(url, _)| url.clone()).collect();
         // Whether there is another relay in the map to fail over to.
@@ -608,6 +625,8 @@ mod tests {
         /// What the status flips to once the loop has acted on the relay
         /// map (`None` = stays as it is).
         after_fail_over: Option<Status>,
+        /// How long a QUIC address discovery recheck takes.
+        recheck_takes: Duration,
     }
 
     impl FakeRelays {
@@ -619,6 +638,7 @@ mod tests {
                 connectable: Arc::new(AtomicBool::new(true)),
                 status: status.clone(),
                 after_fail_over,
+                recheck_takes: Duration::ZERO,
             }
         }
 
@@ -669,6 +689,7 @@ mod tests {
                 out: out.to_vec(),
                 at: self.started.elapsed(),
             });
+            tokio::time::sleep(self.recheck_takes).await;
         }
     }
 
@@ -997,5 +1018,33 @@ mod tests {
                 Action::Recheck { out: vec![relay_a()], at: first * 2 },
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_home_relay_that_reconnects_during_a_slow_recheck_is_not_failed_over() {
+        // A goes down 30 s before a recheck that takes 40 s, and reconnects
+        // 10 s into it: the outage deadline passes while the loop is busy,
+        // and the loop must see the reconnect before it acts. Repeated,
+        // since which ready branch `select!` takes first is random.
+        let first = QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
+        for _ in 0..32 {
+            let status = Watchable::new(Status::UpOnA);
+            let mut relays = FakeRelays::new(&status, None);
+            relays.recheck_takes = 40 * SEC;
+            let flipper = {
+                let status = status.clone();
+                async move {
+                    tokio::time::sleep(first - 30 * SEC).await;
+                    status.set(Status::DownOnA).ok();
+                    tokio::time::sleep(40 * SEC).await;
+                    status.set(Status::UpOnA).ok();
+                }
+            };
+            tokio::join!(run_for(&status, &mut relays, first + 100 * SEC), flipper);
+            assert_eq!(
+                relays.actions(),
+                vec![Action::Recheck { out: Vec::new(), at: first }]
+            );
+        }
     }
 }
