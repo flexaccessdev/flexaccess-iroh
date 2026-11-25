@@ -107,8 +107,8 @@ Checked against the released sources on 2026-09-04.
    needs restoring.
 4. **Relays left out at startup are treated as removed.** `create_endpoint`
    hands back the configured relays it bound without
-   (`CreatedEndpoint::relays_left_out`); `fail_over_home_relay` takes that
-   list and restore-probes each one on the same 90 s cycle as a relay it
+   (`CreatedEndpoint::relays`, `ProbedRelays::left_out`);
+   `fail_over_home_relay` takes that and restore-probes each one on the same 90 s cycle as a relay it
    removed itself. Restoring a relay that is *not* in the configuration is
    refused, so a caller cannot smuggle an extra relay in this way.
 
@@ -148,9 +148,11 @@ the server's clients, which dial with every configured relay as a hint, reach
 it through whichever relay it is homed on.
 
 The exclusion is temporary where the failover runs. `create_endpoint` returns
-`CreatedEndpoint { endpoint, relays_left_out }`, and the server passes
-`relays_left_out` to `fail_over_home_relay`, which restore-probes them every
-90 s and re-inserts each once it is connectable. A process that does not run
+`CreatedEndpoint { endpoint, relays }`, and the server passes `relays` to
+`fail_over_home_relay`, which restore-probes the relays left out every 90 s
+and re-inserts each once it is connectable. A relay is re-inserted with QUIC
+address discovery only if the restore probe found it serves it (see
+[relays-and-address-lookup.md](relays-and-address-lookup.md#quic-address-discovery-on-custom-relays)). A process that does not run
 the failover (a client) keeps them out for its lifetime, which is the right
 call for something that lives one connection; a long-lived client that must
 follow a relay back would have to run the failover too.

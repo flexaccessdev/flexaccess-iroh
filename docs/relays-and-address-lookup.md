@@ -117,6 +117,47 @@ receive one and the feature is inert in default mode. Blank/whitespace-only
 tokens normalize to "no token" rather than erroring. Server and clients sharing a
 private relay must configure the same token.
 
+## QUIC address discovery on custom relays
+
+QUIC address discovery (QAD) is a QUIC endpoint a relay can run on UDP 7842
+that tells an iroh endpoint its public address, one of the signals hole
+punching uses. iroh assumes every relay given by URL serves it, and probes it
+on every relay in the map at the start of each full network report.
+
+Probing a relay that does not serve it is not free. iroh does not pick a home
+relay until its QAD probes finish, and a probe to a relay with nothing on UDP
+7842 waits out the probe timeout: **3 s on iroh 1.5** (`PROBES_TIMEOUT`,
+net_report). An endpoint is not online until it has a home relay, so that 3 s
+lands on every start of every program, and again on each later full report
+(network changes, every 5 minutes). Measured on 2026-11-25 against two relays
+behind a Cloudflare Tunnel: the first report took 3.0 s with QAD probed and
+0.3 s without.
+
+A relay serves QAD only when it terminates TLS itself, runs
+`enable_quic_addr_discovery = true`, and has UDP 7842 reachable. A relay behind
+a Cloudflare Tunnel (see [self-hosting.md](self-hosting.md)) or any other
+HTTP-only front never does.
+
+So the crate **detects it per relay** instead of assuming it, as part of the
+startup probe (next section), and the endpoint probes QAD only on the relays
+that answered (`ProbedRelays::quic_addr_discovery`,
+`RelayConfig::relay_map_for`). Next to each relay's probe endpoint, a second
+throwaway endpoint with UDP transports and QAD on runs a net report with only
+the QAD probes (`NetReportConfig::minimal`); its report shows UDP working
+only if the relay answered. The answer is whatever that endpoint learned by
+the time the relay probe came online, so the check adds no time of its own: a
+relay that serves QAD answers in about one round trip (85–150 ms against n0's
+relays, whose relay probes took 380–520 ms). A relay whose QAD answer is no
+faster than its relay connection (a network that drops UDP, a broken IPv6
+route) would hold the report back as well, so it counts as not serving QAD.
+
+Reading the report needs iroh's `unstable-net-report` feature
+(`Endpoint::net_report`), which the crate enables. The failover's restore
+probe makes the same check, so a relay put back into the map gets QAD exactly
+when it answered then; a relay re-inserted unchanged keeps what it had. The
+default relays are not probed: n0's relays serve QAD, and iroh uses it there
+as before.
+
 ## Custom relay validation: the per-relay startup probe
 
 Before binding the real endpoint (`flexaccess_iroh::endpoint::create_endpoint`),
@@ -126,7 +167,9 @@ by binding a throwaway, relay-only endpoint
 `endpoint.online()`, bounded by a 10 s `RELAY_CONNECT_TIMEOUT`. All probes run in
 parallel. **Startup fails only if no relay comes online; each relay that does
 not is reported as a warning and left out of the relay map the endpoint is
-bound with.**
+bound with.** Each probe also checks its relay for QUIC address discovery,
+within the time the probe takes anyway (see
+[above](#quic-address-discovery-on-custom-relays)).
 
 Probing each relay on its own is what makes those warnings possible: a single
 endpoint-wide `online()` wait only proves that *one* relay (the eventual home
@@ -143,7 +186,7 @@ it. Nor may a relay that failed the probe stay in the map: iroh picks its home
 relay by probe latency, so a relay that answers probes but refuses relay
 connections would be preferred, never connect, and keep `online()` from ever
 resolving. `create_endpoint` therefore binds without those relays and hands
-them back (`CreatedEndpoint::relays_left_out`) for the failover to restore
+them back (`CreatedEndpoint::relays`, `ProbedRelays::left_out`) for the failover to restore
 once they are connectable, using this same probe; a process that does not run
 the failover keeps them out for its lifetime. See
 [relay-failover.md](relay-failover.md#starting-during-an-outage).

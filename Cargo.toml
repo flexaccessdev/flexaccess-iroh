@@ -28,7 +28,11 @@ futures = "0.3"
 # A range, deliberately: every consumer resolves one `iroh` 1.5.x for its own
 # workspace and this crate compiles against it. A consumer on a fork of iroh
 # redirects this dependency too with `[patch.crates-io]` (see README.md).
-iroh = ">=1.5.0, <1.6.0"
+# `unstable-net-report` exposes `Endpoint::net_report`, which the startup probe
+# reads to tell whether a custom relay serves QUIC address discovery
+# (`relay::probe_relay`). Being unstable is why the range stays within one
+# minor release.
+iroh = { version = ">=1.5.0, <1.6.0", features = ["unstable-net-report"] }
 log = "0.4"
 # `relay-health` only. `rustls-no-provider` is the exact reqwest feature iroh
 # already enables, so this adds no new TLS backend (no openssl / aws-lc); the

@@ -87,6 +87,10 @@ manual_key_path = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
 # hostname = "relay.example.com"
 ```
 
+Keep UDP 7842 reachable from where clients run: the programs check each
+custom relay for QUIC address discovery at startup and use it only on the
+relays that answer.
+
 ## Simple production setup: relay behind Cloudflare Tunnel (single TCP port)
 
 If you don't want to manage TLS certificates or open inbound ports, run the
@@ -158,7 +162,11 @@ cloudflared tunnel run --token <token>
 > there is no QUIC endpoint, disables QUIC address discovery (one of the signals
 > iroh uses to help peers hole-punch to a direct connection). For a relay whose
 > job is a pure relay-only fallback this is fine; if you want to maximize direct
-> P2P success, use the TLS + QUIC production config above instead.
+> P2P success, use the TLS + QUIC production config above instead. The programs
+> detect that such a relay does not serve QUIC address discovery and stop
+> probing it for that, which would otherwise delay every endpoint start by 3 s
+> (see
+> [relays-and-address-lookup.md](relays-and-address-lookup.md#quic-address-discovery-on-custom-relays)).
 
 ## Relay access token
 

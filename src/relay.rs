@@ -7,7 +7,7 @@
 use crate::endpoint::PendingCloses;
 use anyhow::{Context, Result};
 use futures::future::join_all;
-use iroh::endpoint::{RelayStatus, presets};
+use iroh::endpoint::{NetReportConfig, PortmapperConfig, RelayStatus, presets};
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, Watcher};
 use log::{info, warn};
 use std::fmt;
@@ -162,31 +162,39 @@ impl RelayConfig {
         matches!(self, Self::Custom { .. })
     }
 
-    /// The corresponding iroh [`RelayMode`].
+    /// The corresponding iroh [`RelayMode`], before the relays are probed.
     ///
     /// For custom relays, an `auth_token` (when set) is applied to every relay in
-    /// the map via [`RelayMap::with_auth_token`], which iroh sends as an
-    /// `Authorization: Bearer <token>` header on the relay WebSocket upgrade.
+    /// the map, which iroh sends as an `Authorization: Bearer <token>` header on
+    /// the relay WebSocket upgrade. No relay is probed for QUIC address
+    /// discovery: that is known only once the startup probe has checked each
+    /// relay, and [`crate::endpoint::create_endpoint`] binds with
+    /// [`Self::relay_map_for`] instead.
     pub fn relay_mode(&self) -> RelayMode {
         match self {
             Self::Default => RelayMode::Default,
-            Self::Custom { urls, auth_token } => {
-                RelayMode::Custom(relay_map(urls.iter().cloned(), auth_token.as_deref()))
-            }
+            Self::Custom { .. } => RelayMode::Custom(self.relay_map_for(&ProbedRelays::default())),
         }
     }
 
-    /// The custom relay map without `excluded`: what an endpoint is bound
-    /// with when some configured relays failed the startup probe (see
-    /// [`crate::endpoint::create_endpoint`]). The auth token is applied as in
-    /// [`Self::relay_mode`]. Empty for the default relays.
-    pub fn relay_map_without(&self, excluded: &[RelayUrl]) -> RelayMap {
+    /// The custom relay map as `probed` found the relays: without the relays
+    /// that did not come online, and with QUIC address discovery only for the
+    /// relays that serve it (see [`probe_custom_relays`]). The auth token is
+    /// applied as in [`Self::relay_mode`]. Empty for the default relays.
+    pub fn relay_map_for(&self, probed: &ProbedRelays) -> RelayMap {
         match self {
             Self::Default => RelayMap::empty(),
-            Self::Custom { urls, auth_token } => relay_map(
-                urls.iter().filter(|url| !excluded.contains(url)).cloned(),
-                auth_token.as_deref(),
-            ),
+            Self::Custom { urls, auth_token } => urls
+                .iter()
+                .filter(|url| !probed.left_out.contains(url))
+                .map(|url| {
+                    relay_entry(
+                        url,
+                        auth_token.as_deref(),
+                        probed.quic_addr_discovery.contains(url),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -205,12 +213,35 @@ impl RelayConfig {
     }
 }
 
-/// A relay map of `urls`, with `auth_token` (when set) applied to every relay.
-fn relay_map(urls: impl IntoIterator<Item = RelayUrl>, auth_token: Option<&str>) -> RelayMap {
-    let map = RelayMap::from_iter(urls);
+/// What the startup probe found out about the custom relays (see
+/// [`probe_custom_relays`]); empty for the default relays, which are not
+/// probed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbedRelays {
+    /// The configured relays that did not come online, left out of the relay
+    /// map the endpoint is bound with.
+    pub left_out: Vec<RelayUrl>,
+    /// The configured relays that serve QUIC address discovery (QAD), the only
+    /// ones the endpoint probes for it. See [`probe_relay`] for why the others
+    /// must not be.
+    pub quic_addr_discovery: Vec<RelayUrl>,
+}
+
+/// The relay-map entry for one custom relay: `auth_token` (when set) on it,
+/// and probed for QUIC address discovery on iroh's default port only when
+/// `quic_addr_discovery` is set.
+pub(crate) fn relay_entry(
+    url: &RelayUrl,
+    auth_token: Option<&str>,
+    quic_addr_discovery: bool,
+) -> iroh::RelayConfig {
+    let mut relay = iroh::RelayConfig::from(url.clone());
+    if !quic_addr_discovery {
+        relay.quic = None;
+    }
     match auth_token {
-        Some(token) => map.with_auth_token(token.to_string()),
-        None => map,
+        Some(token) => relay.with_auth_token(token),
+        None => relay,
     }
 }
 
@@ -222,12 +253,13 @@ fn relay_map(urls: impl IntoIterator<Item = RelayUrl>, auth_token: Option<&str>)
 /// auth-rejecting relay. The auth token, when set, rides the WebSocket upgrade
 /// exactly as it does for the real endpoint, so the probe validates the token
 /// too. iroh's default QUIC transport settings are fine here: the probe only
-/// needs the relay link to come up, never a data path.
+/// needs the relay link to come up, never a data path. Without IP transports
+/// iroh never probes QUIC address discovery, so the entry leaves it off.
 fn probe_endpoint_builder(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
 ) -> iroh::endpoint::Builder {
-    let map = relay_map([relay_url.clone()], auth_token);
+    let map = RelayMap::from_iter([relay_entry(relay_url, auth_token, false)]);
     // iroh 1.x requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
@@ -239,23 +271,112 @@ fn probe_endpoint_builder(
         .clear_ip_transports()
 }
 
+/// Build an endpoint that does nothing but probe one relay for QUIC address
+/// discovery: IP transports (QAD runs over UDP), the relay entry with QAD on,
+/// and none of the net report's other probes, so its report has UDP only when
+/// the relay answered QAD. No portmapping either: the endpoint never carries
+/// a connection.
+fn qad_endpoint_builder(relay_url: &RelayUrl, auth_token: Option<&str>) -> iroh::endpoint::Builder {
+    let map = RelayMap::from_iter([relay_entry(relay_url, auth_token, true)]);
+    Endpoint::builder(presets::Empty)
+        .relay_mode(RelayMode::Custom(map))
+        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .net_report_config(NetReportConfig::minimal())
+        .portmapper_config(PortmapperConfig::Disabled)
+}
+
+/// Resolves once `endpoint`'s net report shows UDP working, which with the
+/// map and report of [`qad_endpoint_builder`] means the relay answered QUIC
+/// address discovery. Pending otherwise.
+async fn quic_addr_discovery_answered(endpoint: &Endpoint) {
+    let mut reports = endpoint.net_report();
+    loop {
+        if reports.get().is_some_and(|report| report.has_udp()) {
+            return;
+        }
+        if reports.updated().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// What [`probe_relay`] found out about a relay that came online.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RelayProbe {
+    /// Whether the relay serves QUIC address discovery (QAD).
+    pub(crate) quic_addr_discovery: bool,
+}
+
 /// Probe a single custom relay by binding a relay-only endpoint and waiting for
-/// it to come online, bounded by [`RELAY_CONNECT_TIMEOUT`]. `Ok(())` means the
+/// it to come online, bounded by [`RELAY_CONNECT_TIMEOUT`]. `Ok` means the
 /// relay connected (and accepted the auth token, if any); otherwise the error
-/// describes the failure. The probe endpoint is always closed before
-/// returning, with a bounded wait for the close (see
-/// [`crate::endpoint::close_endpoint`]); a close that outlives the wait is
-/// kept in `closes`.
+/// describes the failure.
+///
+/// Alongside, a second endpoint checks whether the relay serves QUIC address
+/// discovery on iroh's default UDP port 7842, and the answer is whatever it
+/// learned by the time the relay came online: the check adds no time of its
+/// own. That cut-off is the point. iroh does not choose a home relay until
+/// its QAD probes of every relay in the map finish, and a relay that does not
+/// answer them (a relay behind a Cloudflare Tunnel or any other HTTP-only
+/// front, which carries no UDP) holds each full net report back by the probe
+/// timeout, 3 s on iroh 1.5, so every endpoint start would wait for it: 3.0 s
+/// against 0.3 s for the first report, measured against two relays behind
+/// Cloudflare Tunnels. A relay that serves QAD answers in about one round
+/// trip, well before its relay connection is up. One whose answer is no
+/// faster than that (a network that drops UDP, a broken IPv6 route) would
+/// slow the report down as well, so it is counted as not serving QAD too.
+///
+/// Both endpoints are always closed before returning, with a bounded wait for
+/// the close (see [`crate::endpoint::close_endpoint`]); a close that outlives
+/// the wait is kept in `closes`.
 pub(crate) async fn probe_relay(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
     closes: &PendingCloses,
-) -> Result<()> {
-    let endpoint = probe_endpoint_builder(relay_url, auth_token)
-        .bind()
-        .await
-        .with_context(|| format!("Failed to bind probe endpoint for relay {relay_url}"))?;
-    let outcome = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await;
+) -> Result<RelayProbe> {
+    let (endpoint, qad_endpoint) = futures::join!(
+        probe_endpoint_builder(relay_url, auth_token).bind(),
+        qad_endpoint_builder(relay_url, auth_token).bind()
+    );
+    // The QAD check is best effort: an endpoint that cannot bind UDP cannot
+    // use QAD either.
+    let qad_endpoint = qad_endpoint
+        .inspect_err(|e| warn!("Cannot check {relay_url} for QUIC address discovery: {e:#}"))
+        .ok();
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            if let Some(qad_endpoint) = qad_endpoint {
+                crate::endpoint::close_endpoint(qad_endpoint, closes).await;
+            }
+            return Err(e)
+                .with_context(|| format!("Failed to bind probe endpoint for relay {relay_url}"));
+        }
+    };
+    let mut quic_addr_discovery = false;
+    let outcome = {
+        let online = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online());
+        let answered = async {
+            match &qad_endpoint {
+                Some(qad_endpoint) => quic_addr_discovery_answered(qad_endpoint).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(online, answered);
+        loop {
+            tokio::select! {
+                outcome = &mut online => break outcome,
+                () = &mut answered, if !quic_addr_discovery => quic_addr_discovery = true,
+            }
+        }
+    };
+    // A report that landed in the same poll as the relay coming online.
+    quic_addr_discovery |= qad_endpoint.as_ref().is_some_and(|qad_endpoint| {
+        qad_endpoint
+            .net_report()
+            .get()
+            .is_some_and(|report| report.has_udp())
+    });
     // Read why before closing: the probe map holds this one relay, so its
     // status (if selected at all) carries the last connection failure.
     let failure = outcome.is_err().then(|| {
@@ -265,9 +386,16 @@ pub(crate) async fn probe_relay(
             .first()
             .map_or_else(|| "no home relay selected".to_string(), relay_failure)
     });
-    crate::endpoint::close_endpoint(endpoint, closes).await;
+    let close_qad = async {
+        if let Some(qad_endpoint) = qad_endpoint {
+            crate::endpoint::close_endpoint(qad_endpoint, closes).await;
+        }
+    };
+    futures::join!(crate::endpoint::close_endpoint(endpoint, closes), close_qad);
     match failure {
-        None => Ok(()),
+        None => Ok(RelayProbe {
+            quic_addr_discovery,
+        }),
         Some(failure) => anyhow::bail!(
             "did not come online within {}s: {failure}",
             RELAY_CONNECT_TIMEOUT.as_secs()
@@ -290,9 +418,10 @@ pub(crate) fn relay_failure(status: &RelayStatus) -> String {
 
 /// Probe every configured custom relay individually (in parallel). Startup
 /// fails only if **every** relay is unreachable; each relay that does not
-/// come online is reported as a warning and returned, so the caller can bind
-/// the endpoint without it. Default relays are not probed (returns an empty
-/// list immediately).
+/// come online is reported as a warning and returned as left out, so the
+/// caller can bind the endpoint without it. The relays that serve QUIC address
+/// discovery are returned too (see [`probe_relay`]). Default relays are not
+/// probed (returns empty [`ProbedRelays`] immediately).
 ///
 /// Probing each relay on its own is what makes this possible: a single
 /// endpoint-wide `online()` wait proves only that *one* relay (the home
@@ -314,9 +443,9 @@ pub(crate) fn relay_failure(status: &RelayStatus) -> String {
 pub async fn probe_custom_relays(
     relay_config: &RelayConfig,
     closes: &PendingCloses,
-) -> Result<Vec<RelayUrl>> {
+) -> Result<ProbedRelays> {
     let RelayConfig::Custom { urls, auth_token } = relay_config else {
-        return Ok(Vec::new());
+        return Ok(ProbedRelays::default());
     };
     let token = auth_token.as_deref();
     info!("Probing {} custom relays for reachability...", urls.len());
@@ -325,10 +454,15 @@ pub async fn probe_custom_relays(
             .map(|url| async move { (url, probe_relay(url, token, closes).await) }),
     )
     .await;
-    let failures: Vec<(RelayUrl, anyhow::Error)> = results
-        .into_iter()
-        .filter_map(|(url, res)| res.err().map(|e| (url.clone(), e)))
-        .collect();
+    let mut quic_addr_discovery = Vec::new();
+    let mut failures: Vec<(RelayUrl, anyhow::Error)> = Vec::new();
+    for (url, result) in results {
+        match result {
+            Ok(probe) if probe.quic_addr_discovery => quic_addr_discovery.push(url.clone()),
+            Ok(_) => {}
+            Err(e) => failures.push((url.clone(), e)),
+        }
+    }
     let describe = |failures: &[(RelayUrl, anyhow::Error)]| {
         failures
             .iter()
@@ -354,7 +488,22 @@ pub async fn probe_custom_relays(
             describe(&failures)
         );
     }
-    Ok(failures.into_iter().map(|(url, _)| url).collect())
+    let online = urls.len() - failures.len();
+    match quic_addr_discovery.len() {
+        0 => info!("None of the {online} reachable custom relays serves QUIC address discovery"),
+        n => info!(
+            "{n} of the {online} reachable custom relays serve QUIC address discovery: {}",
+            quic_addr_discovery
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+    Ok(ProbedRelays {
+        left_out: failures.into_iter().map(|(url, _)| url).collect(),
+        quic_addr_discovery,
+    })
 }
 
 #[cfg(test)]
@@ -369,18 +518,52 @@ mod tests {
     }
 
     #[test]
-    fn relay_map_without_drops_only_the_excluded_relays_and_keeps_the_token() {
+    fn relay_map_for_drops_only_the_relays_left_out_and_keeps_the_token() {
         let cfg = RelayConfig::from_urls_with_token(&two(), Some("secret".to_string())).unwrap();
         let relay: RelayUrl = RELAY.parse().unwrap();
         let relay2: RelayUrl = RELAY2.parse().unwrap();
-        let map = cfg.relay_map_without(std::slice::from_ref(&relay));
+        let left_out = ProbedRelays {
+            left_out: vec![relay.clone()],
+            quic_addr_discovery: Vec::new(),
+        };
+        let map = cfg.relay_map_for(&left_out);
         assert!(!map.contains(&relay));
         assert!(map.contains(&relay2));
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&relay2).unwrap().auth_token.as_deref(), Some("secret"));
-        let full = cfg.relay_map_without(&[]);
+        let full = cfg.relay_map_for(&ProbedRelays::default());
         assert_eq!(full.len(), 2);
-        assert!(RelayConfig::Default.relay_map_without(&[relay]).is_empty());
+        assert!(RelayConfig::Default.relay_map_for(&left_out).is_empty());
+    }
+
+    #[test]
+    fn only_relays_that_serve_it_are_probed_for_quic_addr_discovery() {
+        let qad_port = |map: &RelayMap, url: &str| {
+            let url: RelayUrl = url.parse().unwrap();
+            map.get(&url).unwrap().quic.as_ref().map(|quic| quic.port)
+        };
+        // What iroh assumes for a relay given by URL alone (UDP 7842).
+        let default_port = iroh::RelayConfig::from(RELAY.parse::<RelayUrl>().unwrap())
+            .quic
+            .map(|quic| quic.port)
+            .expect("iroh probes QAD on a relay given by URL");
+
+        let cfg = RelayConfig::from_urls_with_token(&two(), Some("secret".to_string())).unwrap();
+        let RelayMode::Custom(unprobed) = cfg.relay_mode() else {
+            panic!("custom relays give a custom relay map");
+        };
+        assert_eq!(qad_port(&unprobed, RELAY), None);
+        assert_eq!(qad_port(&unprobed, RELAY2), None);
+
+        let probed = ProbedRelays {
+            left_out: Vec::new(),
+            quic_addr_discovery: vec![RELAY2.parse().unwrap()],
+        };
+        let map = cfg.relay_map_for(&probed);
+        assert_eq!(qad_port(&map, RELAY), None);
+        assert_eq!(qad_port(&map, RELAY2), Some(default_port));
+        let relay2: RelayUrl = RELAY2.parse().unwrap();
+        assert_eq!(map.get(&relay2).unwrap().auth_token.as_deref(), Some("secret"));
     }
 
     #[test]
@@ -501,12 +684,13 @@ mod tests {
     #[tokio::test]
     async fn default_relays_are_not_probed() {
         // Must return immediately without touching the network.
-        tokio::time::timeout(
+        let probed = tokio::time::timeout(
             Duration::from_millis(100),
             probe_custom_relays(&RelayConfig::Default, &PendingCloses::new()),
         )
         .await
         .expect("no probe for the default relays")
         .unwrap();
+        assert_eq!(probed, ProbedRelays::default());
     }
 }

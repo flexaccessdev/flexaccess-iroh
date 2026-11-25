@@ -9,12 +9,12 @@
 //! tuning onto the [`iroh::endpoint::Builder`] returned by
 //! [`endpoint_builder`], then hand it to [`create_endpoint`].
 
-use crate::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig, probe_custom_relays};
+use crate::relay::{ProbedRelays, RELAY_CONNECT_TIMEOUT, RelayConfig, probe_custom_relays};
 use anyhow::{Context, Result};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, join_all};
 use iroh::{
-    Endpoint, RelayMode, RelayUrl,
+    Endpoint, RelayMode,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, QuicTransportConfig, presets},
 };
@@ -202,24 +202,26 @@ async fn wait_online(endpoint: &Endpoint) -> Result<()> {
     }
 }
 
-/// What [`create_endpoint`] hands back: the bound, online endpoint and the
-/// custom relays it was bound without.
+/// What [`create_endpoint`] hands back: the bound, online endpoint and what
+/// the startup probe found out about the custom relays.
 #[derive(Debug)]
 pub struct CreatedEndpoint {
     pub endpoint: Endpoint,
-    /// The configured custom relays that failed the startup probe and were
-    /// left out of the endpoint's relay map (see [`create_endpoint`]). Empty
-    /// with the default relays or when every custom relay probed fine. Hand
-    /// them to [`crate::relay_failover::fail_over_home_relay`], which puts
-    /// each one back into the relay map once it is connectable again; a
+    /// The custom relays the endpoint was bound without, because they failed
+    /// the startup probe, and those it probes for QUIC address discovery,
+    /// because they serve it (see [`create_endpoint`]). Empty with the
+    /// default relays. Hand it to
+    /// [`crate::relay_failover::fail_over_home_relay`], which puts each relay
+    /// left out back into the relay map once it is connectable again; a
     /// process that does not run the failover keeps them out for its
     /// lifetime.
-    pub relays_left_out: Vec<RelayUrl>,
+    pub relays: ProbedRelays,
 }
 
 /// Create an endpoint: log the relay setup, probe every custom relay (fail
 /// only if none is reachable; see [`probe_custom_relays`]), bind **without**
-/// the relays that failed the probe, and require the endpoint to come online.
+/// the relays that failed the probe and with QUIC address discovery only for
+/// the relays that serve it, and require the endpoint to come online.
 ///
 /// Leaving a failed relay out of the relay map is what lets the endpoint come
 /// online during that relay's outage: iroh picks its home relay by probe
@@ -227,7 +229,11 @@ pub struct CreatedEndpoint {
 /// outage [`crate::relay_failover`] exists for) would otherwise be preferred,
 /// never connect, and keep [`Endpoint::online`] pending until the timeout
 /// here fails the whole start. The relay comes back through the failover's
-/// restore probe; see [`CreatedEndpoint::relays_left_out`].
+/// restore probe; see [`CreatedEndpoint::relays`].
+///
+/// Probing a custom relay for QUIC address discovery is left to the relays
+/// that serve it because a relay that does not delays every endpoint start by
+/// iroh's 3 s probe timeout (see [`crate::relay::probe_custom_relays`]).
 ///
 /// On failure after binding the endpoint is closed before the error
 /// propagates (dropping a bound endpoint without `close()` is fatal under
@@ -243,33 +249,31 @@ pub async fn create_endpoint(
     closes: &PendingCloses,
 ) -> Result<CreatedEndpoint> {
     relay_config.log_status();
-    let relays_left_out = probe_custom_relays(relay_config, closes).await?;
-    let builder = if relays_left_out.is_empty() {
-        builder
+    let relays = probe_custom_relays(relay_config, closes).await?;
+    let builder = if relay_config.is_custom() {
+        if !relays.left_out.is_empty() {
+            warn!(
+                "Binding without {} of {} custom relays: {}",
+                relays.left_out.len(),
+                relay_config.custom_urls().len(),
+                relays
+                    .left_out
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        builder.relay_mode(RelayMode::Custom(relay_config.relay_map_for(&relays)))
     } else {
-        warn!(
-            "Binding without {} of {} custom relays: {}",
-            relays_left_out.len(),
-            relay_config.custom_urls().len(),
-            relays_left_out
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        builder.relay_mode(RelayMode::Custom(
-            relay_config.relay_map_without(&relays_left_out),
-        ))
+        builder
     };
     let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
     if let Err(e) = wait_online(&endpoint).await {
         close_endpoint(endpoint, closes).await;
         return Err(e);
     }
-    Ok(CreatedEndpoint {
-        endpoint,
-        relays_left_out,
-    })
+    Ok(CreatedEndpoint { endpoint, relays })
 }
 
 #[cfg(test)]
