@@ -33,10 +33,10 @@ use tokio::task::{AbortHandle, JoinHandle};
 /// caller's [`PendingCloses`].
 pub(crate) const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The endpoint closes this crate stopped waiting for (see
-/// [`ENDPOINT_CLOSE_TIMEOUT`]) and left running on the runtime, and the
-/// startup relay probes still running beside a created endpoint (see
-/// [`RelayProbes`]), whose probe endpoints must be closed the same way.
+/// The endpoint closes this crate stopped waiting for (after 5 s) and left
+/// running on the runtime, and the startup relay probes still running beside
+/// a created endpoint (see [`RelayProbes`]), whose probe endpoints must be
+/// closed the same way.
 ///
 /// Every caller of [`create_endpoint`] hands one in, and so decides what
 /// becomes of them. A runtime that goes away takes the closes still running
@@ -246,8 +246,8 @@ pub struct CreatedEndpoint {
 ///
 /// On failure after binding the endpoint is closed before the error
 /// propagates (dropping a bound endpoint without `close()` is fatal under
-/// `panic = "abort"`). The close is waited for up to
-/// [`ENDPOINT_CLOSE_TIMEOUT`], so a slow teardown cannot keep the error back.
+/// `panic = "abort"`). The close is waited for up to 5 s, so a slow teardown
+/// cannot keep the error back.
 ///
 /// The probe's task, and any close that outlives that wait (this endpoint's,
 /// or a probe endpoint's), keep running and are kept in `closes`, whether the

@@ -209,8 +209,8 @@ pub struct ProbedRelays {
     /// endpoint's relay map.
     pub left_out: Vec<RelayUrl>,
     /// The configured relays that serve QUIC address discovery (QAD), the only
-    /// ones the endpoint probes for it. See [`probe_relay`] for why the others
-    /// must not be.
+    /// ones the endpoint probes for it: a relay that does not answer QAD
+    /// probes holds each full net report back by iroh's 3 s probe timeout.
     pub quic_addr_discovery: Vec<RelayUrl>,
 }
 
@@ -475,8 +475,7 @@ impl ProbeProgress {
 /// - A relay that serves QUIC address discovery is put back with it turned on.
 ///   It starts off because iroh does not choose a home relay until its QAD
 ///   probes of every relay finish, and a relay that does not answer them holds
-///   each full net report back by iroh's 3 s probe timeout (see
-///   [`probe_relay`]).
+///   each full net report back by iroh's 3 s probe timeout.
 ///
 /// A relay that is down at startup does not stop the process: with at least
 /// [`MIN_CUSTOM_RELAYS`] distinct relays configured the others carry it, and
