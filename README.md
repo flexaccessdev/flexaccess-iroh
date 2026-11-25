@@ -16,8 +16,8 @@ documentation, instead of being ported by hand into every repo.
 
 | Module | Contents |
 |---|---|
-| `relay` | `RelayConfig` (default vs custom relays, which also decides whether n0 internet discovery is on; custom relays must number at least two distinct URLs; duplicates are collapsed before the count), the shared relay auth token, the per-relay startup probe (fails only when no relay is reachable, and reports which relays did not come online) |
-| `endpoint` | the common endpoint builder and `create_endpoint`, which binds **without** the relays that failed the startup probe (a relay that answers probes but cannot be connected would otherwise be preferred as home relay and keep the endpoint from ever coming online, so every client restarting during such an outage would fail to start) and hands them back for the failover to restore. An endpoint it gives up on, or a relay probe's, is closed with a bounded wait; a close that outlives the wait keeps running and is kept in the caller's `PendingCloses`, which a caller whose runtime ends with its request waits for |
+| `relay` | `RelayConfig` (default vs custom relays, which also decides whether n0 internet discovery is on; custom relays must number at least two distinct URLs; duplicates are collapsed before the count), the shared relay auth token, the per-relay startup probe, run beside the endpoint (fails only when no relay is reachable, and reports which relays did not come online; also detects which relays serve QUIC address discovery, the only ones the endpoint probes for it, since a relay that does not serve it delays every endpoint start by 3 s) |
+| `endpoint` | the common endpoint builder and `create_endpoint`, which binds with every relay and returns once the endpoint is online, while the startup probe runs beside it and takes each relay that fails it out of the live relay map (a relay that answers probes but cannot be connected would otherwise be preferred as home relay and keep the endpoint from ever coming online, so every client restarting during such an outage would fail to start) and hands them on for the failover to restore. An endpoint it gives up on, or a relay probe's, is closed with a bounded wait; a close that outlives the wait, and the probe's own task, keep running and are kept in the caller's `PendingCloses`, which a caller whose runtime ends with its request waits for |
 | `relay_failover` | the server-side home-relay failover: after 60 s without a connected home relay, take the wedged relay out of the relay map so the forced net report homes the endpoint on another configured relay, in place; put it back once a probe shows it connectable (likewise for relays left out at startup) |
 | `relay_health` (feature `relay-health`) | the on-demand `/healthz` check of the custom relays that status UIs show: unauthenticated, so it confirms a relay is up rather than that the token is accepted, and made under each relay URL's path prefix, where iroh dials the relay |
 | `auth` | the endpoint-bound public-key auth transcript over the [flexaccess-keys] format; each application passes its own domain-separation context |
@@ -35,11 +35,11 @@ takes the resulting `iroh::SecretKey` / `flexaccess_keys` values.
 
 ```toml
 [dependencies]
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.19" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.20" }
 # or, with mDNS local-network discovery on every endpoint (compiled out on iOS):
-flexaccess-iroh = { git = "...", tag = "v0.0.19", features = ["mdns"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.20", features = ["mdns"] }
 # or, with the custom-relay `/healthz` check for a status view:
-flexaccess-iroh = { git = "...", tag = "v0.0.19", features = ["relay-health"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.20", features = ["relay-health"] }
 ```
 
 The `flexaccess_keys` crate is re-exported so a consumer signs and verifies
@@ -51,6 +51,12 @@ This crate requires `iroh` as a **range** — currently `>=1.5.0, <1.6.0` —
 never an exact pin. Cargo resolves one `iroh` 1.5.x per consumer workspace and
 this crate compiles against whatever that is. The obligation on this side is
 to only use APIs present in the minimum version; CI builds against it.
+
+The crate turns on iroh's `unstable-net-report` feature (for
+`Endpoint::net_report`, which the startup probe reads to detect QUIC address
+discovery on custom relays). iroh does not keep that API stable across minor
+releases, so moving the upper bound past 1.5 means checking it still exists.
+Cargo unifies features, so a consumer's `iroh` gets the feature too.
 
 ### Consumers on a fork of iroh
 

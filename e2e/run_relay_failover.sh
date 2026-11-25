@@ -10,14 +10,16 @@
 # Contract under test: a custom relay set holds at least TWO distinct relays,
 # because a server rides out a relay outage by moving onto another configured
 # relay in place (no rebuild, no dropped identity or connections). Every
-# configured relay is probed individually at startup; a relay that is down is
-# a warning, and startup fails only when none is reachable. Clients dial with
+# configured relay is probed individually at startup, beside the endpoint; a
+# relay that is down is a warning and is taken out of the live relay map, and
+# startup fails only when none is reachable. Clients dial with
 # every configured relay as a hint, so a server homed on any of them is reachable.
 #
 # Phase A - relay offline BEFORE startup (the per-relay startup probe):
 #   A0  both relays down; server configured with both ..... startup fails (negative)
 #   A1  only relay2 up; server and client with both ....... both start (warning
-#       for relay1); the client connects via relay2; echo passes
+#       for relay1, once its probe gives up, which may be after the server is
+#       ready); the client connects via relay2; echo passes
 #   A2  a single custom relay is rejected as configuration: server and client
 #       configured with ONLY relay2 ........................ startup fails (negative)
 #
@@ -67,8 +69,8 @@
 #   D2  the held client disconnects and a client with the SAME two-relay
 #       configuration (relay1 still the fake, direct paths allowed) dials
 #       again, as a LAN client that restarts during the outage would: its
-#       startup probe finds relay1 not connectable and it binds without it, so
-#       it comes online on relay2, reaches the re-homed server through relay2,
+#       startup probe finds relay1 not connectable and takes it out of the
+#       relay map, so it comes online on relay2, reaches the re-homed server through relay2,
 #       and moves onto a direct path again; echo passes
 #
 # Requirements: cargo, iroh-relay (cargo install iroh-relay --features server).
@@ -399,7 +401,9 @@ scenario A1 "relay1 down: server and client configured with both start on relay2
 start_relay 2
 rc=0
 expect_server_ready "$RELAY1_URL" "$RELAY2_URL" || rc=1
-if [[ "$rc" -eq 0 ]] && ! grep -Eq "1 of 2 custom relays failed to come online" "$SERVER_LOG"; then
+# The probe runs beside the endpoint, so the server can be ready before the
+# probe of the dead relay gives up (RELAY_CONNECT_TIMEOUT, 10s).
+if [[ "$rc" -eq 0 ]] && ! wait_for_log "$SERVER_LOG" "1 of 2 custom relays failed to come online" 30; then
     note "server did not warn about the dead relay"
     rc=1
 fi
@@ -695,8 +699,11 @@ start_held_client "$RELAY1_URL" "$PROXY_URL"
 wait_for_log_or_death "$HELD_PID" "$HELD_LOG" "Echo OK" "$READY_TIMEOUT" || {
     note "the redialing client did not connect (rc=$?)"; rc=1; }
 # What makes it possible: the startup probe found relay1 not connectable and
-# the endpoint was bound without it, so it homed on relay2 and came online.
-if [[ "$rc" -eq 0 ]] && ! grep -Eq "Binding without 1 of 2 custom relays: $RELAY1_URL/" "$HELD_LOG"; then
+# took it out of the relay map, so the endpoint re-homed on relay2 and came
+# online. The probe runs beside the endpoint: a client that homed on relay2
+# straight away is online before the probe gives up on relay1
+# (RELAY_CONNECT_TIMEOUT, 10s), so wait for it as in A1.
+if [[ "$rc" -eq 0 ]] && ! wait_for_log "$HELD_LOG" "Took $RELAY1_URL/ out of the relay map" 30; then
     note "the redialing client did not leave relay1 out of its relay map"
     rc=1
 fi

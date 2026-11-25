@@ -117,16 +117,92 @@ receive one and the feature is inert in default mode. Blank/whitespace-only
 tokens normalize to "no token" rather than erroring. Server and clients sharing a
 private relay must configure the same token.
 
+## QUIC address discovery on custom relays
+
+QUIC address discovery (QAD) is a QUIC endpoint a relay can run on UDP 7842
+that tells an iroh endpoint its public address, one of the signals hole
+punching uses. iroh assumes every relay given by URL serves it, and probes it
+on every relay in the map at the start of each full network report.
+
+Probing a relay that does not serve it is not free. iroh does not pick a home
+relay until its QAD probes finish, and a probe to a relay with nothing on UDP
+7842 waits out the probe timeout: **3 s on iroh 1.5** (`PROBES_TIMEOUT`,
+net_report). An endpoint is not online until it has a home relay, so that 3 s
+lands on every start of every program, and again on each later full report
+(network changes, every 5 minutes). Measured on 2026-11-25 against two relays
+behind a Cloudflare Tunnel: the first report took 3.0 s with QAD probed and
+0.3 s without.
+
+A relay serves QAD only when it terminates TLS itself, runs
+`enable_quic_addr_discovery = true`, and has UDP 7842 reachable. A relay behind
+a Cloudflare Tunnel (see [self-hosting.md](self-hosting.md)) or any other
+HTTP-only front never does.
+
+So the crate **detects it per relay** instead of assuming it, as part of the
+startup probe (next section). The endpoint is bound with QAD off on every
+custom relay, and the probe turns it on, on the live endpoint, for each relay
+that answered (`ProbedRelays::quic_addr_discovery`). Next to each relay's probe endpoint, a second
+throwaway endpoint with UDP transports and QAD on runs a net report with only
+the QAD probes (`NetReportConfig::minimal`); its report shows UDP working
+only if the relay answered. The answer is whatever that endpoint learned by
+the time the relay probe came online, so the check adds no time of its own: a
+relay that serves QAD answers in about one round trip (85–150 ms against n0's
+relays, whose relay probes took 380–520 ms). A relay whose QAD answer is no
+faster than its relay connection (a network that drops UDP, a broken IPv6
+route) would hold the report back as well, so it counts as not serving QAD.
+
+Reading the report needs iroh's `unstable-net-report` feature
+(`Endpoint::net_report`), which the crate enables. The failover's restore
+probe makes the same check, so a relay put back into the map gets QAD exactly
+when it answered then; a relay re-inserted unchanged keeps what it had. The
+default relays are not probed: n0's relays serve QAD, and iroh uses it there
+as before.
+
+The answer is not checked again while the process runs: a relay found not
+serving QAD stays without it until the failover takes it out and puts it
+back, or the process restarts. A miss costs only the address that relay's QAD
+would have reported; any other relay that serves QAD still reports it.
+
+A relay-only endpoint (`EndpointOptions::relay_only`) has no IP transports
+and cannot use QAD, so neither the startup probe nor the failover checks for
+it: those probes send no UDP at all.
+
 ## Custom relay validation: the per-relay startup probe
 
-Before binding the real endpoint (`flexaccess_iroh::endpoint::create_endpoint`),
-each configured relay is probed **individually** (`relay::probe_custom_relays`)
-by binding a throwaway, relay-only endpoint
-(`clear_ip_transports`, ephemeral identity) for just that one URL and waiting on
-`endpoint.online()`, bounded by a 10 s `RELAY_CONNECT_TIMEOUT`. All probes run in
-parallel. **Startup fails only if no relay comes online; each relay that does
-not is reported as a warning and left out of the relay map the endpoint is
-bound with.**
+`flexaccess_iroh::endpoint::create_endpoint` binds the real endpoint with
+every configured relay at once and probes each relay **individually** beside
+it (`relay::RelayProbes`): a throwaway, relay-only endpoint
+(`clear_ip_transports`, ephemeral identity) for just that one URL, waiting on
+`endpoint.online()`, bounded by a 10 s `RELAY_CONNECT_TIMEOUT`. All probes run
+in parallel, and each result is applied to the live endpoint as it lands.
+**Each relay whose probe fails is reported as a warning and taken out of the
+endpoint's relay map**, unless the endpoint is connected through it or it is
+the last relay left. A probe is a connection of its own, so its result and the
+endpoint's can differ: a probe can fail on a relay the endpoint is connected
+through, which stays, and the endpoint can fail to come online on relays that
+passed. **Startup fails when every probe fails and the endpoint is not
+connected, or when the endpoint is still not online 10 s after the wait began
+or a probe last took a relay out of the map**, so a startup timeout does not
+by itself mean that every relay failed its probe. Only taking a relay out
+restarts the 10 s: turning QUIC address discovery on for a relay changes the
+map too, but leaves the deadline where it was. A probe still running when the
+10 s are up is waited for, since it may yet take out the relay that keeps the
+endpoint offline. Each probe
+also checks its relay for QUIC address discovery, within the time the probe
+takes anyway (see [above](#quic-address-discovery-on-custom-relays)).
+
+`create_endpoint` returns as soon as the endpoint is online, so on healthy
+relays the probe costs the start nothing: it used to run ahead of the bind and
+added a relay connection's worth of time (about 1.5 s through Cloudflare
+Tunnels) to every start. The probe's task carries on in the background, is
+kept in the caller's `PendingCloses` like a slow close, and settles within
+the probe timeout plus the probe endpoints' bounded close
+(`RelayProbes::settled`). The task holds a handle to the endpoint while it
+runs, which keeps its UDP sockets bound; it lets go when the endpoint's close
+begins, so a caller that rebinds the same port right after closing awaits
+`RelayProbes::released` in between, which does not wait for the probes. A
+probe that fails on a relay the endpoint is connected through leaves that
+relay in the map, and never fails a start that is already connected.
 
 Probing each relay on its own is what makes those warnings possible: a single
 endpoint-wide `online()` wait only proves that *one* relay (the eventual home
@@ -142,10 +218,13 @@ a survivable relay outage into an outage of every client that restarts during
 it. Nor may a relay that failed the probe stay in the map: iroh picks its home
 relay by probe latency, so a relay that answers probes but refuses relay
 connections would be preferred, never connect, and keep `online()` from ever
-resolving. `create_endpoint` therefore binds without those relays and hands
-them back (`CreatedEndpoint::relays_left_out`) for the failover to restore
-once they are connectable, using this same probe; a process that does not run
-the failover keeps them out for its lifetime. See
+resolving. The probe therefore takes it out of the live map (never the last
+relay left), which forces a fresh net report that re-homes the endpoint, and
+the wait for the endpoint restarts its 10 s from that change, so the endpoint
+gets a full window on the relays that work. The relays taken out are handed
+on (`CreatedEndpoint::relays`, `ProbedRelays::left_out`) for the failover to
+restore once they are connectable, using this same probe; a process that does
+not run the failover keeps them out for its lifetime. See
 [relay-failover.md](relay-failover.md#starting-during-an-outage).
 
 `clear_ip_transports()` on the probe endpoint is what makes `online()` a *pure
@@ -190,7 +269,7 @@ builder.
 
 | Repo | Implementation | Notes |
 |---|---|---|
-| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs`, `src/relay_failover.rs`, `src/relay_health.rs`, `e2e/` | `RelayConfig` (at least two custom relays), the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` (binds without the relays that failed the probe, returns them in `CreatedEndpoint`), the in-place home-relay failover (restores them), the e2e suites for all of it, and the on-demand `/healthz` relay health check (feature `relay-health`) |
+| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs`, `src/relay_failover.rs`, `src/relay_health.rs`, `e2e/` | `RelayConfig` (at least two custom relays), the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` (binds with every relay, runs the probe beside the endpoint and takes the relays that fail it out of the live relay map, returns the probe in `CreatedEndpoint`), the in-place home-relay failover (restores them), the e2e suites for all of it, and the on-demand `/healthz` relay health check (feature `relay-health`) |
 | [tunnel-rs] | `src/iroh_mode/endpoint.rs` | `mf/4` ALPN, transport tuning, user-facing `--relay-only` + sequential relay failover dial; `mdns` on |
 | [ezvpn] | `src/transport/endpoint.rs`, `src/transport/paths.rs` | VPN ALPN, transport tuning, bounded connect; `mdns` off; iroh fork via `[patch.crates-io]`; shows the crate's `/healthz` relay health check in its status UIs |
 | [flextunnel] | `crates/flextunnel-core/src/transport/endpoint.rs`, `.../transport/paths.rs` | three ALPNs + native allowlist hook; the client's rebuildable endpoint (`ClientEndpoint`, its own since the crate dropped rebuilds); `mdns` on (crate compiles it out on iOS); outbound bridges attach the same relay hints; shows the crate's `/healthz` relay health check in its status UIs |

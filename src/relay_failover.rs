@@ -41,10 +41,15 @@
 //! one), the endpoint is nudged with a no-op relay-map change instead, which
 //! forces a fresh report the same way.
 //!
-//! Relays that failed the startup probe were never in the map
-//! ([`crate::endpoint::create_endpoint`] binds without them, so that a process
-//! starting during an outage comes online on a relay that works). They are
-//! handed in as already removed and get the same restore probe.
+//! Relays that failed the startup probe were taken out of the map by it
+//! (see [`crate::relay::RelayProbes`]), so that a process starting during an
+//! outage comes online on a relay that works. The failover waits for that
+//! probe to settle before it starts, takes them as already removed, and gives
+//! them the same restore probe.
+//!
+//! A relay is put back probed for QUIC address discovery only if the restore
+//! probe found it serves it, the same check the startup probe makes; a relay
+//! re-inserted unchanged keeps what the endpoint was last told about it.
 //!
 //! Only the *home* relay matters: non-home relays are connected on demand and
 //! dropped after a minute idle, which is normal and not an outage. With the
@@ -53,9 +58,12 @@
 //! registration.
 
 use crate::endpoint::PendingCloses;
-use crate::relay::{RelayConfig, probe_relay, relay_failure};
+use crate::relay::{
+    RelayConfig, RelayProbes, has_ip_transports, probe_relay, relay_entry, relay_failure,
+};
 use iroh::endpoint::RelayStatus;
-use iroh::{Endpoint, RelayMap, RelayUrl, Watcher};
+use iroh::{Endpoint, RelayUrl, Watcher};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -78,16 +86,16 @@ const RELAY_OUTAGE_LOG_GRACE: Duration = Duration::from_secs(5);
 pub const RELAY_RESTORE_INTERVAL: Duration = Duration::from_secs(90);
 
 /// Watch `endpoint`'s home relay and fail over in place when it is lost for
-/// [`RELAY_OUTAGE_FAILOVER`]; see the module docs. `relays_left_out` are the
-/// configured relays the endpoint was bound without
-/// ([`crate::endpoint::CreatedEndpoint::relays_left_out`]); they are probed
-/// for restoration like a relay removed here. Never resolves: run it
-/// alongside the accept loop and drop it with the endpoint. Pending forever
-/// with the default relays.
+/// [`RELAY_OUTAGE_FAILOVER`]; see the module docs. `relays` is the startup
+/// probe ([`crate::endpoint::CreatedEndpoint::relays`]), which is waited for
+/// first: the relays it took out of the map are probed for restoration like a
+/// relay removed here, and those serving QUIC address discovery keep it when
+/// re-inserted. Never resolves: run it alongside the accept loop and drop it
+/// with the endpoint. Pending forever with the default relays.
 pub async fn fail_over_home_relay(
     endpoint: &Endpoint,
     relay_config: &RelayConfig,
-    relays_left_out: &[RelayUrl],
+    relays: &RelayProbes,
 ) {
     let RelayConfig::Custom { urls, auth_token } = relay_config else {
         std::future::pending().await
@@ -96,18 +104,14 @@ pub async fn fail_over_home_relay(
         log::error!("Custom relay set is empty; home-relay failover has nothing to work with");
         std::future::pending().await
     }
-    let mut relays = EndpointRelays {
-        endpoint,
-        configured: relay_config.relay_mode().relay_map(),
-        urls: urls.clone(),
-        auth_token: auth_token.clone(),
-    };
-    let out: Vec<RelayUrl> = relays_left_out
+    let relays = relays.settled().await;
+    let out: Vec<RelayUrl> = relays
+        .left_out
         .iter()
         .filter(|url| {
             let configured = urls.contains(url);
             if !configured {
-                log::error!("{url} was left out at startup but is not a configured relay; ignoring it");
+                log::error!("{url} was taken out at startup but is not a configured relay; ignoring it");
             }
             configured
         })
@@ -115,17 +119,24 @@ pub async fn fail_over_home_relay(
         .collect();
     if !out.is_empty() {
         log::info!(
-            "{} relay(s) left out of the relay map at startup will be probed for restoration \
+            "{} relay(s) taken out of the relay map at startup will be probed for restoration \
              every {}s: {}",
             out.len(),
             RELAY_RESTORE_INTERVAL.as_secs(),
             out.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
         );
     }
+    let mut endpoint_relays = EndpointRelays {
+        endpoint,
+        urls: urls.clone(),
+        auth_token: auth_token.clone(),
+        ip_transports: has_ip_transports(endpoint),
+        quic_addr_discovery: relays.quic_addr_discovery.clone(),
+    };
     run_failover(
         endpoint.home_relay_status(),
         |statuses| describe_statuses(statuses),
-        &mut relays,
+        &mut endpoint_relays,
         out,
     )
     .await
@@ -188,12 +199,28 @@ trait FailoverRelays {
 /// The real endpoint's relay map.
 struct EndpointRelays<'a> {
     endpoint: &'a Endpoint,
-    /// The configured relay map, kept as the source of each relay's
-    /// configuration (URL, auth token) for re-insertion.
-    configured: RelayMap,
     /// The configured relay URLs, in configured order.
     urls: Vec<RelayUrl>,
     auth_token: Option<String>,
+    /// Whether the endpoint has IP transports, without which it cannot use
+    /// QUIC address discovery and restore probes do not check for it.
+    ip_transports: bool,
+    /// The relays last found serving QUIC address discovery: at startup, then
+    /// by each restore probe.
+    quic_addr_discovery: Vec<RelayUrl>,
+}
+
+impl EndpointRelays<'_> {
+    /// Put `url` into the endpoint's relay map as it is configured, probed
+    /// for QUIC address discovery only if it was last found serving it.
+    async fn insert(&self, url: &RelayUrl) {
+        let entry = relay_entry(
+            url,
+            self.auth_token.as_deref(),
+            self.quic_addr_discovery.contains(url),
+        );
+        self.endpoint.insert_relay(url.clone(), Arc::new(entry)).await;
+    }
 }
 
 impl FailoverRelays for EndpointRelays<'_> {
@@ -214,27 +241,33 @@ impl FailoverRelays for EndpointRelays<'_> {
     }
 
     async fn nudge(&mut self, url: &RelayUrl) {
-        let Some(config) = self.configured.get(url) else {
+        if !self.urls.contains(url) {
             log::error!("{url} is not a configured relay; cannot re-insert it");
             return;
-        };
+        }
         log::warn!("Re-inserting {url} into the relay map unchanged to force a fresh net report");
-        self.endpoint.insert_relay(url.clone(), config).await;
+        self.insert(url).await;
     }
 
     async fn restore(&mut self, url: &RelayUrl) -> bool {
         // The failover lives on the process's runtime, where a slow close of
         // the probe endpoint finishes by itself: nothing waits for it.
-        match probe_relay(url, self.auth_token.as_deref(), &PendingCloses::new()).await {
-            Ok(()) => {
-                let Some(config) = self.configured.get(url) else {
+        let closes = PendingCloses::new();
+        let probe = probe_relay(url, self.auth_token.as_deref(), self.ip_transports, &closes);
+        match probe.await {
+            Ok(probe) => {
+                if !self.urls.contains(url) {
                     log::error!(
                         "{url} is connectable but not a configured relay; cannot put it back in \
                          the relay map"
                     );
                     return false;
-                };
-                self.endpoint.insert_relay(url.clone(), config).await;
+                }
+                self.quic_addr_discovery.retain(|served| served != url);
+                if probe.quic_addr_discovery {
+                    self.quic_addr_discovery.push(url.clone());
+                }
+                self.insert(url).await;
                 true
             }
             Err(e) => {

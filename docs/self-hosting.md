@@ -17,11 +17,16 @@ contact with public iroh infrastructure.**
 
 ## Before you start: the startup contract
 
-Every configured custom relay is probed **individually** at startup. The
-process refuses to start only when **none** of them comes online; each relay
-that does not is named in a warning and left out of the relay map until the
-server's failover finds it connectable again (a client keeps it out for its
-lifetime). A dead backup relay is therefore loud at startup but not fatal, so
+Every configured custom relay is probed **individually** at startup. Each
+relay whose probe fails is named in a warning and taken out of the relay map
+until the server's failover finds it connectable again (a client keeps it out
+for its lifetime), unless the endpoint is connected through it or it is the
+last relay left. The process refuses to start when every probe fails and the
+endpoint is not connected, or when the endpoint is still not online 10 s after
+startup began or a probe last took a relay out of the map (only that restarts
+the 10 s; turning QUIC address discovery on for a relay does not), with any
+probe still running then waited for first. A startup timeout does not by
+itself mean that every relay failed its probe. A dead backup relay is therefore loud at startup but not fatal, so
 watch the logs: a relay list that is only half up has no failover left. Plan
 your relay list accordingly (at least two distinct relays are required), and
 configure **both sides with the full list** — see the warning in
@@ -86,6 +91,10 @@ manual_key_path = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
 # cert_mode = "LetsEncrypt"
 # hostname = "relay.example.com"
 ```
+
+Keep UDP 7842 reachable from where clients run: the programs check each
+custom relay for QUIC address discovery at startup and use it only on the
+relays that answer.
 
 ## Simple production setup: relay behind Cloudflare Tunnel (single TCP port)
 
@@ -158,7 +167,11 @@ cloudflared tunnel run --token <token>
 > there is no QUIC endpoint, disables QUIC address discovery (one of the signals
 > iroh uses to help peers hole-punch to a direct connection). For a relay whose
 > job is a pure relay-only fallback this is fine; if you want to maximize direct
-> P2P success, use the TLS + QUIC production config above instead.
+> P2P success, use the TLS + QUIC production config above instead. The programs
+> detect that such a relay does not serve QUIC address discovery and stop
+> probing it for that, which would otherwise delay every endpoint start by 3 s
+> (see
+> [relays-and-address-lookup.md](relays-and-address-lookup.md#quic-address-discovery-on-custom-relays)).
 
 ## Relay access token
 
@@ -201,7 +214,7 @@ configuration error in all three programs.
 
 The token rides the relay WebSocket upgrade as `Authorization: Bearer <token>`,
 which means the per-relay startup probe validates it: a relay that rejects the
-token never comes online, is named in a warning and left out of the relay map,
+token never comes online, is named in a warning and taken out of the relay map,
 and startup fails once no relay accepts it.
 
 ## Verifying a relay

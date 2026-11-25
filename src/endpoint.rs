@@ -9,12 +9,12 @@
 //! tuning onto the [`iroh::endpoint::Builder`] returned by
 //! [`endpoint_builder`], then hand it to [`create_endpoint`].
 
-use crate::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig, probe_custom_relays};
+use crate::relay::{EndpointSlot, RELAY_CONNECT_TIMEOUT, RelayConfig, RelayProbes, wait_online_beside};
 use anyhow::{Context, Result};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, join_all};
 use iroh::{
-    Endpoint, RelayMode, RelayUrl,
+    Endpoint,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, QuicTransportConfig, presets},
 };
@@ -22,7 +22,7 @@ use log::{info, warn};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 /// Bound wait on the graceful close of an endpoint this crate bound and is
 /// giving up on: one that never came online, or a relay probe's. iroh's close
@@ -33,8 +33,10 @@ use tokio::task::JoinHandle;
 /// caller's [`PendingCloses`].
 pub(crate) const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The endpoint closes this crate stopped waiting for (see
-/// [`ENDPOINT_CLOSE_TIMEOUT`]) and left running on the runtime.
+/// The endpoint closes this crate stopped waiting for (after 5 s) and left
+/// running on the runtime, and the startup relay probes still running beside
+/// a created endpoint (see [`RelayProbes`]), whose probe endpoints must be
+/// closed the same way.
 ///
 /// Every caller of [`create_endpoint`] hands one in, and so decides what
 /// becomes of them. A runtime that goes away takes the closes still running
@@ -46,18 +48,32 @@ pub(crate) const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct PendingCloses(Arc<Mutex<Vec<KeptClose>>>);
 
 /// A close left running, as every waiter can wait for it: it stays in the set
-/// until it is over, whoever is waiting and whether they keep waiting.
-type KeptClose = Shared<BoxFuture<'static, ()>>;
+/// until it is over, whoever is waiting and whether they keep waiting. The
+/// task's abort handle (never used to abort) tells whether it is over without
+/// polling it.
+type KeptClose = (AbortHandle, Shared<BoxFuture<'static, ()>>);
 
 impl PendingCloses {
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn keep(&self, close: JoinHandle<()>) {
+    pub(crate) fn keep(&self, close: JoinHandle<()>) {
+        drop(self.kept(close));
+    }
+
+    /// Keep `close`, and return a future for it that the caller can wait on
+    /// as every other waiter does.
+    fn kept(&self, close: JoinHandle<()>) -> Shared<BoxFuture<'static, ()>> {
+        let over = close.abort_handle();
         // A close that panicked or was aborted is over all the same.
         let close = async move { drop(close.await) }.boxed().shared();
-        self.0.lock().expect("pending closes lock").push(close);
+        let mut kept = self.0.lock().expect("pending closes lock");
+        // Forget those already over, so that a set kept for the life of the
+        // process does not grow with every endpoint created.
+        kept.retain(|(over, _)| !over.is_finished());
+        kept.push((over, close.clone()));
+        close
     }
 
     /// Wait until every close kept here has finished, those added meanwhile
@@ -70,8 +86,8 @@ impl PendingCloses {
         loop {
             let closes = {
                 let mut kept = self.0.lock().expect("pending closes lock");
-                kept.retain(|close| close.peek().is_none());
-                kept.clone()
+                kept.retain(|(over, _)| !over.is_finished());
+                kept.iter().map(|(_, close)| close.clone()).collect::<Vec<_>>()
             };
             if closes.is_empty() {
                 return;
@@ -82,8 +98,9 @@ impl PendingCloses {
 }
 
 /// Close `endpoint` gracefully, waiting at most [`ENDPOINT_CLOSE_TIMEOUT`]
-/// for it. A slower close is left to finish in the background, and kept in
-/// `closes` for whoever needs to wait for it.
+/// for it. A slower close is left to finish in the background. The close is
+/// kept in `closes` from the moment it starts, for whoever needs to wait for
+/// it, so a caller cancelled during the wait leaves nothing untracked.
 ///
 /// Either way the close has begun by the time this returns, which is what a
 /// bound endpoint needs before it is dropped: iroh aborts one that is dropped
@@ -91,26 +108,28 @@ impl PendingCloses {
 /// leaves alone one that is already closing.
 pub(crate) async fn close_endpoint(endpoint: Endpoint, closes: &PendingCloses) {
     let id = endpoint.id();
-    let close = closed_within(ENDPOINT_CLOSE_TIMEOUT, async move { endpoint.close().await });
-    if let Some(close) = close.await {
+    let closed = closed_within(
+        ENDPOINT_CLOSE_TIMEOUT,
+        async move { endpoint.close().await },
+        closes,
+    );
+    if !closed.await {
         warn!(
             "Endpoint {id} is slow to close; leaving it to finish in the background"
         );
-        closes.keep(close);
     }
 }
 
-/// Run `close` on a task of its own and wait up to `limit` for it. `None`
-/// when it finished in time; otherwise the task, which keeps running.
+/// Run `close` on a task of its own, kept in `closes` as it starts, and wait
+/// up to `limit` for it. Whether it finished in time; a close that did not
+/// keeps running, and stays in `closes` until it is over.
 async fn closed_within(
     limit: Duration,
     close: impl Future<Output = ()> + Send + 'static,
-) -> Option<JoinHandle<()>> {
-    let mut close = tokio::spawn(close);
-    match tokio::time::timeout(limit, &mut close).await {
-        Ok(_) => None,
-        Err(_) => Some(close),
-    }
+    closes: &PendingCloses,
+) -> bool {
+    let close = closes.kept(tokio::spawn(close));
+    tokio::time::timeout(limit, close).await.is_ok()
 }
 
 /// What an application decides about every endpoint it builds.
@@ -185,112 +204,164 @@ pub fn endpoint_builder(relay_config: &RelayConfig, options: EndpointOptions) ->
     builder
 }
 
-/// Wait for a freshly bound endpoint to come online (relay/discovery ready),
-/// bounded by [`RELAY_CONNECT_TIMEOUT`]. Does not close the endpoint on
-/// failure; the caller decides.
-async fn wait_online(endpoint: &Endpoint) -> Result<()> {
-    info!(
-        "Waiting for endpoint to come online (timeout: {}s)...",
-        RELAY_CONNECT_TIMEOUT.as_secs()
-    );
-    match tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await {
-        Ok(()) => Ok(()),
-        Err(_) => anyhow::bail!(
-            "Endpoint failed to come online after {}s - check relay server connectivity",
-            RELAY_CONNECT_TIMEOUT.as_secs()
-        ),
-    }
-}
-
 /// What [`create_endpoint`] hands back: the bound, online endpoint and the
-/// custom relays it was bound without.
+/// startup probe of its custom relays.
 #[derive(Debug)]
 pub struct CreatedEndpoint {
     pub endpoint: Endpoint,
-    /// The configured custom relays that failed the startup probe and were
-    /// left out of the endpoint's relay map (see [`create_endpoint`]). Empty
-    /// with the default relays or when every custom relay probed fine. Hand
-    /// them to [`crate::relay_failover::fail_over_home_relay`], which puts
-    /// each one back into the relay map once it is connectable again; a
-    /// process that does not run the failover keeps them out for its
-    /// lifetime.
-    pub relays_left_out: Vec<RelayUrl>,
+    /// The startup probe of the custom relays, which may still be running when
+    /// the endpoint is handed back (see [`create_endpoint`]); it settles
+    /// within [`RELAY_CONNECT_TIMEOUT`] plus a bounded close. Hand it to
+    /// [`crate::relay_failover::fail_over_home_relay`], which waits for it and
+    /// puts each relay it took out back into the relay map once it is
+    /// connectable again; a process that does not run the failover keeps them
+    /// out for its lifetime. Settled at once with the default relays.
+    ///
+    /// Until it settles, the probe holds a handle to the endpoint, which keeps
+    /// its UDP sockets bound. A caller that closes the endpoint and then binds
+    /// a new one on the same port awaits [`RelayProbes::released`] in between.
+    pub relays: RelayProbes,
 }
 
-/// Create an endpoint: log the relay setup, probe every custom relay (fail
-/// only if none is reachable; see [`probe_custom_relays`]), bind **without**
-/// the relays that failed the probe, and require the endpoint to come online.
+/// Create an endpoint: log the relay setup, bind with every configured relay,
+/// probe each custom relay beside it, and require the endpoint to come
+/// online. Returns as soon as it is: the probe goes on in the background and
+/// fixes the live relay map up as its results land (see [`RelayProbes`]), so
+/// on healthy relays it costs the start nothing.
 ///
-/// Leaving a failed relay out of the relay map is what lets the endpoint come
-/// online during that relay's outage: iroh picks its home relay by probe
-/// latency, so a relay that still answers probes but cannot be connected (the
-/// outage [`crate::relay_failover`] exists for) would otherwise be preferred,
-/// never connect, and keep [`Endpoint::online`] pending until the timeout
-/// here fails the whole start. The relay comes back through the failover's
-/// restore probe; see [`CreatedEndpoint::relays_left_out`].
+/// A relay whose probe fails is taken out of the relay map, which is what
+/// lets the endpoint come online during that relay's outage: iroh picks its
+/// home relay by probe latency, so a relay that still answers probes but
+/// cannot be connected (the outage [`crate::relay_failover`] exists for) would
+/// otherwise be preferred, never connect, and keep [`Endpoint::online`]
+/// pending. The wait for the endpoint is [`RELAY_CONNECT_TIMEOUT`] from the
+/// latest such change, so taking that relay out gives it a full window to
+/// re-home; the start fails when every relay fails its probe. The relay
+/// comes back through the failover's restore probe; see
+/// [`CreatedEndpoint::relays`].
+///
+/// The endpoint starts without QUIC address discovery on any custom relay,
+/// and the probe turns it on for the relays that serve it: one that does not
+/// would delay every start by iroh's 3 s probe timeout (see [`RelayProbes`]).
 ///
 /// On failure after binding the endpoint is closed before the error
 /// propagates (dropping a bound endpoint without `close()` is fatal under
-/// `panic = "abort"`). The close is waited for up to
-/// [`ENDPOINT_CLOSE_TIMEOUT`], so a slow teardown cannot keep the error back.
+/// `panic = "abort"`). The close is waited for up to 5 s, so a slow teardown
+/// cannot keep the error back.
 ///
-/// A close that outlives that wait — this endpoint's, or a relay probe's —
-/// keeps running and is kept in `closes`, whether the endpoint was created
-/// or not; see [`PendingCloses`] for what a caller owes them.
+/// The probe's task, and any close that outlives that wait (this endpoint's,
+/// or a probe endpoint's), keep running and are kept in `closes`, whether the
+/// endpoint was created or not; see [`PendingCloses`] for what a caller owes
+/// them.
+///
+/// Cancelled (the future dropped before it returns), it lets go of the
+/// endpoint at once: the probe task's handle is taken from it then and there,
+/// and the endpoint is closed on a task of its own, kept in `closes`, so its
+/// UDP port is free again as soon as that close is done rather than when the
+/// probes end. The probes still run to the end.
 pub async fn create_endpoint(
     relay_config: &RelayConfig,
     builder: EndpointBuilder,
     closes: &PendingCloses,
 ) -> Result<CreatedEndpoint> {
     relay_config.log_status();
-    let relays_left_out = probe_custom_relays(relay_config, closes).await?;
-    let builder = if relays_left_out.is_empty() {
-        builder
-    } else {
-        warn!(
-            "Binding without {} of {} custom relays: {}",
-            relays_left_out.len(),
-            relay_config.custom_urls().len(),
-            relays_left_out
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        builder.relay_mode(RelayMode::Custom(
-            relay_config.relay_map_without(&relays_left_out),
-        ))
-    };
     let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
-    if let Err(e) = wait_online(&endpoint).await {
+    let (relays, probing) = RelayProbes::start(&endpoint, relay_config, closes);
+    let mut cancelled = CloseIfCancelled {
+        endpoint: Some(endpoint.clone()),
+        runtime: tokio::runtime::Handle::try_current().ok(),
+        slot: None,
+        closes: closes.clone(),
+    };
+    if let Some((task, slot)) = probing {
+        closes.keep(task);
+        cancelled.slot = Some(slot);
+    }
+    info!(
+        "Waiting for endpoint to come online (timeout: {}s)...",
+        RELAY_CONNECT_TIMEOUT.as_secs()
+    );
+    let outcome = wait_online_beside(&endpoint, &relays).await;
+    // Not cancelled: whatever follows is up to this function's own paths.
+    cancelled.disarm(outcome.is_err());
+    if let Err(e) = outcome {
         close_endpoint(endpoint, closes).await;
         return Err(e);
     }
-    Ok(CreatedEndpoint {
-        endpoint,
-        relays_left_out,
-    })
+    Ok(CreatedEndpoint { endpoint, relays })
+}
+
+/// Armed while [`create_endpoint`] waits for the endpoint, beside the probe
+/// or not: if the wait is dropped unfinished, take the probe task's handle to
+/// the endpoint and close the endpoint, so a cancelled start neither keeps the
+/// endpoint's port bound for as long as the probes run nor drops it without
+/// `close()`. It holds a handle of its own for the whole wait, since the
+/// probe task's may be gone already, and the runtime the endpoint was bound
+/// on, since it may be dropped outside it.
+struct CloseIfCancelled {
+    endpoint: Option<Endpoint>,
+    runtime: Option<tokio::runtime::Handle>,
+    slot: Option<EndpointSlot>,
+    closes: PendingCloses,
+}
+
+impl CloseIfCancelled {
+    /// The wait finished. A start that failed lets go of the endpoint at once
+    /// too, before closing it, since the probes may run on for a while.
+    fn disarm(&mut self, failed: bool) {
+        self.endpoint = None;
+        if let Some(slot) = self.slot.take()
+            && failed
+        {
+            drop(slot.take());
+        }
+    }
+}
+
+impl Drop for CloseIfCancelled {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            drop(slot.take());
+        }
+        let Some(endpoint) = self.endpoint.take() else {
+            return;
+        };
+        // Closed rather than dropped: iroh tears down an endpoint whose last
+        // handle goes without `close()` (fatal under `panic = "abort"`).
+        match &self.runtime {
+            Some(runtime) => self
+                .closes
+                .keep(runtime.spawn(async move { endpoint.close().await })),
+            None => drop(endpoint),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::RelayMode;
 
     /// A close that takes its time is waited for up to the limit and no
     /// longer — and goes on by itself, rather than being cut off.
     #[tokio::test(start_paused = true)]
     async fn a_slow_close_is_waited_for_only_so_long() {
-        assert!(closed_within(ENDPOINT_CLOSE_TIMEOUT, async {}).await.is_none());
+        let closes = PendingCloses::new();
+        assert!(closed_within(ENDPOINT_CLOSE_TIMEOUT, async {}, &closes).await);
 
         let (release, released) = tokio::sync::oneshot::channel::<()>();
         let (done, mut finished) = tokio::sync::oneshot::channel::<()>();
         let started = tokio::time::Instant::now();
-        let left_running = closed_within(ENDPOINT_CLOSE_TIMEOUT, async move {
-            let _ = released.await;
-            let _ = done.send(());
-        })
+        let in_time = closed_within(
+            ENDPOINT_CLOSE_TIMEOUT,
+            async move {
+                let _ = released.await;
+                let _ = done.send(());
+            },
+            &closes,
+        )
         .await;
-        assert!(left_running.is_some());
+        assert!(!in_time);
         assert_eq!(started.elapsed(), ENDPOINT_CLOSE_TIMEOUT);
         assert!(finished.try_recv().is_err(), "still closing");
 
@@ -328,12 +399,15 @@ mod tests {
         closes.finished().await;
 
         let (release, released) = tokio::sync::oneshot::channel::<()>();
-        let close = closed_within(ENDPOINT_CLOSE_TIMEOUT, async move {
-            let _ = released.await;
-        })
-        .await
-        .expect("left running");
-        closes.keep(close);
+        let in_time = closed_within(
+            ENDPOINT_CLOSE_TIMEOUT,
+            async move {
+                let _ = released.await;
+            },
+            &closes,
+        )
+        .await;
+        assert!(!in_time, "left running, and kept");
 
         let waiting = closes.clone();
         let mut finished = tokio::spawn(async move { waiting.finished().await });
@@ -345,6 +419,63 @@ mod tests {
         finished.await.unwrap();
         // And they are forgotten once finished.
         closes.finished().await;
+    }
+
+    /// A close is kept as it starts: a caller cancelled while it waits for the
+    /// close leaves it for whoever waits on the set, not running untracked.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_whose_wait_is_cancelled_is_still_kept() {
+        let closes = PendingCloses::new();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let cancelled = tokio::time::timeout(
+            ENDPOINT_CLOSE_TIMEOUT / 5,
+            closed_within(
+                ENDPOINT_CLOSE_TIMEOUT,
+                async move {
+                    let _ = released.await;
+                },
+                &closes,
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the wait was cut short");
+        let waiting = closes.clone();
+        let mut finished = tokio::spawn(async move { waiting.finished().await });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), &mut finished).await.is_err(),
+            "the close is still running, and still kept"
+        );
+        release.send(()).unwrap();
+        finished.await.unwrap();
+    }
+
+    /// A set that is never waited on forgets the closes that are over as new
+    /// ones are kept, so it does not grow with every endpoint created.
+    #[tokio::test]
+    async fn closes_that_are_over_are_forgotten_as_new_ones_are_kept() {
+        let closes = PendingCloses::new();
+        for _ in 0..3 {
+            let close = tokio::spawn(async {});
+            while !close.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            closes.keep(close);
+        }
+        assert_eq!(closes.0.lock().unwrap().len(), 1, "only the latest is kept");
+
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        closes.keep(tokio::spawn(async move {
+            let _ = released.await;
+        }));
+        let done = tokio::spawn(async {});
+        while !done.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        closes.keep(done);
+        assert_eq!(closes.0.lock().unwrap().len(), 2, "the running close stays");
+        release.send(()).unwrap();
+        closes.finished().await;
+        assert!(closes.0.lock().unwrap().is_empty());
     }
 
     /// A close still running is still there for whoever waits next: a second

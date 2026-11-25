@@ -253,14 +253,14 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         .secret_key(secret);
     let CreatedEndpoint {
         endpoint,
-        relays_left_out,
+        relays,
     } = create_endpoint(&relay_config, builder, &PendingCloses::new()).await?;
     info!("Waiting for clients to connect");
 
     let authorized = Arc::new(authorized);
     let outcome = tokio::select! {
         outcome = accept_loop(&endpoint, &authorized) => outcome,
-        () = fail_over_home_relay(&endpoint, &relay_config, &relays_left_out) => Ok(()),
+        () = fail_over_home_relay(&endpoint, &relay_config, &relays) => Ok(()),
     };
     endpoint.close().await;
     outcome

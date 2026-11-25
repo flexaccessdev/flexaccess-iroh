@@ -105,11 +105,12 @@ Checked against the released sources on 2026-09-04.
    nothing to remove, so the first configured relay is re-inserted unchanged,
    which forces a fresh report the same way. Nothing is removed and nothing
    needs restoring.
-4. **Relays left out at startup are treated as removed.** `create_endpoint`
-   hands back the configured relays it bound without
-   (`CreatedEndpoint::relays_left_out`); `fail_over_home_relay` takes that
-   list and restore-probes each one on the same 90 s cycle as a relay it
-   removed itself. Restoring a relay that is *not* in the configuration is
+4. **Relays taken out at startup are treated as removed.** `create_endpoint`
+   hands back the startup probe (`CreatedEndpoint::relays`), which takes the
+   relays that fail it out of the live relay map;
+   `fail_over_home_relay` waits for it to settle, then restore-probes each
+   relay it took out (`ProbedRelays::left_out`) on the same 90 s cycle as a
+   relay it removed itself. Restoring a relay that is *not* in the configuration is
    refused, so a caller cannot smuggle an extra relay in this way.
 
 If the endpoint is still without a home relay after a cycle, the next failover
@@ -127,7 +128,7 @@ an outage.
   outage discovered later. The default relay map is n0's and is not subject
   to this.
 - **The startup probe fails only when no relay is reachable**, and the
-  relays that fail it are left out of the relay map (next section). Every
+  relays that fail it are taken out of the relay map (next section). Every
   custom relay is still probed individually, and each unreachable one is a
   loud warning, but with failover being the point of the second relay a
   client that restarts during a relay outage must still start on the
@@ -138,26 +139,31 @@ an outage.
 
 ## Starting during an outage
 
-A relay that fails the startup probe is not merely warned about; it is **left
-out of the relay map the endpoint is bound with**. Leaving it in would put the
-process into the stall described above whenever the relay answers probes but
-refuses relay connections: iroh would prefer it by latency, never connect, and
-`online()` would never resolve, so `create_endpoint` would time out after
-10 s. With it out of the map the endpoint homes on a relay that works, and
-the server's clients, which dial with every configured relay as a hint, reach
-it through whichever relay it is homed on.
+A relay that fails the startup probe is not merely warned about; it is **taken
+out of the endpoint's relay map**. The endpoint is bound with every relay and
+the probe runs beside it, so for the length of that probe a relay that
+answers probes but refuses relay connections puts the process into the stall
+described above: iroh prefers it by latency, never connects, and `online()`
+does not resolve. The probe gives up on it after 10 s and takes it out, which
+forces a fresh net report; the endpoint homes on a relay that works, and
+`create_endpoint`'s wait restarts its 10 s from that change, so the start
+succeeds about as late as it did when the probe ran ahead of the bind. The
+server's clients, which dial with every configured relay as a hint, reach it
+through whichever relay it is homed on.
 
 The exclusion is temporary where the failover runs. `create_endpoint` returns
-`CreatedEndpoint { endpoint, relays_left_out }`, and the server passes
-`relays_left_out` to `fail_over_home_relay`, which restore-probes them every
-90 s and re-inserts each once it is connectable. A process that does not run
+`CreatedEndpoint { endpoint, relays }`, and the server passes `relays` to
+`fail_over_home_relay`, which waits for the probe to settle, restore-probes
+the relays it took out every 90 s, and re-inserts each once it is connectable. A relay is re-inserted with QUIC
+address discovery only if the restore probe found it serves it (see
+[relays-and-address-lookup.md](relays-and-address-lookup.md#quic-address-discovery-on-custom-relays)). A process that does not run
 the failover (a client) keeps them out for its lifetime, which is the right
 call for something that lives one connection; a long-lived client that must
 follow a relay back would have to run the failover too.
 
-Which relays were left out is logged at bind time
-(`Binding without 1 of 2 custom relays: <url>`), and restoration logs as it
-does for a relay the failover removed.
+Each relay taken out is logged as the probe gives up on it
+(`Took <url> out of the relay map: it did not come online (...)`), and
+restoration logs as it does for a relay the failover removed.
 
 ## Verification
 
@@ -175,7 +181,7 @@ off-LAN:
 | A | Startup: both relays down fails; one relay down starts with a warning and the client connects through the other; a single custom relay is rejected as configuration |
 | B | A relay dies at runtime: the server re-homes on its own within a net-report cycle, a restarted client with both relays connects; both down fails; both back reconnects |
 | C | The home relay is replaced by a fake that answers `/ping` but refuses relay connections, with the other relay behind a latency-adding proxy so net_report keeps preferring the fake: nothing re-homes on its own, the failover removes the fake from the relay map after 60 s, the server homes on the other relay in place (same process, same endpoint) and a client connects; when the real relay returns, the restore probe puts it back and the server moves back onto it |
-| D | The same wedge with direct paths allowed and a client holding a live connection, logging every path of it with its RTT and selected flag (the view flextunnel's connection-path status shows). Its paths are `relay1 + direct`; through the wedge it keeps echoing over the direct path and ends up direct-only; the failover still moves the server onto relay2 in the background; a new relay-only client's connection path shows relay2 as the home relay. Then a client with the same two-relay configuration redials during the outage, as a LAN client that restarts would: its probe finds relay1 not connectable, it binds without relay1, comes online on relay2, reaches the server, and goes direct again |
+| D | The same wedge with direct paths allowed and a client holding a live connection, logging every path of it with its RTT and selected flag (the view flextunnel's connection-path status shows). Its paths are `relay1 + direct`; through the wedge it keeps echoing over the direct path and ends up direct-only; the failover still moves the server onto relay2 in the background; a new relay-only client's connection path shows relay2 as the home relay. Then a client with the same two-relay configuration redials during the outage, as a LAN client that restarts would: its probe finds relay1 not connectable and takes it out of the relay map, the client comes online on relay2, reaches the server, and goes direct again |
 
 Phases C and D exercise this document (the last step of D, the redial, is the
 startup exclusion; it fails without it); Phases A and B are iroh's own behavior
