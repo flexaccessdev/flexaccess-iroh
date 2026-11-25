@@ -24,8 +24,12 @@
 //! it through that relay. Nothing is torn down: the endpoint, its identity,
 //! its direct paths, and every established connection stay as they are; a
 //! connection whose only path ran through the dead relay times out on its own
-//! and that client redials. This is why a custom relay set is required to hold
-//! at least [`crate::relay::MIN_CUSTOM_RELAYS`] distinct relays.
+//! and that client redials. This is why a custom relay set should hold at
+//! least two distinct relays: with a single relay (reduced-redundancy mode,
+//! [`RelayConfig::is_single_relay`]) there is nothing to move onto: the
+//! failover only nudges the endpoint into a fresh net report (see below),
+//! iroh keeps retrying that relay on its own schedule, and new off-LAN dials
+//! reach the endpoint only once that relay works again.
 //!
 //! The removed relay is put back once a probe (the same relay-only probe used
 //! at startup) shows it connectable again, checked every
@@ -332,8 +336,18 @@ impl Outage {
     }
 
     /// Report the outage once it has outlasted the grace period.
-    fn report(&mut self) {
+    /// `alternative` is whether another relay is in the map to fail over to.
+    fn report(&mut self, alternative: bool) {
         self.report_at = None;
+        if !alternative {
+            log::warn!(
+                "No connected home relay ({}); off-LAN clients cannot reach this server until \
+                 it reconnects. No other relay is in the relay map to fail over to; waiting \
+                 for it to reconnect",
+                self.reason
+            );
+            return;
+        }
         log::warn!(
             "No connected home relay ({}); off-LAN clients cannot reach this server until \
              it reconnects. Failing over to another relay in {}s unless it does",
@@ -368,12 +382,7 @@ async fn fail_over<R: FailoverRelays>(
     home: Option<RelayUrl>,
     removed: &[RelayUrl],
 ) -> Option<RelayUrl> {
-    let in_map: Vec<RelayUrl> = relays
-        .configured()
-        .iter()
-        .filter(|u| !removed.contains(u))
-        .cloned()
-        .collect();
+    let in_map = in_map(relays.configured(), removed);
     let home = home.filter(|home| !removed.contains(home));
     match home {
         // Never remove the last relay left in the map.
@@ -393,6 +402,15 @@ async fn fail_over<R: FailoverRelays>(
         }
     }
     None
+}
+
+/// The configured relays that are still in the map.
+fn in_map(configured: &[RelayUrl], removed: &[RelayUrl]) -> Vec<RelayUrl> {
+    configured
+        .iter()
+        .filter(|u| !removed.contains(u))
+        .cloned()
+        .collect()
 }
 
 /// The failover loop proper, generic over the status source and the relay
@@ -416,20 +434,27 @@ where
     loop {
         let check_at = removed.iter().map(|(_, at)| *at).min();
         let out: Vec<RelayUrl> = removed.iter().map(|(url, _)| url.clone()).collect();
+        // Whether there is another relay in the map to fail over to.
+        let alternative = in_map(relays.configured(), &out).len() > 1;
         tokio::select! {
-            () = sleep_until_opt(outage.report_at) => outage.report(),
+            () = sleep_until_opt(outage.report_at) => outage.report(alternative),
             () = sleep_until_opt(outage.fail_over_at) => {
                 outage.fail_over_at = None;
                 let HomeRelay::Down { home, .. } = describe(&value) else {
                     continue;
                 };
-                log::warn!(
-                    "Still no connected home relay after {:.0}s; failing over",
-                    outage
-                        .since
-                        .map(|since| since.elapsed().as_secs_f64())
-                        .unwrap_or_default()
-                );
+                let down_for = outage
+                    .since
+                    .map(|since| since.elapsed().as_secs_f64())
+                    .unwrap_or_default();
+                if alternative {
+                    log::warn!("Still no connected home relay after {down_for:.0}s; failing over");
+                } else {
+                    log::warn!(
+                        "Still no connected home relay after {down_for:.0}s, and no other relay \
+                         to fail over to; refreshing the net report while it retries"
+                    );
+                }
                 if let Some(url) = fail_over(relays, home, &out).await {
                     removed.push((url, Instant::now() + RELAY_RESTORE_INTERVAL));
                 }

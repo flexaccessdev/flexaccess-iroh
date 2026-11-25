@@ -84,7 +84,7 @@ startup probe, iroh's own re-homing, and the shared failover:
 
 | Phase | Scenario |
 |---|---|
-| A | Every configured relay is probed at startup: a server configured with both relays fails to start only when both are down, starts with a warning when one is (taken out of its relay map), and a client with both relays connects through the live one; a single custom relay is rejected as configuration |
+| A | Every configured relay is probed at startup: a server configured with both relays fails to start only when both are down, starts with a warning when one is (taken out of its relay map), and a client with both relays connects through the live one; a single custom relay (reduced-redundancy mode) starts with a warning and the client connects through it, and fails to start when that relay is down |
 | B | Runtime relay loss is survivable: killing the server's home relay leaves the server up, it re-homes onto the surviving relay on its own (observed ≈ the 20–26 s re-probe cycle) and a restarted client with both relays reconnects; with both relays down new clients fail; after both restart, clients connect again |
 | C | The in-place home-relay failover for the case iroh does not recover on its own; see [relay-failover.md](relay-failover.md#verification) |
 | D | The same behind a live direct connection, and a client that starts during the outage; see [relay-failover.md](relay-failover.md#verification) |

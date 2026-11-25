@@ -102,8 +102,9 @@ enum Command {
 /// [`RelayConfig`] and [`EndpointOptions`].
 #[derive(Args)]
 struct RelayArgs {
-    /// Custom relay URL (repeatable; at least two distinct, or none for the
-    /// default relays). Custom relays disable n0 internet discovery.
+    /// Custom relay URL (repeatable; one alone is reduced-redundancy mode, or
+    /// none for the default relays). Custom relays disable n0 internet
+    /// discovery.
     #[arg(long = "relay-url")]
     relay_urls: Vec<String>,
     /// Shared relay auth token, sent to every custom relay.
@@ -119,7 +120,7 @@ impl RelayArgs {
     fn resolve(&self) -> Result<RelayConfig> {
         let config = RelayConfig::from_urls_with_token(&self.relay_urls, self.relay_auth_token.clone())?;
         if self.relay_only && !config.is_custom() {
-            bail!("--relay-only requires custom relays (--relay-url, at least two)");
+            bail!("--relay-only requires custom relays (--relay-url)");
         }
         // Everything here runs on one host. With mDNS compiled in, a client
         // with direct paths allowed would find the server over mDNS and dial

@@ -28,7 +28,7 @@ the 10 s; turning QUIC address discovery on for a relay does not), with any
 probe still running then waited for first. A startup timeout does not by
 itself mean that every relay failed its probe. A dead backup relay is therefore loud at startup but not fatal, so
 watch the logs: a relay list that is only half up has no failover left. Plan
-your relay list accordingly (at least two distinct relays are required), and
+your relay list accordingly (at least two distinct relays; a single relay is accepted as reduced-redundancy mode, with a startup warning and no failover), and
 configure **both sides with the full list** — see the warning in
 [relays-and-address-lookup.md](relays-and-address-lookup.md#custom-relays)
 and [relay-failover.md](relay-failover.md).
