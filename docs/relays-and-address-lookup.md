@@ -76,10 +76,13 @@ discovery off there is no published record to fall back on.
 > recover from, the shared failover moves it after 60 s. See
 > [relay-failover.md](relay-failover.md).
 
-A custom relay set must hold **at least two distinct relays**
-(`relay::MIN_CUSTOM_RELAYS`); `RelayConfig::from_urls_with_token` rejects one.
-Failover is the reason the relay list exists, and one relay leaves nothing to
-fail over to.
+A custom relay set should hold **at least two distinct relays**: failover is
+the reason the relay list exists. A single relay is accepted as
+**reduced-redundancy mode** (`RelayConfig::is_single_relay`), for deployments
+that run only one: it works, and `RelayConfig::log_status` warns at startup,
+but there is nothing to fail over to, so while that relay is down the
+endpoint is reachable off-LAN by no one, and a process that starts during the
+outage fails to start.
 
 A deployment that runs custom relays contacts **no public iroh infrastructure at
 all**. See [relay-discovery-findings.md](relay-discovery-findings.md) for the
@@ -269,7 +272,7 @@ builder.
 
 | Repo | Implementation | Notes |
 |---|---|---|
-| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs`, `src/relay_failover.rs`, `src/relay_health.rs`, `e2e/` | `RelayConfig` (at least two custom relays), the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` (binds with every relay, runs the probe beside the endpoint and takes the relays that fail it out of the live relay map, returns the probe in `CreatedEndpoint`), the in-place home-relay failover (restores them), the e2e suites for all of it, and the on-demand `/healthz` relay health check (feature `relay-health`) |
+| [flexaccess-iroh] | `src/relay.rs`, `src/endpoint.rs`, `src/relay_failover.rs`, `src/relay_health.rs`, `e2e/` | `RelayConfig` (two or more custom relays, or one in reduced-redundancy mode), the per-relay probe, the base builder (`endpoint_builder` + `EndpointOptions`), `create_endpoint` (binds with every relay, runs the probe beside the endpoint and takes the relays that fail it out of the live relay map, returns the probe in `CreatedEndpoint`), the in-place home-relay failover (restores them), the e2e suites for all of it, and the on-demand `/healthz` relay health check (feature `relay-health`) |
 | [tunnel-rs] | `src/iroh_mode/endpoint.rs` | `mf/4` ALPN, transport tuning, user-facing `--relay-only` + sequential relay failover dial; `mdns` on |
 | [ezvpn] | `src/transport/endpoint.rs`, `src/transport/paths.rs` | VPN ALPN, transport tuning, bounded connect; `mdns` off; iroh fork via `[patch.crates-io]`; shows the crate's `/healthz` relay health check in its status UIs |
 | [flextunnel] | `crates/flextunnel-core/src/transport/endpoint.rs`, `.../transport/paths.rs` | three ALPNs + native allowlist hook; the client's rebuildable endpoint (`ClientEndpoint`, its own since the crate dropped rebuilds); `mdns` on (crate compiles it out on iOS); outbound bridges attach the same relay hints; shows the crate's `/healthz` relay health check in its status UIs |

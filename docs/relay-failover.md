@@ -1,7 +1,8 @@
 # Relay Failover
 
 How a server on custom relays stays reachable when the relay it is homed on
-stops working, and why that takes **at least two custom relays** and no
+stops working, and why that takes **at least two custom relays** (a single
+relay runs in reduced-redundancy mode, with nothing to fail over to) and no
 teardown of anything. This replaces the home-relay watchdog that rebuilt the
 endpoint; see [History](#history) for what that was and why it is gone.
 
@@ -121,12 +122,14 @@ an outage.
 
 ## Consequences for configuration
 
-- **At least two custom relays.** `RelayConfig::from_urls_with_token`
-  rejects fewer than two distinct custom relay URLs
-  (`relay::MIN_CUSTOM_RELAYS`): with one relay there is nothing to fail over
-  to, and that is a configuration error caught at startup rather than an
-  outage discovered later. The default relay map is n0's and is not subject
-  to this.
+- **At least two custom relays for failover.** With one distinct custom
+  relay URL the endpoint runs in reduced-redundancy mode
+  (`RelayConfig::is_single_relay`): it works and `RelayConfig::log_status`
+  warns at startup, but there is nothing to fail over to. A wedged relay
+  is only nudged (a no-op relay-map change that forces a fresh net report
+  and reconnect), the endpoint is reachable off-LAN only once that relay
+  works again, and a process that starts while it is down fails to start.
+  The default relay map is n0's and is not subject to this.
 - **The startup probe fails only when no relay is reachable**, and the
   relays that fail it are taken out of the relay map (next section). Every
   custom relay is still probed individually, and each unreachable one is a
@@ -178,7 +181,7 @@ off-LAN:
 
 | Phase | Scenario |
 |---|---|
-| A | Startup: both relays down fails; one relay down starts with a warning and the client connects through the other; a single custom relay is rejected as configuration |
+| A | Startup: both relays down fails; one relay down starts with a warning and the client connects through the other; a single custom relay (reduced-redundancy mode) starts with a warning and the client connects through it, and fails to start when that relay is down |
 | B | A relay dies at runtime: the server re-homes on its own within a net-report cycle, a restarted client with both relays connects; both down fails; both back reconnects |
 | C | The home relay is replaced by a fake that answers `/ping` but refuses relay connections, with the other relay behind a latency-adding proxy so net_report keeps preferring the fake: nothing re-homes on its own, the failover removes the fake from the relay map after 60 s, the server homes on the other relay in place (same process, same endpoint) and a client connects; when the real relay returns, the restore probe puts it back and the server moves back onto it |
 | D | The same wedge with direct paths allowed and a client holding a live connection, logging every path of it with its RTT and selected flag (the view flextunnel's connection-path status shows). Its paths are `relay1 + direct`; through the wedge it keeps echoing over the direct path and ends up direct-only; the failover still moves the server onto relay2 in the background; a new relay-only client's connection path shows relay2 as the home relay. Then a client with the same two-relay configuration redials during the outage, as a LAN client that restarts would: its probe finds relay1 not connectable and takes it out of the relay map, the client comes online on relay2, reaches the server, and goes direct again |
@@ -192,7 +195,7 @@ the crate's CI on every push.
 
 | Repo | Failover | Serve loop |
 |---|---|---|
-| [flexaccess-iroh] | `src/relay_failover.rs`; `MIN_CUSTOM_RELAYS` and the tolerant probe in `src/relay.rs`; the startup exclusion and `CreatedEndpoint` in `src/endpoint.rs`; the e2e suite above in `e2e/` | — |
+| [flexaccess-iroh] | `src/relay_failover.rs`; the single-relay mode and the tolerant probe in `src/relay.rs`; the startup exclusion and `CreatedEndpoint` in `src/endpoint.rs`; the e2e suite above in `e2e/` | — |
 | [tunnel-rs] | crate, on v0.0.8 (tunnel-rs v0.6.4): in-place failover and the startup exclusion; `create_server_endpoint` returns `CreatedEndpoint` and the client keeps a relay it could not probe out for its lifetime | `run_multi_source_server` in `src/iroh_mode/multi_source.rs`, selected alongside the accept loop, fed `relays_left_out`. **First consumer** |
 | [ezvpn] | crate, on v0.0.8 (ezvpn v0.0.47): in-place failover and the startup exclusion | `VpnServer::run` in `src/tunnel/server.rs`, selected alongside the accept loop, fed `relays_left_out`; the endpoint watch channel that let the TUN reader follow a rebuilt endpoint is gone |
 | [flextunnel] | crate, on v0.0.8 (flextunnel v0.0.76): in-place failover and the startup exclusion. The **client's** rebuildable endpoint (`ClientEndpoint`, its reconnect loop's every-third-attempt rebuild for a wedged client endpoint) is flextunnel's own code now that the crate carries no rebuild | `run_server` in `crates/flextunnel-cli/src/main.rs`, selected alongside `ProxyServer::run`, fed `relays_left_out` |

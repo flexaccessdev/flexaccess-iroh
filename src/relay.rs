@@ -23,11 +23,6 @@ use tokio::time::Instant;
 /// online before that is treated as a relay connectivity failure.
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The fewest distinct custom relays a configuration may name. Relay failover
-/// needs somewhere to fail over *to*; the default relay map is n0's and is
-/// not subject to this.
-pub const MIN_CUSTOM_RELAYS: usize = 2;
-
 /// Relay configuration, resolved once from the raw config strings.
 ///
 /// This is the single source of the default-vs-custom distinction. It selects
@@ -43,11 +38,12 @@ pub enum RelayConfig {
     /// iroh's default relay map, with n0 address lookup.
     #[default]
     Default,
-    /// Custom relay set (parsed, deduped, in configured order). Never fewer
-    /// than [`MIN_CUSTOM_RELAYS`] distinct relays: a server keeps working
-    /// through a relay outage only by moving onto another configured relay,
-    /// and with one relay there is nothing to move to (see
-    /// [`crate::relay_failover`]).
+    /// Custom relay set (parsed, deduped, in configured order), never empty.
+    /// A server keeps working through a relay outage only by moving onto
+    /// another configured relay (see [`crate::relay_failover`]), so a single
+    /// relay is reduced-redundancy mode (see [`Self::is_single_relay`]): it
+    /// works, but an outage of that relay leaves the endpoint unreachable
+    /// off-LAN until the relay recovers.
     ///
     /// The configured order is kept because it is meaningful to a relay-only
     /// dialer, which tries the relays one at a time: the first URL is the
@@ -101,11 +97,10 @@ impl RelayConfig {
     ///
     /// Empty input selects the default relays. Parsing fails on the first
     /// malformed URL, so config typos surface at resolve time instead of at each
-    /// use site. Custom relays must number at least [`MIN_CUSTOM_RELAYS`]
-    /// distinct URLs after deduplication (listing the same relay twice counts
-    /// once): one relay leaves a server nothing to fail over to when it stops
-    /// working, which is rejected up front rather than discovered during an
-    /// outage.
+    /// use site. Exact duplicates are collapsed (listing the same relay twice
+    /// counts once), so a list that names one relay, however often, is
+    /// single-relay, reduced-redundancy mode, which [`Self::log_status`]
+    /// warns about.
     ///
     /// The token is normalized (blank/whitespace-only becomes `None`) and is
     /// **strictly gated to custom relays**: a non-empty token with no custom
@@ -133,14 +128,6 @@ impl RelayConfig {
                 parsed.push(url);
             }
         }
-        if parsed.len() < MIN_CUSTOM_RELAYS {
-            anyhow::bail!(
-                "custom relays need at least {MIN_CUSTOM_RELAYS} distinct relay_urls (got {}): a \
-                 server rides out a relay outage by moving onto another configured relay, and \
-                 with one relay there is nothing to fail over to",
-                parsed.len()
-            );
-        }
         Ok(Self::Custom {
             urls: parsed,
             auth_token,
@@ -167,6 +154,12 @@ impl RelayConfig {
         matches!(self, Self::Custom { .. })
     }
 
+    /// Whether this is a single custom relay: reduced-redundancy mode, with no
+    /// other relay to fail over to when it stops working.
+    pub fn is_single_relay(&self) -> bool {
+        self.custom_urls().len() == 1
+    }
+
     /// The corresponding iroh [`RelayMode`]: every configured relay, before
     /// the startup probe has looked at any of them.
     ///
@@ -186,8 +179,9 @@ impl RelayConfig {
         }
     }
 
-    /// Log which relays are in use (silent for the default relays). Only ever
-    /// reports *whether* an auth token is set — never the token itself.
+    /// Log which relays are in use (silent for the default relays), with a
+    /// warning for a single custom relay. Only ever reports *whether* an auth
+    /// token is set — never the token itself.
     pub fn log_status(&self) {
         let auth = if self.relay_auth_token().is_some() {
             " (authenticated)"
@@ -196,6 +190,11 @@ impl RelayConfig {
         };
         match self.custom_urls().len() {
             0 => {}
+            1 => warn!(
+                "Using a single custom relay server{auth}: reduced redundancy, no failover. While \
+                 it is down the endpoint is reachable off-LAN by no one; configure another \
+                 relay_url to ride out a relay outage"
+            ),
             n => info!("Using {n} custom relay servers with failover{auth}"),
         }
     }
@@ -448,6 +447,20 @@ impl ProbeProgress {
         self.total > 0 && self.failures.len() == self.total
     }
 
+    /// Why the start failed when [`Self::all_failed`].
+    fn all_failed_error(&self) -> anyhow::Error {
+        match self.total {
+            1 => anyhow::anyhow!(
+                "the single custom relay failed to come online (no other relay is configured):\n  {}",
+                self.describe_failures()
+            ),
+            n => anyhow::anyhow!(
+                "all {n} custom relays failed to come online:\n  {}",
+                self.describe_failures()
+            ),
+        }
+    }
+
     fn describe_failures(&self) -> String {
         self.failures
             .iter()
@@ -477,11 +490,12 @@ impl ProbeProgress {
 ///   probes of every relay finish, and a relay that does not answer them holds
 ///   each full net report back by iroh's 3 s probe timeout.
 ///
-/// A relay that is down at startup does not stop the process: with at least
-/// [`MIN_CUSTOM_RELAYS`] distinct relays configured the others carry it, and
-/// refusing to start would turn a survivable relay outage into an outage of
-/// every client that restarts during it. Only when every relay fails does the
-/// start fail, if the endpoint is not online by then.
+/// A relay that is down at startup does not stop the process: the other
+/// configured relays carry it, and refusing to start would turn a survivable
+/// relay outage into an outage of every client that restarts during it. Only
+/// when every relay fails does the start fail, if the endpoint is not online
+/// by then; with a single relay (reduced-redundancy mode) that is its own
+/// failure.
 #[derive(Debug, Clone)]
 pub struct RelayProbes(watch::Receiver<ProbeProgress>);
 
@@ -624,7 +638,10 @@ async fn apply_relay_probes(
 ) {
     tokio::pin!(closed);
     let mut watching_close = true;
-    info!("Probing {} custom relays for reachability...", urls.len());
+    match urls.len() {
+        1 => info!("Probing the custom relay for reachability..."),
+        n => info!("Probing {n} custom relays for reachability..."),
+    }
     let mut probes: FuturesUnordered<_> = urls
         .iter()
         .map(|url| {
@@ -784,11 +801,7 @@ pub(crate) async fn wait_online_beside(endpoint: &Endpoint, probes: &RelayProbes
                     return Ok(());
                 }
                 if progress.all_failed() {
-                    anyhow::bail!(
-                        "all {} custom relays failed to come online:\n  {}",
-                        progress.total,
-                        progress.describe_failures()
-                    );
+                    return Err(progress.all_failed_error());
                 }
                 probing = !progress.settled();
                 if progress.relays.left_out.len() > left_out {
@@ -890,18 +903,35 @@ mod tests {
     }
 
     #[test]
-    fn a_single_custom_url_is_rejected() {
-        let err = RelayConfig::from_urls(&[RELAY.to_string()])
-            .expect_err("one custom relay leaves nothing to fail over to");
-        assert!(
-            err.to_string().contains("at least 2 distinct relay_urls (got 1)"),
-            "unexpected error: {err}"
-        );
+    fn a_single_custom_url_is_reduced_redundancy_mode() {
+        let cfg = RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("secret".to_string()))
+            .expect("one custom relay is accepted");
+        assert!(cfg.is_custom());
+        assert!(cfg.is_single_relay());
+        assert_eq!(cfg.relay_auth_token(), Some("secret"));
+        let RelayMode::Custom(map) = cfg.relay_mode() else {
+            panic!("one custom relay gives a custom relay map");
+        };
+        assert_eq!(map.len(), 1);
         // Repeats of one URL are still one relay.
-        let err = RelayConfig::from_urls(&[RELAY.to_string(), RELAY.to_string()])
-            .expect_err("a duplicated relay is still one relay");
+        let cfg = RelayConfig::from_urls(&[RELAY.to_string(), RELAY.to_string()]).unwrap();
+        assert!(cfg.is_single_relay());
+        assert!(!RelayConfig::from_urls(&two()).unwrap().is_single_relay());
+        assert!(!RelayConfig::Default.is_single_relay());
+    }
+
+    #[test]
+    fn a_failed_single_relay_is_named_as_the_only_one() {
+        let mut progress = ProbeProgress {
+            total: 1,
+            probed: 1,
+            ..ProbeProgress::default()
+        };
+        progress.failures.push((RELAY.parse().unwrap(), "down".to_string()));
+        assert!(progress.all_failed());
+        let err = progress.all_failed_error().to_string();
         assert!(
-            err.to_string().contains("(got 1)"),
+            err.contains("the single custom relay failed to come online") && err.contains("down"),
             "unexpected error: {err}"
         );
     }

@@ -7,9 +7,10 @@
 # are each given an explicit relay list per scenario. Custom relays disable
 # internet discovery, so nothing here touches public iroh infrastructure.
 #
-# Contract under test: a custom relay set holds at least TWO distinct relays,
-# because a server rides out a relay outage by moving onto another configured
-# relay in place (no rebuild, no dropped identity or connections). Every
+# Contract under test: a server rides out a relay outage by moving onto
+# another configured relay in place (no rebuild, no dropped identity or
+# connections); a single custom relay is accepted as reduced-redundancy mode,
+# with a warning and nothing to fail over to. Every
 # configured relay is probed individually at startup, beside the endpoint; a
 # relay that is down is a warning and is taken out of the live relay map, and
 # startup fails only when none is reachable. Clients dial with
@@ -20,8 +21,11 @@
 #   A1  only relay2 up; server and client with both ....... both start (warning
 #       for relay1, once its probe gives up, which may be after the server is
 #       ready); the client connects via relay2; echo passes
-#   A2  a single custom relay is rejected as configuration: server and client
-#       configured with ONLY relay2 ........................ startup fails (negative)
+#   A2  single-relay (reduced-redundancy) mode: server and client configured
+#       with ONLY relay2 start, the server warns that there is no failover,
+#       and the client connects via relay2; echo passes
+#   A3  single-relay mode with that relay down: server with ONLY relay2
+#       ................................................... startup fails (negative)
 #
 # Phase B - a relay dies AFTER startup (iroh's own re-homing):
 #   B1  both relays up; server and client with both relays; connects; echo passes
@@ -89,18 +93,14 @@ require_iroh_relay
 # ---------------------------------------------------------------------------
 # Ports, identity, client authentication key
 # ---------------------------------------------------------------------------
-mapfile -t PORTS < <(pick_ports 4)
+mapfile -t PORTS < <(pick_ports 3)
 RELAY1_PORT="${PORTS[0]}"
 RELAY2_PORT="${PORTS[1]}"
 PROXY_PORT="${PORTS[2]}"
-DEAD_PORT="${PORTS[3]}"
 RELAY1_URL="http://127.0.0.1:$RELAY1_PORT"
 RELAY2_URL="http://127.0.0.1:$RELAY2_PORT"
 # relay2 as seen through the latency-adding proxy (phase C).
 PROXY_URL="http://127.0.0.1:$PROXY_PORT"
-# A relay URL nothing ever listens on: fills the second slot of a client that
-# must only use one live relay, since a single custom relay is rejected.
-DEAD_URL="http://127.0.0.1:$DEAD_PORT"
 log "Relays: relay1=$RELAY1_URL relay2=$RELAY2_URL proxy->relay2=$PROXY_URL"
 
 define_relay 1 "$RELAY1_PORT"
@@ -345,8 +345,9 @@ wait_for_held_echoes_past() {
 # the expected way; requiring the message keeps an unrelated startup failure
 # (bad key, malformed config) from passing as the expected one.
 RELAY_PROBE_FAILURE='all [0-9]+ custom relays failed to come online'
-# The config error for fewer than two distinct custom relays.
-SINGLE_RELAY_REJECTED='at least 2 distinct relay_urls'
+# The startup failure of a single custom relay (reduced-redundancy mode)
+# that is down.
+SINGLE_RELAY_FAILURE='the single custom relay failed to come online'
 
 # Run a client that is EXPECTED to fail for the reason matching regex $1.
 # Passes when it exits non-zero without ever authenticating AND reports that
@@ -417,13 +418,26 @@ fi
 record A1 "$rc"
 stop_server
 
-scenario A2 "a single custom relay is rejected: server and client with only relay2 fail to start"
+scenario A2 "single-relay mode: server and client with only relay2 start and connect"
 rc=0
-expect_server_start_failure "$SINGLE_RELAY_REJECTED" "$RELAY2_URL" || rc=1
-expect_connect_failure "$SINGLE_RELAY_REJECTED" "$RELAY2_URL" || rc=1
+expect_server_ready "$RELAY2_URL" || rc=1
+if [[ "$rc" -eq 0 ]] && ! grep -q "Using a single custom relay server" "$SERVER_LOG"; then
+    note "server did not warn about reduced redundancy"
+    rc=1
+fi
+if [[ "$rc" -eq 0 ]]; then
+    connect_and_echo_via "$RELAY2_URL" 3 "$RELAY2_URL" || rc=1
+fi
 record A2 "$rc"
+stop_server
 
 stop_relay 2
+
+scenario A3 "single-relay mode, relay down: server with only relay2 fails to start"
+rc=0
+expect_server_start_failure "$SINGLE_RELAY_FAILURE" "$RELAY2_URL" || rc=1
+expect_connect_failure "$SINGLE_RELAY_FAILURE" "$RELAY2_URL" || rc=1
+record A3 "$rc"
 
 # ===========================================================================
 # Phase B - a relay dies AFTER client/server are connected (iroh re-homes)
@@ -545,11 +559,11 @@ if [[ "$rc" -eq 0 ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
     note "server process died"
     rc=1
 fi
-# A new client reaches the server through relay2. Its second relay slot is a
-# dead port rather than the fake: a client that homed on the fake could never
-# come online, and the failover runs only on the server.
+# A new single-relay client reaches the server through relay2. It does not
+# list the fake: this checks the server's failover, not the client's startup
+# probe (D2 covers that).
 if [[ "$rc" -eq 0 ]]; then
-    connect_and_echo_via "$PROXY_URL" 3 "$PROXY_URL" "$DEAD_URL" || rc=1
+    connect_and_echo_via "$PROXY_URL" 3 "$PROXY_URL" || rc=1
 fi
 [[ "$rc" -eq 0 ]] || dump_log "$SERVER_LOG"
 record C1 "$rc"
@@ -682,9 +696,9 @@ if [[ "$rc" -eq 0 ]]; then
     note "held client echoed $(held_echo_count) times, $(( $(held_echo_count) - ECHOES_AT_REMOVAL )) of them after the relay map changed"
 fi
 # Off-LAN reachability is back: a new relay-only client reaches the server
-# through relay2 (dead port in the second slot, as in C1).
+# through relay2 (a single-relay client, as in C1).
 if [[ "$rc" -eq 0 ]]; then
-    connect_and_echo_via "$PROXY_URL" 3 "$PROXY_URL" "$DEAD_URL" || rc=1
+    connect_and_echo_via "$PROXY_URL" 3 "$PROXY_URL" || rc=1
 fi
 [[ "$rc" -eq 0 ]] || { dump_log "$SERVER_LOG"; dump_log "$HELD_LOG"; }
 record D1 "$rc"

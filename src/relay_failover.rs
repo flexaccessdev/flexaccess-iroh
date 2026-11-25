@@ -24,8 +24,11 @@
 //! it through that relay. Nothing is torn down: the endpoint, its identity,
 //! its direct paths, and every established connection stay as they are; a
 //! connection whose only path ran through the dead relay times out on its own
-//! and that client redials. This is why a custom relay set is required to hold
-//! at least [`crate::relay::MIN_CUSTOM_RELAYS`] distinct relays.
+//! and that client redials. This is why a custom relay set should hold at
+//! least two distinct relays: with a single relay (reduced-redundancy mode,
+//! [`RelayConfig::is_single_relay`]) there is nothing to move onto, so the
+//! failover can only nudge the endpoint to reconnect to it (see below), and
+//! the endpoint is reachable off-LAN only once that relay works again.
 //!
 //! The removed relay is put back once a probe (the same relay-only probe used
 //! at startup) shows it connectable again, checked every

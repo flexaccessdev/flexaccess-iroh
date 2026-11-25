@@ -40,8 +40,8 @@ usage() {
 Usage: run_e2e.sh [OPTIONS]
 
 Options:
-  --relay-url URL   Custom relay URL for both sides (repeatable; at least two,
-                    a single custom relay is rejected). May be --relay-url=URL.
+  --relay-url URL   Custom relay URL for both sides (repeatable; a single one
+                    is reduced-redundancy mode). May be --relay-url=URL.
   --local-relays    Start two local iroh-relay instances and use them.
   --relay-only      Reach the server only through the relays (no direct
                     paths). Requires custom relays.
@@ -70,10 +70,6 @@ if [[ ${#RELAY_URLS[@]} -eq 0 && -n "${RELAY_URL:-}" ]]; then
 fi
 if [[ "$LOCAL_RELAYS" == 1 && ${#RELAY_URLS[@]} -gt 0 ]]; then
     echo "ERROR: --local-relays and --relay-url are exclusive" >&2
-    exit 2
-fi
-if [[ ${#RELAY_URLS[@]} -eq 1 ]]; then
-    echo "ERROR: custom relays need at least two --relay-url values" >&2
     exit 2
 fi
 if [[ "$RELAY_ONLY" == 1 && "$LOCAL_RELAYS" == 0 && ${#RELAY_URLS[@]} -eq 0 ]]; then

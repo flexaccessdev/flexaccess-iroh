@@ -45,7 +45,7 @@ crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
   on its own, the in-place failover for the case it does not (take the wedged
   relay out of the relay map, restore it once connectable), how a process
   that starts during such an outage still comes online (take the relay the
-  probe cannot connect out of the relay map), why that needs at least two custom relays
+  probe cannot connect out of the relay map), why that needs at least two custom relays (one runs in reduced-redundancy mode)
   and no address lookup service, and the crate's e2e suite that proves it,
   behind a relay-only and a live direct connection alike.
 - **[nat-traversal-and-transport.md](nat-traversal-and-transport.md)** — what the
