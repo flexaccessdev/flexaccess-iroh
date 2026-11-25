@@ -12,7 +12,8 @@ use iroh::endpoint::{NetReportConfig, PortmapperConfig, RelayStatus, presets};
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, Watcher};
 use log::{info, warn};
 use std::fmt;
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -475,13 +476,14 @@ impl RelayProbes {
 
     /// Start probing `relay_config`'s custom relays for `endpoint`, on a task
     /// of its own. Returns the probe and that task, which the caller keeps in
-    /// its [`PendingCloses`]: the probe endpoints must be closed before the
-    /// runtime goes away. `None` for the default relays.
+    /// its [`PendingCloses`] (the probe endpoints must be closed before the
+    /// runtime goes away), with the slot through which the task reaches the
+    /// endpoint. `None` for the default relays.
     pub(crate) fn start(
         endpoint: &Endpoint,
         relay_config: &RelayConfig,
         closes: &PendingCloses,
-    ) -> (Self, Option<JoinHandle<()>>) {
+    ) -> (Self, Option<(JoinHandle<()>, EndpointSlot)>) {
         let RelayConfig::Custom { urls, auth_token } = relay_config else {
             return (Self::none(), None);
         };
@@ -489,14 +491,16 @@ impl RelayProbes {
             total: urls.len(),
             ..ProbeProgress::default()
         });
+        let slot = EndpointSlot(Arc::new(Mutex::new(Some(endpoint.clone()))));
         let task = tokio::spawn(apply_relay_probes(
-            endpoint.clone(),
+            endpoint.closed(),
+            slot.clone(),
             urls.clone(),
             auth_token.clone(),
             closes.clone(),
             tx,
         ));
-        (Self(rx), Some(task))
+        (Self(rx), Some((task, slot)))
     }
 
     /// What the probe has found so far. Final once [`Self::is_settled`].
@@ -546,6 +550,27 @@ impl RelayProbes {
     }
 }
 
+/// Where the probe task keeps its handle to the endpoint it fixes up. The task
+/// borrows a clone only while it applies a result, so emptying the slot lets
+/// go of the endpoint at once, from wherever that happens: the task itself
+/// when the endpoint's close begins, or [`crate::endpoint::create_endpoint`]
+/// when it is cancelled.
+#[derive(Debug, Clone)]
+pub(crate) struct EndpointSlot(Arc<Mutex<Option<Endpoint>>>);
+
+impl EndpointSlot {
+    /// A clone of the endpoint, unless it has been let go of or is closed.
+    fn get(&self) -> Option<Endpoint> {
+        let slot = self.0.lock().expect("endpoint slot lock");
+        slot.as_ref().filter(|endpoint| !endpoint.is_closed()).cloned()
+    }
+
+    /// Let go of the endpoint, handing over the slot's handle to it.
+    pub(crate) fn take(&self) -> Option<Endpoint> {
+        self.0.lock().expect("endpoint slot lock").take()
+    }
+}
+
 /// Whether `endpoint`'s home relay is connected through `url`.
 fn home_relay_connected(endpoint: &Endpoint, url: &RelayUrl) -> bool {
     endpoint
@@ -558,23 +583,23 @@ fn home_relay_connected(endpoint: &Endpoint, url: &RelayUrl) -> bool {
 /// The probe task behind [`RelayProbes`]: probe every relay in parallel,
 /// apply each result to `endpoint` as it lands, and publish the progress.
 ///
-/// The task lets go of `endpoint` as soon as its close begins
-/// ([`Endpoint::closed`], which holds no handle to it), and says so
+/// The task lets go of the endpoint in `slot` as soon as its close begins
+/// (`closed`, from [`Endpoint::closed`], which holds no handle to it), and says so
 /// ([`RelayProbes::released`]): its sockets are released only with its last
 /// handle, and a caller that closes the endpoint and binds a new one on the
 /// same port must not find it still taken by a probe of a relay that does not
 /// answer. The probes themselves run to the end either way, so that their own
 /// endpoints are closed.
 async fn apply_relay_probes(
-    endpoint: Endpoint,
+    closed: impl Future<Output = ()>,
+    slot: EndpointSlot,
     urls: Vec<RelayUrl>,
     auth_token: Option<String>,
     closes: PendingCloses,
     progress: watch::Sender<ProbeProgress>,
 ) {
-    let closed = endpoint.closed();
     tokio::pin!(closed);
-    let mut endpoint = Some(endpoint);
+    let mut watching_close = true;
     info!("Probing {} custom relays for reachability...", urls.len());
     let mut probes: FuturesUnordered<_> = urls
         .iter()
@@ -587,8 +612,9 @@ async fn apply_relay_probes(
     loop {
         let next = tokio::select! {
             next = probes.next() => next,
-            () = &mut closed, if endpoint.is_some() => {
-                endpoint = None;
+            () = &mut closed, if watching_close => {
+                watching_close = false;
+                drop(slot.take());
                 progress.send_modify(|progress| progress.released = true);
                 continue;
             }
@@ -601,8 +627,8 @@ async fn apply_relay_probes(
             Err(e) => (Some(format!("{e:#}")), false),
         };
         let mut left_out = false;
-        let endpoint = endpoint.as_ref().filter(|endpoint| !endpoint.is_closed());
-        if let (Some(failure), Some(endpoint)) = (&failure, endpoint) {
+        let endpoint = slot.get();
+        if let (Some(failure), Some(endpoint)) = (&failure, &endpoint) {
             // The probe is a connection of its own: it can fail on a relay
             // the endpoint is connected through all the same, and taking that
             // relay out would move the endpoint off a relay that works.
@@ -624,7 +650,7 @@ async fn apply_relay_probes(
                 warn!("{url} did not come online ({failure}); it is the last relay in the map");
             }
         }
-        if let (true, Some(endpoint)) = (quic_addr_discovery, endpoint) {
+        if let (true, Some(endpoint)) = (quic_addr_discovery, &endpoint) {
             let entry = relay_entry(url, auth_token.as_deref(), true);
             endpoint.insert_relay(url.clone(), Arc::new(entry)).await;
         }
@@ -641,7 +667,7 @@ async fn apply_relay_probes(
             }
         });
     }
-    drop(endpoint);
+    drop(slot.take());
     progress.send_modify(|progress| progress.released = true);
     let progress = progress.borrow();
     if !progress.failures.is_empty() && !progress.all_failed() {
