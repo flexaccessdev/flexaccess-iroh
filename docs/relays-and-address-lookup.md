@@ -181,9 +181,13 @@ the last relay left. A probe is a connection of its own, so its result and the
 endpoint's can differ: a probe can fail on a relay the endpoint is connected
 through, which stays, and the endpoint can fail to come online on relays that
 passed. **Startup fails when every probe fails and the endpoint is not
-connected, or when the endpoint is still not online 10 s after its relay map
-last changed**, so a startup timeout does not by itself mean that every relay
-failed its probe. Each probe
+connected, or when the endpoint is still not online 10 s after the wait began
+or a probe last took a relay out of the map**, so a startup timeout does not
+by itself mean that every relay failed its probe. Only taking a relay out
+restarts the 10 s: turning QUIC address discovery on for a relay changes the
+map too, but leaves the deadline where it was. A probe still running when the
+10 s are up is waited for, since it may yet take out the relay that keeps the
+endpoint offline. Each probe
 also checks its relay for QUIC address discovery, within the time the probe
 takes anyway (see [above](#quic-address-discovery-on-custom-relays)).
 

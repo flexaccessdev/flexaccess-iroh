@@ -23,8 +23,10 @@ until the server's failover finds it connectable again (a client keeps it out
 for its lifetime), unless the endpoint is connected through it or it is the
 last relay left. The process refuses to start when every probe fails and the
 endpoint is not connected, or when the endpoint is still not online 10 s after
-its relay map last changed; a startup timeout does not by itself mean that
-every relay failed its probe. A dead backup relay is therefore loud at startup but not fatal, so
+startup began or a probe last took a relay out of the map (only that restarts
+the 10 s; turning QUIC address discovery on for a relay does not), with any
+probe still running then waited for first. A startup timeout does not by
+itself mean that every relay failed its probe. A dead backup relay is therefore loud at startup but not fatal, so
 watch the logs: a relay list that is only half up has no failover left. Plan
 your relay list accordingly (at least two distinct relays are required), and
 configure **both sides with the full list** — see the warning in

@@ -728,11 +728,13 @@ async fn apply_relay_probes(
 /// Wait for `endpoint` to come online while `probes` runs beside it.
 ///
 /// Fails when every custom relay failed its probe, or when the endpoint is
-/// still offline [`RELAY_CONNECT_TIMEOUT`] after the latest change to its relay
-/// map: taking a relay out restarts the wait, because that is what lets an
-/// endpoint stuck on a relay that cannot be connected re-home on one that
-/// can. Nor does the wait end while a probe is still running, which may yet
-/// take out the relay that keeps it offline.
+/// still offline [`RELAY_CONNECT_TIMEOUT`] after the wait began or the probe
+/// last took a relay out of its map: taking a relay out restarts the wait,
+/// because that is what lets an endpoint stuck on a relay that cannot be
+/// connected re-home on one that can. Turning QUIC address discovery on for a
+/// relay changes the map too, but does not restart it. Nor does the wait end
+/// while a probe is still running, which may yet take out the relay that
+/// keeps it offline.
 pub(crate) async fn wait_online_beside(endpoint: &Endpoint, probes: &RelayProbes) -> Result<()> {
     // Online means connected to a relay. A probe is a connection of its own
     // and can fail on a relay the endpoint is connected through, so every
