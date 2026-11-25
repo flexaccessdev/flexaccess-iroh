@@ -19,7 +19,7 @@ contact with public iroh infrastructure.**
 
 Every configured custom relay is probed **individually** at startup. The
 process refuses to start only when **none** of them comes online; each relay
-that does not is named in a warning and left out of the relay map until the
+that does not is named in a warning and taken out of the relay map until the
 server's failover finds it connectable again (a client keeps it out for its
 lifetime). A dead backup relay is therefore loud at startup but not fatal, so
 watch the logs: a relay list that is only half up has no failover left. Plan
@@ -209,7 +209,7 @@ configuration error in all three programs.
 
 The token rides the relay WebSocket upgrade as `Authorization: Bearer <token>`,
 which means the per-relay startup probe validates it: a relay that rejects the
-token never comes online, is named in a warning and left out of the relay map,
+token never comes online, is named in a warning and taken out of the relay map,
 and startup fails once no relay accepts it.
 
 ## Verifying a relay

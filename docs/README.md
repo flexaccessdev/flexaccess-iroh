@@ -18,8 +18,8 @@ This design is also **code**, once: [`flexaccess-iroh`](../README.md), the
 Rust crate in this repository, which all three programs depend on by git tag.
 It carries `RelayConfig` (at
 least two custom relays) and the per-relay startup probe, the common endpoint
-builder (and relay-only mode) that binds without the relays that fail the
-probe, the server-side in-place home-relay failover that restores them, and
+builder (and relay-only mode), endpoint creation that runs the probe beside
+the endpoint and takes the relays that fail it out of the relay map, the server-side in-place home-relay failover that restores them, and
 the endpoint-bound public-key auth transcript over
 [`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys). A fix to
 any of that lands in the crate and reaches every program on its next tag bump,
@@ -44,8 +44,8 @@ crate's `iroh` to that fork with `[patch.crates-io]` so the graph holds one
   stays reachable when its home relay stops working: what iroh 1.1.0 recovers
   on its own, the in-place failover for the case it does not (take the wedged
   relay out of the relay map, restore it once connectable), how a process
-  that starts during such an outage still comes online (bind without the
-  relay the probe cannot connect), why that needs at least two custom relays
+  that starts during such an outage still comes online (take the relay the
+  probe cannot connect out of the relay map), why that needs at least two custom relays
   and no address lookup service, and the crate's e2e suite that proves it,
   behind a relay-only and a live direct connection alike.
 - **[nat-traversal-and-transport.md](nat-traversal-and-transport.md)** — what the

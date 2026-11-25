@@ -41,15 +41,15 @@
 //! one), the endpoint is nudged with a no-op relay-map change instead, which
 //! forces a fresh report the same way.
 //!
-//! Relays that failed the startup probe were never in the map
-//! ([`crate::endpoint::create_endpoint`] binds without them, so that a process
-//! starting during an outage comes online on a relay that works). They are
-//! handed in as already removed and get the same restore probe.
+//! Relays that failed the startup probe were taken out of the map by it
+//! (see [`crate::relay::RelayProbes`]), so that a process starting during an
+//! outage comes online on a relay that works. The failover waits for that
+//! probe to settle before it starts, takes them as already removed, and gives
+//! them the same restore probe.
 //!
 //! A relay is put back probed for QUIC address discovery only if the restore
-//! probe found it serves it, the same check the startup probe makes (see
-//! [`crate::relay::probe_custom_relays`]); a relay re-inserted unchanged keeps
-//! what the endpoint was last told about it.
+//! probe found it serves it, the same check the startup probe makes; a relay
+//! re-inserted unchanged keeps what the endpoint was last told about it.
 //!
 //! Only the *home* relay matters: non-home relays are connected on demand and
 //! dropped after a minute idle, which is normal and not an outage. With the
@@ -58,7 +58,7 @@
 //! registration.
 
 use crate::endpoint::PendingCloses;
-use crate::relay::{ProbedRelays, RelayConfig, probe_relay, relay_entry, relay_failure};
+use crate::relay::{RelayConfig, RelayProbes, probe_relay, relay_entry, relay_failure};
 use iroh::endpoint::RelayStatus;
 use iroh::{Endpoint, RelayUrl, Watcher};
 use std::sync::Arc;
@@ -84,16 +84,16 @@ const RELAY_OUTAGE_LOG_GRACE: Duration = Duration::from_secs(5);
 pub const RELAY_RESTORE_INTERVAL: Duration = Duration::from_secs(90);
 
 /// Watch `endpoint`'s home relay and fail over in place when it is lost for
-/// [`RELAY_OUTAGE_FAILOVER`]; see the module docs. `relays` is what the
-/// startup probe found ([`crate::endpoint::CreatedEndpoint::relays`]): the
-/// relays the endpoint was bound without are probed for restoration like a
+/// [`RELAY_OUTAGE_FAILOVER`]; see the module docs. `relays` is the startup
+/// probe ([`crate::endpoint::CreatedEndpoint::relays`]), which is waited for
+/// first: the relays it took out of the map are probed for restoration like a
 /// relay removed here, and those serving QUIC address discovery keep it when
 /// re-inserted. Never resolves: run it alongside the accept loop and drop it
 /// with the endpoint. Pending forever with the default relays.
 pub async fn fail_over_home_relay(
     endpoint: &Endpoint,
     relay_config: &RelayConfig,
-    relays: &ProbedRelays,
+    relays: &RelayProbes,
 ) {
     let RelayConfig::Custom { urls, auth_token } = relay_config else {
         std::future::pending().await
@@ -102,13 +102,14 @@ pub async fn fail_over_home_relay(
         log::error!("Custom relay set is empty; home-relay failover has nothing to work with");
         std::future::pending().await
     }
+    let relays = relays.settled().await;
     let out: Vec<RelayUrl> = relays
         .left_out
         .iter()
         .filter(|url| {
             let configured = urls.contains(url);
             if !configured {
-                log::error!("{url} was left out at startup but is not a configured relay; ignoring it");
+                log::error!("{url} was taken out at startup but is not a configured relay; ignoring it");
             }
             configured
         })
@@ -116,7 +117,7 @@ pub async fn fail_over_home_relay(
         .collect();
     if !out.is_empty() {
         log::info!(
-            "{} relay(s) left out of the relay map at startup will be probed for restoration \
+            "{} relay(s) taken out of the relay map at startup will be probed for restoration \
              every {}s: {}",
             out.len(),
             RELAY_RESTORE_INTERVAL.as_secs(),
