@@ -35,7 +35,7 @@ the relay and a direct path is learned through it, exactly as off-LAN.
 | Script | What it checks | Needs |
 |---|---|---|
 | `run_e2e.sh` | **Auth + connectivity.** An unlisted key is rejected (exit 3, explicit rejection, server logs why); an authorized client authenticates and gets its echo; a second client on the *same* key uses a *distinct* ephemeral iroh identity; under `--relay-only`, every connection ran through a relay. | internet for the default relays; or `--local-relays` / `--relay-url` (one or more) for a fully offline run |
-| `run_quic_addr_discovery.sh` | **QUIC address discovery, on or off for all custom relays.** Offline against two local `iroh-relay --dev` instances, neither serving QAD, as relays behind a Cloudflare Tunnel: with QAD on, the client's endpoint waits out iroh's 3 s QAD timeout before coming online; with it off, it does not. With `--n0`, the same on/off pair against n0's production relays as custom relays, which all serve QAD: on sees QAD answer without the 3 s wait, off does not see it answer. Every scenario reaches the server. | `iroh-relay`, `ss`, UDP 7842 free; internet for `--n0` |
+| `run_quic_addr_discovery.sh` | **QUIC address discovery, on or off for all custom relays.** Offline against two local `iroh-relay --dev` instances, neither serving QAD, as relays behind a Cloudflare Tunnel: with QAD on, the client's endpoint waits out iroh's 3 s QAD timeout before coming online; with it off, it does not. With `--n0`, the same on/off pair against n0's production relays as custom relays, which all serve QAD: on sees QAD answer, off does not; their online times are noted, not checked. Every scenario reaches the server. | `iroh-relay`, `ss`, UDP 7842 free; internet for `--n0` |
 | `run_relay_failover.sh` | **Relay failover**, fully offline against two local `iroh-relay --dev` instances (relay-only until phase D). Phase A: relays down *before* startup (per-relay probe: startup fails only when none is reachable; a single custom relay runs in reduced-redundancy mode, and fails to start only when it is down). Phase B: a relay dies *after* startup (iroh re-homes on its own; both down fails new clients; both back recovers). Phase C: the home relay answers probes but refuses connections (the in-place failover removes it after 60 s, the server homes on the other relay without restarting, and the restore probe puts it back once it is connectable again). Phase D: the same wedge with direct paths allowed and a client holding a live connection whose paths are relay1 + direct; the failover still moves the server onto the other relay in the background, the held connection keeps echoing over its direct path (ending up direct-only: iroh drops the wedged relay path and does not add a peer's new home relay to an established connection), a new relay-only client's connection path shows the new home relay, and a client that restarts with the same two-relay configuration during the outage comes online, reaches the server through the new home relay, and goes direct again. | `iroh-relay` |
 
 ```sh
@@ -69,9 +69,10 @@ lines are what the scripts assert on).
 
 ## CI
 
-The `e2e` job in `.github/workflows/ci.yml` runs `run_e2e.sh --local-relays`,
-`run_e2e.sh --local-relays --relay-only`, `run_quic_addr_discovery.sh --n0`
-and `run_relay_failover.sh`. All are offline except the `--n0` section of the
-QUIC address discovery suite, its only check that QAD answers, which uses n0's
-public relays as custom relays. The default-relay run of `run_e2e.sh` needs
+The `e2e` job in `.github/workflows/ci.yml` runs the offline suites,
+`run_e2e.sh --local-relays`, `run_e2e.sh --local-relays --relay-only`,
+`run_quic_addr_discovery.sh` and `run_relay_failover.sh`, then
+`run_quic_addr_discovery.sh --n0` last, whatever came before: its `--n0`
+section, the suite's only check that QAD answers, uses n0's public relays as
+custom relays, so its failure never skips an offline suite. The default-relay run of `run_e2e.sh` needs
 n0's DNS as well and is left to a developer machine.

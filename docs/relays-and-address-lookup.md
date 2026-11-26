@@ -127,15 +127,16 @@ QUIC address discovery (QAD) is a QUIC endpoint a relay can run on UDP 7842
 that tells an iroh endpoint its public address, one of the signals hole
 punching uses. iroh assumes every relay given by URL serves it, and at the
 start of each full network report probes it on up to five relays in the map,
-stopping early once enough of them (three, or all of them when the map holds
-fewer) have answered.
+over IPv4 and, where the endpoint has it, IPv6. It stops early once it has
+enough replies: three, or as many as there are relays when the map holds
+fewer, counting a relay's IPv4 and IPv6 replies separately.
 
 Probing a relay that does not serve it is not free. iroh does not pick a home
 relay until its QAD probes finish, and a probe to a relay with nothing on UDP
 7842 waits out the probe timeout: **3 s on iroh 1.5** (`PROBES_TIMEOUT`,
-net_report). When too few of the probed relays answer to stop early (none of
-them serves QAD, say, or one of two does not), the report waits up to that
-3 s. An endpoint is not online until it has a home relay, so such a delay
+net_report). When too few replies come back to stop early (none of the relays
+serves QAD, say, or one of two does not and the other replies over IPv4
+alone), the report waits up to that 3 s. An endpoint is not online until it has a home relay, so such a delay
 lands on its start, and can again on later full reports (network changes,
 every 5 minutes). Measured on 2026-11-25 against two relays behind a
 Cloudflare Tunnel: the first report took 3.0 s with QAD probed and 0.3 s

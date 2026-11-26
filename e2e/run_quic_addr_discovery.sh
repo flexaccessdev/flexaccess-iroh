@@ -19,8 +19,10 @@
 # (use1-1 and euc1-1.relay.n0.iroh.link) as the custom relays, which all serve
 # QAD over the public internet:
 #
-#   n0-on       QAD on: the endpoint sees QAD answer, without the 3 s wait.
-#               This is the suite's only check that QAD answers at all
+#   n0-on       QAD on: the endpoint sees QAD answer. This is the suite's only
+#               check that QAD answers at all. Its online time is noted but not
+#               checked: over the internet it includes DNS and the relay
+#               connection, which the local cases bound
 #   n0-off      QAD off: the endpoint does not see it answer
 #
 # Usage: ./e2e/run_quic_addr_discovery.sh [--n0]
@@ -130,9 +132,10 @@ expect() {
     grep -Eq "$2" "$1" || { note "$3"; return 1; }
 }
 
-# expect_online <logfile> <label> <waited|quick>: note and fail unless the
+# expect_online <logfile> <label> <waited|quick|any>: note and fail unless the
 # endpoint logged as <label> came online after at least WAITED_MS (waited) or
-# within QUICK_MS (quick). The time is noted for the summary either way.
+# within QUICK_MS (quick); any checks nothing. The time is noted for the
+# summary either way.
 expect_online() {
     local logfile="$1" label="$2" bound="$3" ms
     ms="$(sed -nE "s/.*\] $label online after ([0-9]+) ms.*/\1/p" "$logfile" | head -1)"
@@ -143,10 +146,11 @@ expect_online() {
             { note "$label came online after $ms ms, before the 3 s QAD timeout"; return 1; } ;;
         quick) (( ms < QUICK_MS )) ||
             { note "$label came online after $ms ms, not within $QUICK_MS ms"; return 1; } ;;
+        any) ;;
     esac
 }
 
-# scenario <id> <answered|did not answer> <waited|quick> <what> <relay args...>:
+# scenario <id> <answered|did not answer> <waited|quick|any> <what> <relay args...>:
 # run a client, and check that its endpoint's net report saw QAD answer or
 # not, how long the endpoint took to come online, and that it reached the
 # server.
@@ -190,9 +194,9 @@ if [[ "$N0" -eq 1 ]]; then
         --relay-url "https://euc1-1.relay.n0.iroh.link./")
     start_server n0 "${N0_RELAYS[@]}"
 
-    scenario n0-on "answered" quick "n0's relays, QAD on" "${N0_RELAYS[@]}"
+    scenario n0-on "answered" any "n0's relays, QAD on" "${N0_RELAYS[@]}"
 
-    scenario n0-off "did not answer" quick "n0's relays, QAD off" \
+    scenario n0-off "did not answer" any "n0's relays, QAD off" \
         "${N0_RELAYS[@]}" --no-quic-addr-discovery
 
     check_server_alive n0

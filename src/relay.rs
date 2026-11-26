@@ -160,7 +160,7 @@ impl RelayConfig {
     ///
     /// Off, no relay is probed for QAD at all. For relays that cannot serve
     /// it, such as relays behind a Cloudflare Tunnel or any other HTTP-only
-    /// front: with QAD on, when too few of the probed relays answer, a full
+    /// front: with QAD on, when too few probe replies come back, a full
     /// net report waits up to that timeout, the first one too, which delays
     /// the endpoint's start. No
     /// relay then reports the endpoint's public address to it.
