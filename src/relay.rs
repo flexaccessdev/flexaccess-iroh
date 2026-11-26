@@ -19,9 +19,33 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-/// How long a freshly bound endpoint (or a relay probe) may take to come
-/// online before that is treated as a relay connectivity failure.
+/// How long a relay probe, or a freshly bound endpoint once its QUIC address
+/// discovery is done (see [`online_timeout`]), may take to come online before
+/// that is treated as a relay connectivity failure.
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long iroh 1.5 waits for its QUIC address discovery (QAD) probes
+/// (`PROBES_TIMEOUT` in its net_report, private to iroh): the longest a net
+/// report holds an endpoint's home relay back on QAD.
+pub const QAD_PROBES_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long `endpoint`, bound from `relay_config`, may take to come online at
+/// startup: [`RELAY_CONNECT_TIMEOUT`], the window each relay probe gets for
+/// its connection, plus [`QAD_PROBES_TIMEOUT`] when the endpoint probes the
+/// custom relays for QAD. The probes never do (they have no IP transports),
+/// but an endpoint that does picks no home relay, and so opens no relay
+/// connection, until its net report's QAD probes are done or timed out.
+/// Without it, a relay that connects late in its window would pass its probe
+/// and still fail the start.
+///
+/// With the default relays there is no probe to match, and the window is
+/// [`RELAY_CONNECT_TIMEOUT`] alone.
+pub fn online_timeout(relay_config: &RelayConfig, endpoint: &Endpoint) -> Duration {
+    // iroh runs QAD only on an endpoint with IP transports, so a relay-only
+    // one (no bound sockets) never waits for it.
+    let qad = relay_config.quic_addr_discovery() == Some(true) && !endpoint.bound_sockets().is_empty();
+    if qad { RELAY_CONNECT_TIMEOUT + QAD_PROBES_TIMEOUT } else { RELAY_CONNECT_TIMEOUT }
+}
 
 /// Relay configuration, resolved once from the raw config strings.
 ///
@@ -632,12 +656,17 @@ async fn apply_relay_probes(
 /// Wait for `endpoint` to come online while `probes` runs beside it.
 ///
 /// Fails when every custom relay failed its probe, or when the endpoint is
-/// still offline [`RELAY_CONNECT_TIMEOUT`] after the wait began or the probe
-/// last took a relay out of its map: taking a relay out restarts the wait,
-/// because that is what lets an endpoint stuck on a relay that cannot be
-/// connected re-home on one that can. Nor does the wait end while a probe is
-/// still running, which may yet take out the relay that keeps it offline.
-pub(crate) async fn wait_online_beside(endpoint: &Endpoint, probes: &RelayProbes) -> Result<()> {
+/// still offline `timeout` (see [`online_timeout`]) after the wait began or
+/// the probe last took a relay out of its map: taking a relay out restarts
+/// the wait, because that is what lets an endpoint stuck on a relay that
+/// cannot be connected re-home on one that can, and the re-homing net report
+/// may wait on QAD again. Nor does the wait end while a probe is still
+/// running, which may yet take out the relay that keeps it offline.
+pub(crate) async fn wait_online_beside(
+    endpoint: &Endpoint,
+    probes: &RelayProbes,
+    timeout: Duration,
+) -> Result<()> {
     // Online means connected to a relay. A probe is a connection of its own
     // and can fail on a relay the endpoint is connected through, so every
     // failure is checked against the live connection first.
@@ -655,10 +684,10 @@ pub(crate) async fn wait_online_beside(endpoint: &Endpoint, probes: &RelayProbes
     let timed_out = || {
         anyhow::anyhow!(
             "Endpoint failed to come online after {}s - check relay server connectivity",
-            RELAY_CONNECT_TIMEOUT.as_secs()
+            timeout.as_secs()
         )
     };
-    let mut deadline = Some(Instant::now() + RELAY_CONNECT_TIMEOUT);
+    let mut deadline = Some(Instant::now() + timeout);
     let mut left_out = 0;
     let mut probing = true;
     let online = endpoint.online();
@@ -691,7 +720,7 @@ pub(crate) async fn wait_online_beside(endpoint: &Endpoint, probes: &RelayProbes
                 probing = !progress.settled();
                 if progress.left_out.len() > left_out {
                     left_out = progress.left_out.len();
-                    deadline = Some(Instant::now() + RELAY_CONNECT_TIMEOUT);
+                    deadline = Some(Instant::now() + timeout);
                 } else if deadline.is_none() && !probing {
                     return Err(timed_out());
                 }
@@ -951,7 +980,7 @@ mod tests {
         drop(tx);
         let err = tokio::time::timeout(
             Duration::from_secs(1),
-            wait_online_beside(&endpoint, &RelayProbes(rx)),
+            wait_online_beside(&endpoint, &RelayProbes(rx), RELAY_CONNECT_TIMEOUT),
         )
         .await
         .expect("no wait for the timeout")

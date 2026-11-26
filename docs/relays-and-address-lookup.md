@@ -164,8 +164,9 @@ alike: all behind Cloudflare Tunnels, or all terminating TLS themselves.
 - **On** (the default): every relay is in the relay map exactly as iroh has it
   (`iroh::RelayConfig::from(url)`, QAD on UDP 7842 at the URL's host), and iroh
   does the rest. A relay whose QAD is down for a while can hold a full report
-  back by up to iroh's 3 s timeout, as it does in iroh; nothing in the crate
-  works around it.
+  back by up to iroh's 3 s timeout, as it does in iroh; the crate only widens
+  its startup window by that much (see the
+  [startup probe](#custom-relay-validation-the-per-relay-startup-probe)).
 - **Off**: no relay is probed for QAD (`quic: None` on every entry), so no
   report waits for it, and no relay reports the endpoint's public address.
   For relays behind a Cloudflare Tunnel or any other HTTP-only front.
@@ -205,13 +206,21 @@ the last relay left. A probe is a connection of its own, so its result and the
 endpoint's can differ: a probe can fail on a relay the endpoint is connected
 through, which stays, and the endpoint can fail to come online on relays that
 passed. **Startup fails when every probe fails and the endpoint is not
-connected, or when the endpoint is still not online 10 s after the wait began
-or a probe last took a relay out of the map**, so a startup timeout does not
-by itself mean that every relay failed its probe. Only taking a relay out
-restarts the 10 s. A probe still running when the 10 s are up is waited for,
-since it may yet take out the relay that keeps the endpoint offline. The probe
-checks relay connectivity only; QUIC address discovery is the application's
-setting (see [above](#quic-address-discovery-on-custom-relays)).
+connected, or when the endpoint is still not online within its startup window
+after the wait began or a probe last took a relay out of the map**, so a
+startup timeout does not by itself mean that every relay failed its probe.
+Only taking a relay out restarts the window. A probe still running when the
+window is up is waited for, since it may yet take out the relay that keeps the
+endpoint offline. The probe checks relay connectivity only; QUIC address
+discovery is the application's setting (see
+[above](#quic-address-discovery-on-custom-relays)).
+
+The window (`relay::online_timeout`) is the probes' 10 s, plus iroh's 3 s QAD
+probe timeout (`QAD_PROBES_TIMEOUT`) when the endpoint runs QAD: QAD on and IP
+transports present. The probes never run QAD, but such an endpoint opens no
+relay connection until its net report's QAD probes are done, so on 10 s alone
+a relay that connects late in its probe's window would pass the probe and
+still fail the start. A relay-only endpoint, or one with QAD off, gets 10 s.
 
 `create_endpoint` returns as soon as the endpoint is online, so on healthy
 relays the probe costs the start nothing: it used to run ahead of the bind and
@@ -243,7 +252,7 @@ relay by probe latency, so a relay that answers probes but refuses relay
 connections would be preferred, never connect, and keep `online()` from ever
 resolving. The probe therefore takes it out of the live map (never the last
 relay left), which forces a fresh net report that re-homes the endpoint, and
-the wait for the endpoint restarts its 10 s from that change, so the endpoint
+the wait for the endpoint restarts its window from that change, so the endpoint
 gets a full window on the relays that work. The relays taken out are handed
 on (`CreatedEndpoint::relays`, `RelayProbes::settled`) for the failover to
 restore once they are connectable, using this same probe; a process that does
