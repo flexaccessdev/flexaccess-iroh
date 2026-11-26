@@ -10,7 +10,7 @@
 //! [`endpoint_builder`], then hand it to [`create_endpoint`].
 
 use crate::relay::{
-    EndpointSlot, RelayConfig, RelayProbes, qad_wait, wait_online_beside,
+    EndpointSlot, RelayConfig, RelayProbes, online_timeout, qad_wait, wait_online_beside,
 };
 use anyhow::{Context, Result};
 use futures::FutureExt;
@@ -295,7 +295,7 @@ pub async fn create_endpoint(
     let qad_wait = qad_wait(relay_config, &endpoint);
     info!(
         "Waiting for endpoint to come online (timeout: {}s)...",
-        (crate::relay::RELAY_CONNECT_TIMEOUT + qad_wait).as_secs()
+        online_timeout(relay_config, &endpoint).as_secs()
     );
     let outcome = wait_online_beside(&endpoint, &relays, qad_wait).await;
     // Not cancelled: whatever follows is up to this function's own paths.
@@ -365,7 +365,7 @@ impl Drop for CloseIfCancelled {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::QAD_PROBES_TIMEOUT;
+    use crate::relay::{QAD_PROBES_TIMEOUT, RELAY_CONNECT_TIMEOUT};
     use iroh::{RelayMode, RelayUrl};
 
     fn relay_only() -> EndpointOptions {
@@ -415,6 +415,10 @@ mod tests {
         assert_eq!(qad_wait(&off, &with_ip), Duration::ZERO);
         assert_eq!(qad_wait(&on, &without_ip), Duration::ZERO);
         assert_eq!(qad_wait(&RelayConfig::Default, &with_ip), Duration::ZERO);
+        assert_eq!(online_timeout(&on, &with_ip), RELAY_CONNECT_TIMEOUT + QAD_PROBES_TIMEOUT);
+        assert_eq!(online_timeout(&off, &with_ip), RELAY_CONNECT_TIMEOUT);
+        assert_eq!(online_timeout(&on, &without_ip), RELAY_CONNECT_TIMEOUT);
+        assert_eq!(online_timeout(&RelayConfig::Default, &with_ip), RELAY_CONNECT_TIMEOUT);
         with_ip.close().await;
         without_ip.close().await;
     }

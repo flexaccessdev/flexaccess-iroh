@@ -49,6 +49,18 @@ pub(crate) fn qad_wait(relay_config: &RelayConfig, endpoint: &Endpoint) -> Durat
     if qad { QAD_PROBES_TIMEOUT } else { Duration::ZERO }
 }
 
+/// How long `endpoint`, freshly bound from `relay_config` (with
+/// [`crate::endpoint::endpoint_builder`]), may take to come online while its
+/// relay map stays as bound: [`RELAY_CONNECT_TIMEOUT`] plus iroh's QAD probe
+/// timeout when the endpoint runs QUIC address discovery on custom relays
+/// (see [`QAD_PROBES_TIMEOUT`]). For a caller that binds an endpoint and waits
+/// on [`Endpoint::online`] itself, without the startup probe of
+/// [`crate::endpoint::create_endpoint`] (which also allows for the probe
+/// taking relays out of the map).
+pub fn online_timeout(relay_config: &RelayConfig, endpoint: &Endpoint) -> Duration {
+    RELAY_CONNECT_TIMEOUT + qad_wait(relay_config, endpoint)
+}
+
 /// Relay configuration, resolved once from the raw config strings.
 ///
 /// This is the single source of the default-vs-custom distinction. It selects
