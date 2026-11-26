@@ -225,7 +225,11 @@ still fail the start. From the start that is one report (13 s). After a relay
 is taken out it is two (16 s): iroh runs one report at a time, so the map
 change waits behind the report already running, which may still home the
 endpoint on a relay just taken out, and any later change joins the one
-queued. A relay-only endpoint, or one with QAD off, gets 10 s.
+queued. A relay-only endpoint, or one with QAD off, gets 10 s. An application
+that binds an endpoint itself and waits on `online()` without the probe (a
+mid-session rebuild, say) gets the one-report window from
+`relay::online_timeout`. The default relays serve QAD too, so an endpoint on
+them with IP transports also gets 13 s, at startup as well.
 
 **Known limitation (iroh 1.5).** iroh's queue holds one pending report and
 keeps only the latest reason for it, so a port-mapping update (or the

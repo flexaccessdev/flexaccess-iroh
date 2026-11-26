@@ -40,13 +40,27 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const QAD_PROBES_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long each net report of `endpoint`, bound from `relay_config`, may
-/// wait on QAD: [`QAD_PROBES_TIMEOUT`] when it probes the custom relays for
-/// QAD, zero otherwise. With the default relays there is no probe to match.
+/// wait on QAD: [`QAD_PROBES_TIMEOUT`] when it probes its relays for QAD,
+/// zero otherwise. iroh's default relays all serve QAD, so with them it is
+/// only a question of IP transports.
 pub(crate) fn qad_wait(relay_config: &RelayConfig, endpoint: &Endpoint) -> Duration {
     // iroh runs QAD only on an endpoint with IP transports, so a relay-only
     // one (no bound sockets) never waits for it.
-    let qad = relay_config.quic_addr_discovery() == Some(true) && !endpoint.bound_sockets().is_empty();
+    let qad = relay_config.quic_addr_discovery() != Some(false) && !endpoint.bound_sockets().is_empty();
     if qad { QAD_PROBES_TIMEOUT } else { Duration::ZERO }
+}
+
+/// How long `endpoint`, freshly bound from `relay_config` (with
+/// [`crate::endpoint::endpoint_builder`]), may take to come online while its
+/// relay map stays as bound: [`RELAY_CONNECT_TIMEOUT`] plus iroh's QAD probe
+/// timeout when the endpoint runs QUIC address discovery: it has IP
+/// transports, and its relays are the default ones or custom relays with QAD
+/// on (see [`QAD_PROBES_TIMEOUT`]). For a caller that binds an endpoint and waits
+/// on [`Endpoint::online`] itself, without the startup probe of
+/// [`crate::endpoint::create_endpoint`] (which also allows for the probe
+/// taking relays out of the map).
+pub fn online_timeout(relay_config: &RelayConfig, endpoint: &Endpoint) -> Duration {
+    RELAY_CONNECT_TIMEOUT + qad_wait(relay_config, endpoint)
 }
 
 /// Relay configuration, resolved once from the raw config strings.
