@@ -117,7 +117,7 @@ impl PendingCloses {
 ///
 /// # Panics
 ///
-/// Panics if called outside a Tokio runtime, or on one built without the
+/// Panics if polled outside a Tokio runtime, or on one built without the
 /// time driver enabled.
 pub async fn close_endpoint(endpoint: Endpoint, closes: &PendingCloses) {
     let id = endpoint.id();
