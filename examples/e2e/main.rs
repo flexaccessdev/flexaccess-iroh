@@ -125,10 +125,11 @@ struct RelayArgs {
 
 impl RelayArgs {
     fn resolve(&self) -> Result<RelayConfig> {
-        let mut config = RelayConfig::from_urls_with_token(&self.relay_urls, self.relay_auth_token.clone())?;
-        if self.no_quic_addr_discovery {
-            config = config.with_quic_addr_discovery(false)?;
-        }
+        let config = RelayConfig::from_settings(
+            &self.relay_urls,
+            self.relay_auth_token.clone(),
+            self.no_quic_addr_discovery.then_some(false),
+        )?;
         if self.relay_only && !config.is_custom() {
             bail!("--relay-only requires custom relays (--relay-url)");
         }

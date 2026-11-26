@@ -10,7 +10,7 @@
 //! [`endpoint_builder`], then hand it to [`create_endpoint`].
 
 use crate::relay::{
-    EndpointSlot, RelayConfig, RelayProbes, online_timeout, qad_wait, wait_online_beside,
+    EndpointSlot, ReinsertRelay, RelayConfig, RelayProbes, online_timeout, qad_wait, wait_online_beside,
 };
 use anyhow::{Context, Result};
 use futures::FutureExt;
@@ -24,6 +24,7 @@ use log::{info, warn};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::runtime::Runtime;
 use tokio::task::{AbortHandle, JoinHandle};
 
 /// Bound wait on the graceful close of an endpoint being given up on: one
@@ -44,7 +45,9 @@ pub const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every caller of [`create_endpoint`] hands one in, and so decides what
 /// becomes of them. A runtime that goes away takes the closes still running
 /// on it along, so a caller whose runtime ends with its request waits for
-/// [`PendingCloses::finished`] before letting it go. A process whose runtime
+/// [`PendingCloses::finished`] before letting it go; one that cannot wait
+/// without a limit gives the runtime to [`tear_down_runtime`], which bounds
+/// the wait and not the closes. A process whose runtime
 /// lasts has nothing to do with them — they finish by themselves — and can
 /// drop the set, which leaves them running. Clones share one set.
 #[derive(Debug, Clone, Default)]
@@ -151,6 +154,63 @@ async fn closed_within(
 ) -> bool {
     let close = closes.kept(tokio::spawn(close));
     tokio::time::timeout(limit, close).await.is_ok()
+}
+
+/// Run `teardown` on `runtime` to its end and then shut the runtime down,
+/// waiting at most `limit` for that. Whether the teardown was over in time.
+///
+/// For a caller that owns the runtime its endpoints live on and is done with
+/// both: a session being stopped, a one-off request. What it owes those
+/// endpoints is `teardown` (closing them, and then
+/// [`PendingCloses::finished`]), and all of it has to be over before the
+/// runtime goes, since a runtime that goes away takes what is still running
+/// on it along: an endpoint mid-close, one still being built, a relay probe.
+/// But such a caller cannot wait without a limit either. iroh's close has no
+/// deadline, and a teardown can sit behind an endpoint that is still coming
+/// online.
+///
+/// So only the wait is bounded. `teardown` runs as a task on `runtime`. Over
+/// within `limit`, the runtime is shut down and this returns `true`. Still
+/// running then, this returns `false` and the runtime is handed to a thread
+/// named `thread_name`, which keeps it until the teardown is over and shuts
+/// it down then. Should that thread fail to start, the runtime is shut down
+/// with the teardown unfinished, as a caller without this function would
+/// have done.
+///
+/// The shutdown never blocks ([`Runtime::shutdown_background`]): whatever
+/// else is on the runtime is dropped with it, so `teardown` is everything
+/// that must finish.
+///
+/// # Panics
+///
+/// Panics if called from within a Tokio runtime (it blocks on `runtime` for
+/// the wait), or with a runtime built without the time driver.
+pub fn tear_down_runtime(
+    runtime: Runtime,
+    teardown: impl Future<Output = ()> + Send + 'static,
+    limit: Duration,
+    thread_name: &str,
+) -> bool {
+    let mut teardown = runtime.spawn(teardown);
+    // A teardown that panicked is over all the same.
+    let in_time = runtime.block_on(async { tokio::time::timeout(limit, &mut teardown).await.is_ok() });
+    if in_time {
+        runtime.shutdown_background();
+        return true;
+    }
+    warn!(
+        "Teardown is still running after {}s; leaving it to finish in the background",
+        limit.as_secs()
+    );
+    // A closure that never runs is dropped, and the runtime with it.
+    let kept = std::thread::Builder::new().name(thread_name.to_string()).spawn(move || {
+        drop(runtime.block_on(teardown));
+        runtime.shutdown_background();
+    });
+    if let Err(e) = kept {
+        warn!("Could not keep the runtime for the teardown ({e}); it is cut short");
+    }
+    false
 }
 
 /// What an application decides about every endpoint it builds.
@@ -264,6 +324,13 @@ pub struct CreatedEndpoint {
 /// comes back through the failover's restore probe; see
 /// [`CreatedEndpoint::relays`].
 ///
+/// iroh 1.5 can lose the net report that taking a relay out asks for, which
+/// would leave the endpoint homed on that relay and the start timing out
+/// beside a relay that works. So while the endpoint stays offline after a
+/// relay was taken out, a relay still in the map is re-inserted unchanged
+/// every few seconds, which asks for the report again (see
+/// `docs/relays-and-address-lookup.md`).
+///
 /// On failure after binding the endpoint is closed before the error
 /// propagates (iroh aborts a bound endpoint dropped without `close()`). The
 /// close is waited for up to 5 s, so a slow teardown cannot keep the error
@@ -297,7 +364,11 @@ pub async fn create_endpoint(
         "Waiting for endpoint to come online (timeout: {}s)...",
         online_timeout(relay_config, &endpoint).as_secs()
     );
-    let outcome = wait_online_beside(&endpoint, &relays, qad_wait).await;
+    let mut refresh = ReinsertRelay {
+        endpoint: &endpoint,
+        relay_config,
+    };
+    let outcome = wait_online_beside(&endpoint, &relays, qad_wait, &mut refresh).await;
     // Not cancelled: whatever follows is up to this function's own paths.
     cancelled.disarm(outcome.is_err());
     if let Err(e) = outcome {
@@ -434,6 +505,65 @@ mod tests {
         without_ip.close().await;
         default_with_ip.close().await;
         default_without_ip.close().await;
+    }
+
+    /// `create_endpoint` can be spawned and boxed as `Send`, as consumers do
+    /// with it (a destination's endpoint is built on a task).
+    #[test]
+    fn creating_an_endpoint_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let config = RelayConfig::Default;
+        let closes = PendingCloses::new();
+        assert_send(create_endpoint(&config, endpoint_builder(&config, relay_only()), &closes));
+    }
+
+    /// A teardown over within its limit: the runtime is shut down with
+    /// nothing left on it. One that outlasts the limit is not waited for, and
+    /// runs to its end all the same on the runtime, which is kept for it. On
+    /// either flavor of runtime.
+    #[test]
+    fn a_teardown_outlasting_its_wait_keeps_the_runtime() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+        use tokio::runtime::Builder;
+
+        let runtimes = || {
+            [
+                Builder::new_current_thread().enable_all().build().unwrap(),
+                Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap(),
+            ]
+        };
+
+        for runtime in runtimes() {
+            let (done, finished) = mpsc::channel();
+            let teardown = async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                done.send(()).unwrap();
+            };
+            assert!(tear_down_runtime(runtime, teardown, Duration::from_secs(10), "test-teardown"));
+            finished.try_recv().expect("over when the call returns");
+        }
+
+        for runtime in runtimes() {
+            let (done, finished) = mpsc::channel();
+            let teardown = async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                // Needs the runtime alive: a second timer, and a task on it.
+                tokio::spawn(tokio::time::sleep(Duration::from_millis(50))).await.unwrap();
+                done.send(std::thread::current().name().map(str::to_string)).unwrap();
+            };
+            let started = Instant::now();
+            assert!(!tear_down_runtime(runtime, teardown, Duration::from_millis(50), "test-teardown"));
+            assert!(started.elapsed() < Duration::from_millis(350), "waited only for the limit");
+            assert!(finished.try_recv().is_err(), "still tearing down");
+            let thread = finished
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the teardown ran to its end on the kept runtime");
+            // A current-thread runtime runs it on the thread that keeps it.
+            if let Some(thread) = thread.filter(|name| !name.starts_with("tokio")) {
+                assert_eq!(thread, "test-teardown");
+            }
+        }
     }
 
     /// A close that takes its time is waited for up to the limit and no

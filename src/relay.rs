@@ -39,6 +39,63 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// its probe's window would pass the probe and still fail the start.
 pub const QAD_PROBES_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long after a net report's worth of time ([`qad_wait`]) an endpoint
+/// that the startup probe took a relay away from may stay offline before its
+/// net report is asked for again, and then again at that interval (see
+/// `wait_online_beside`).
+///
+/// Taking a relay out of the map asks iroh for a full net report, which is
+/// what homes the endpoint on a relay still in it. iroh 1.5 keeps one report
+/// queued and only the latest reason for it, so a port-mapping update or its
+/// periodic refresh that lands behind the map change replaces it, and the
+/// report that then runs is incremental: it leaves the endpoint homed on the
+/// relay just taken out, or without a home relay, until a later full report
+/// (minutes away with QAD on). Asking again is what gets that report run. The
+/// interval leaves a report already under way the time to finish and the
+/// relay connection behind it the time to come up, so a start that is going
+/// well is not asked twice.
+pub(crate) const REHOME_GRACE: Duration = Duration::from_secs(2);
+
+/// Asks an endpoint for a fresh, full net report, abstracted so that the
+/// startup wait can be driven by a test double (see `wait_online_beside`).
+pub(crate) trait NetReportRefresh {
+    /// Ask for the report. `left_out` are the relays out of the relay map.
+    async fn refresh(&mut self, left_out: &[RelayUrl]);
+}
+
+/// The real endpoint, asked by re-inserting one of its relays unchanged: a
+/// relay-map change is what makes iroh run a full report, and this one
+/// changes nothing else.
+pub(crate) struct ReinsertRelay<'a> {
+    pub(crate) endpoint: &'a Endpoint,
+    pub(crate) relay_config: &'a RelayConfig,
+}
+
+impl NetReportRefresh for ReinsertRelay<'_> {
+    /// Re-insert the first configured relay that is not among `left_out`,
+    /// exactly as configured. Nothing to do with the default relays, or when
+    /// every relay is out.
+    async fn refresh(&mut self, left_out: &[RelayUrl]) {
+        let RelayConfig::Custom {
+            urls,
+            auth_token,
+            quic_addr_discovery,
+        } = self.relay_config
+        else {
+            return;
+        };
+        let Some(url) = urls.iter().find(|url| !left_out.contains(url)) else {
+            return;
+        };
+        info!(
+            "The endpoint is still offline after a relay was taken out of its relay map; \
+             re-inserting {url} unchanged to have iroh run a fresh net report"
+        );
+        let entry = relay_entry(url, auth_token.as_deref(), *quic_addr_discovery);
+        self.endpoint.insert_relay(url.clone(), Arc::new(entry)).await;
+    }
+}
+
 /// How long each net report of `endpoint`, bound from `relay_config`, may
 /// wait on QAD: [`QAD_PROBES_TIMEOUT`] when it probes its relays for QAD,
 /// zero otherwise. iroh's default relays all serve QAD, so with them it is
@@ -184,6 +241,27 @@ impl RelayConfig {
             auth_token,
             quic_addr_discovery: true,
         })
+    }
+
+    /// The relay configuration from an application's settings as it has
+    /// them: the relay URLs, the shared auth token, and whether the custom
+    /// relays serve QUIC address discovery. [`Self::from_urls_with_token`],
+    /// then [`Self::with_quic_addr_discovery`] when `quic_addr_discovery` is
+    /// set.
+    ///
+    /// Unset keeps the default, on. Set, either way, it is an error with the
+    /// default relays, as a token is: a setting with nothing to apply to is
+    /// a misconfiguration, surfaced before the endpoint starts.
+    pub fn from_settings(
+        urls: &[String],
+        auth_token: Option<String>,
+        quic_addr_discovery: Option<bool>,
+    ) -> Result<Self> {
+        let config = Self::from_urls_with_token(urls, auth_token)?;
+        match quic_addr_discovery {
+            Some(enabled) => config.with_quic_addr_discovery(enabled),
+            None => Ok(config),
+        }
     }
 
     /// Say whether the custom relays serve QUIC address discovery (QAD), all
@@ -679,10 +757,17 @@ async fn apply_relay_probes(
 /// on a relay that cannot be connected re-home on one that can. Nor does the
 /// wait end while a probe is still running, which may yet take out the relay
 /// that keeps it offline.
+///
+/// Once a relay has been taken out, `refresh` is asked, with the relays out
+/// of the map, every `qad_wait` plus [`REHOME_GRACE`] for as long as the
+/// endpoint stays offline: iroh can lose the net report a relay-map change
+/// asks for (see [`REHOME_GRACE`]), and `refresh` asks for it again
+/// ([`ReinsertRelay`]).
 pub(crate) async fn wait_online_beside(
     endpoint: &Endpoint,
     probes: &RelayProbes,
     qad_wait: Duration,
+    refresh: &mut impl NetReportRefresh,
 ) -> Result<()> {
     // Online means connected to a relay. A probe is a connection of its own
     // and can fail on a relay the endpoint is connected through, so every
@@ -706,7 +791,11 @@ pub(crate) async fn wait_online_beside(
         )
     };
     let mut deadline = Some(Instant::now() + window);
-    let mut left_out = 0;
+    let mut left_out: Vec<RelayUrl> = Vec::new();
+    // When to ask for the net report again; `None` until a relay is taken
+    // out.
+    let refresh_every = qad_wait + REHOME_GRACE;
+    let mut refresh_at = None;
     let mut probing = true;
     let online = endpoint.online();
     tokio::pin!(online);
@@ -723,6 +812,13 @@ pub(crate) async fn wait_online_beside(
                 }
                 deadline = None;
             }
+            () = sleep_until_opt(refresh_at) => {
+                if connected() {
+                    return Ok(());
+                }
+                refresh.refresh(&left_out).await;
+                refresh_at = Some(Instant::now() + refresh_every);
+            }
             progress = probes.changed(), if probing => {
                 let Some(progress) = progress else {
                     probing = false;
@@ -736,10 +832,13 @@ pub(crate) async fn wait_online_beside(
                     return Err(progress.all_failed_error());
                 }
                 probing = !progress.settled();
-                if progress.left_out.len() > left_out {
-                    left_out = progress.left_out.len();
+                if progress.left_out.len() > left_out.len() {
+                    left_out.clone_from(&progress.left_out);
                     window = RELAY_CONNECT_TIMEOUT + 2 * qad_wait;
-                    deadline = Some(Instant::now() + window);
+                    let now = Instant::now();
+                    deadline = Some(now + window);
+                    // The map change just made asks for a report itself.
+                    refresh_at = Some(now + refresh_every);
                 } else if deadline.is_none() && !probing {
                     return Err(timed_out(window));
                 }
@@ -815,6 +914,24 @@ mod tests {
             panic!("custom relays give a custom relay map");
         };
         assert!(map.get(&RELAY.parse::<RelayUrl>().unwrap()).unwrap().quic.is_some());
+    }
+
+    /// The settings constructor is the token constructor plus the QUIC
+    /// address discovery setting when one is given, with the same rules.
+    #[test]
+    fn from_settings_takes_the_quic_addr_discovery_setting_when_given() {
+        let unset = RelayConfig::from_settings(&two(), Some("token".into()), None).unwrap();
+        assert_eq!(unset, RelayConfig::from_urls_with_token(&two(), Some("token".into())).unwrap());
+        assert_eq!(unset.quic_addr_discovery(), Some(true));
+        for enabled in [true, false] {
+            let set = RelayConfig::from_settings(&two(), None, Some(enabled)).unwrap();
+            assert_eq!(set.quic_addr_discovery(), Some(enabled));
+            // With the default relays there is nothing for it to apply to.
+            assert!(RelayConfig::from_settings(&[], None, Some(enabled)).is_err());
+        }
+        assert_eq!(RelayConfig::from_settings(&[], None, None).unwrap(), RelayConfig::Default);
+        assert!(RelayConfig::from_settings(&[], Some("token".into()), None).is_err());
+        assert!(RelayConfig::from_settings(&["not a url".to_string()], None, None).is_err());
     }
 
     #[test]
@@ -976,6 +1093,17 @@ mod tests {
         assert_eq!(cfg.relay_auth_token(), None);
     }
 
+    /// A [`NetReportRefresh`] that only records being asked: when, on the
+    /// (paused) clock, and with which relays out.
+    #[derive(Default)]
+    struct Asked(Vec<(Instant, Vec<RelayUrl>)>);
+
+    impl NetReportRefresh for Asked {
+        async fn refresh(&mut self, left_out: &[RelayUrl]) {
+            self.0.push((Instant::now(), left_out.to_vec()));
+        }
+    }
+
     /// A probe that has already settled, every relay failed, when the wait
     /// begins: the start fails at once with why, not after the timeout.
     #[tokio::test]
@@ -999,7 +1127,7 @@ mod tests {
         drop(tx);
         let err = tokio::time::timeout(
             Duration::from_secs(1),
-            wait_online_beside(&endpoint, &RelayProbes(rx), Duration::ZERO),
+            wait_online_beside(&endpoint, &RelayProbes(rx), Duration::ZERO, &mut Asked::default()),
         )
         .await
         .expect("no wait for the timeout")
@@ -1039,7 +1167,7 @@ mod tests {
             ..ProbeProgress::default()
         });
         let started = Instant::now();
-        let err = wait_online_beside(&endpoint, &RelayProbes(rx), qad)
+        let err = wait_online_beside(&endpoint, &RelayProbes(rx), qad, &mut Asked::default())
             .await
             .expect_err("never online");
         assert_took(started, RELAY_CONNECT_TIMEOUT + qad);
@@ -1064,15 +1192,126 @@ mod tests {
             std::future::pending::<()>().await
         };
         let probes = RelayProbes(rx);
+        let mut asked = Asked::default();
         let started = Instant::now();
         let err = tokio::select! {
-            outcome = wait_online_beside(&endpoint, &probes, qad) => {
+            outcome = wait_online_beside(&endpoint, &probes, qad, &mut asked) => {
                 outcome.expect_err("never online")
             }
             () = probe => unreachable!(),
         };
         assert_took(started, Duration::from_secs(5) + RELAY_CONNECT_TIMEOUT + 2 * qad);
         assert!(err.to_string().contains("after 16s"), "unexpected error: {err}");
+        endpoint.close().await;
+    }
+
+    /// An endpoint that stays offline after the probe took a relay out has
+    /// its net report asked for again, a QAD wait plus [`REHOME_GRACE`] after
+    /// the removal and at that interval from then on, with the relays that
+    /// are out; one that lost no relay is never asked.
+    #[tokio::test(start_paused = true)]
+    async fn the_startup_wait_asks_for_the_net_report_again_after_a_removal() {
+        // No relays: never online, and no relay traffic.
+        let endpoint = Endpoint::builder(presets::Empty)
+            .relay_mode(RelayMode::Disabled)
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .bind()
+            .await
+            .unwrap();
+        let out: RelayUrl = RELAY.parse().unwrap();
+        let secs = |secs: &[u64]| secs.iter().map(|s| Duration::from_secs(*s)).collect::<Vec<_>>();
+
+        // (QAD wait, when the report is asked for again): a relay taken out
+        // at 5 s, with the window then open until 5 s + 10 s + two QAD waits.
+        for (qad, expected) in [
+            (QAD_PROBES_TIMEOUT, secs(&[10, 15, 20])),
+            (Duration::ZERO, secs(&[7, 9, 11, 13])),
+        ] {
+            let (tx, rx) = watch::channel(ProbeProgress {
+                total: 2,
+                ..ProbeProgress::default()
+            });
+            let probe = async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                tx.send_modify(|progress| {
+                    progress.probed = 2;
+                    progress.failures.push((out.clone(), "down".to_string()));
+                    progress.left_out.push(out.clone());
+                });
+                std::future::pending::<()>().await
+            };
+            let started = Instant::now();
+            let mut asked = Asked::default();
+            let probes = RelayProbes(rx);
+            tokio::select! {
+                outcome = wait_online_beside(&endpoint, &probes, qad, &mut asked) => {
+                    outcome.expect_err("never online");
+                }
+                () = probe => unreachable!(),
+            }
+            let (at, left_out): (Vec<_>, Vec<_>) = asked.0.into_iter().unzip();
+            let at: Vec<_> = at.into_iter().map(|at| at - started).collect();
+            assert_eq!(at, expected, "QAD wait {qad:?}");
+            assert!(left_out.iter().all(|left_out| left_out == std::slice::from_ref(&out)));
+        }
+
+        // Nothing taken out: the map never changed, so no report was lost.
+        let (_tx, rx) = watch::channel(ProbeProgress {
+            total: 1,
+            probed: 1,
+            ..ProbeProgress::default()
+        });
+        let mut asked = Asked::default();
+        wait_online_beside(&endpoint, &RelayProbes(rx), Duration::ZERO, &mut asked)
+            .await
+            .expect_err("never online");
+        assert!(asked.0.is_empty(), "no relay was taken out");
+        endpoint.close().await;
+    }
+
+    /// Asking for a fresh net report re-inserts a relay that is still in the
+    /// map, as configured, and never one that was taken out.
+    #[tokio::test]
+    async fn refreshing_the_net_report_re_inserts_a_relay_still_in_the_map() {
+        let config = RelayConfig::from_settings(&two(), Some("token".into()), Some(false)).unwrap();
+        let [first, second]: [RelayUrl; 2] = two().map(|url| url.parse().unwrap());
+        // No sockets: the relays here are never reached.
+        let bind = || async {
+            Endpoint::builder(presets::Empty)
+                .relay_mode(config.relay_mode())
+                .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .clear_ip_transports()
+                .bind()
+                .await
+                .unwrap()
+        };
+
+        // The first relay is out: the second is the one re-inserted.
+        let endpoint = bind().await;
+        endpoint.remove_relay(&first).await.expect("in the relay map");
+        let mut reinsert = ReinsertRelay {
+            endpoint: &endpoint,
+            relay_config: &config,
+        };
+        reinsert.refresh(std::slice::from_ref(&first)).await;
+        assert!(endpoint.remove_relay(&first).await.is_none(), "stays out");
+        let entry = endpoint.remove_relay(&second).await.expect("still in the relay map");
+        assert!(entry.quic.is_none(), "as configured: QUIC address discovery off");
+        endpoint.close().await;
+
+        // Every relay out: nothing to re-insert.
+        let endpoint = bind().await;
+        for url in [&first, &second] {
+            endpoint.remove_relay(url).await.expect("in the relay map");
+        }
+        let mut reinsert = ReinsertRelay {
+            endpoint: &endpoint,
+            relay_config: &config,
+        };
+        reinsert.refresh(&[first.clone(), second.clone()]).await;
+        for url in [&first, &second] {
+            assert!(endpoint.remove_relay(url).await.is_none(), "{url} stays out");
+        }
         endpoint.close().await;
     }
 
