@@ -46,7 +46,7 @@ jobs:
       - name: Pin iroh to the lower bound
         run: |
           MIN=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[0].dependencies[] | select(.name == "iroh") | .req' \
+            | jq -r '.packages[0].dependencies[] | select(.name == "iroh" and .kind == null) | .req' \
             | grep -oE '>=[0-9]+\.[0-9]+\.[0-9]+' | tr -d '>=')
           echo "minimum iroh: $MIN"
           cargo update -p iroh --precise "$MIN"
@@ -55,11 +55,13 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
-  # The end-to-end suites that need no public infrastructure: the auth
-  # transcript and connectivity over two local iroh-relay instances, and the
-  # relay failover scenarios (which take ~8 minutes by design: a 60 s outage
-  # window and a 90 s restore probe relay-only, then another 60 s window with
-  # direct paths allowed). See e2e/README.md.
+  # The end-to-end suites over local iroh-relay instances: the auth transcript
+  # and connectivity, QUIC address discovery, and the relay failover scenarios
+  # (which take ~8 minutes by design: a 60 s outage window and a 90 s restore
+  # probe relay-only, then another 60 s window with direct paths allowed). The
+  # QUIC address discovery suite runs once more at the end against n0's public
+  # relays alone (--n0-only), its only check that QAD answers. See
+  # e2e/README.md.
   e2e:
     name: e2e (local relays)
     runs-on: ubuntu-latest
@@ -90,3 +92,10 @@ jobs:
         run: ./e2e/run_quic_addr_discovery.sh
       - name: Relay failover
         run: ./e2e/run_relay_failover.sh
+      # Last, and whatever came before: it depends on n0's public relays, so
+      # its failure says nothing about the local suites and must not skip them.
+      # n0 only: the local section ran above, and its setup must not keep this
+      # one from running.
+      - name: QUIC address discovery (n0 relays)
+        if: ${{ !cancelled() }}
+        run: ./e2e/run_quic_addr_discovery.sh --n0-only

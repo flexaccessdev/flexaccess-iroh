@@ -9,7 +9,8 @@
 //! - [`relay`]: the default-vs-custom [`relay::RelayConfig`] (which also decides
 //!   whether n0 internet discovery is on; custom relays are deduplicated, and a
 //!   single one runs in reduced-redundancy mode, with no failover), the shared
-//!   relay auth token, and the per-relay startup probe.
+//!   relay auth token, the all-or-none QUIC address discovery setting of the
+//!   custom relays, and the per-relay startup probe.
 //! - [`endpoint`]: the common endpoint builder and the bind-and-come-online
 //!   policy.
 //! - [`relay_failover`]: the server-side home-relay failover that moves the

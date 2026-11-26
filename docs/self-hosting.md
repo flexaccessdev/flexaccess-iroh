@@ -24,8 +24,7 @@ for its lifetime), unless the endpoint is connected through it or it is the
 last relay left. The process refuses to start when every probe fails and the
 endpoint is not connected, or when the endpoint is still not online 10 s after
 startup began or a probe last took a relay out of the map (only that restarts
-the 10 s; turning QUIC address discovery on for a relay does not), with any
-probe still running then waited for first. A startup timeout does not by
+the 10 s), with any probe still running then waited for first. A startup timeout does not by
 itself mean that every relay failed its probe. A dead backup relay is therefore loud at startup but not fatal, so
 watch the logs: a relay list that is only half up has no failover left. Plan
 your relay list accordingly (at least two distinct relays; a single relay is accepted as reduced-redundancy mode, with a startup warning and no failover), and
@@ -92,18 +91,12 @@ manual_key_path = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
 # hostname = "relay.example.com"
 ```
 
-Keep UDP 7842 reachable from where clients run: the programs check each
-custom relay for QUIC address discovery at startup and use it only on the
-relays that answer.
-
-A certificate from a private CA instead of a public one is trusted through
-`RelayConfig::with_extra_ca_roots`, which every endpoint the crate builds
-uses, the relay probes and the `/healthz` check included; the programs
-decide how a user supplies the CA. It goes into those endpoints' TLS
-config, so iroh's pkarr publisher and resolver trust it too if a program
-adds them, as does any other address lookup that uses that config; their
-DNS-over-HTTPS fallbacks keep the public roots. The QUIC address discovery check counts
-a relay whose certificate is not trusted as not serving it.
+Keep UDP 7842 reachable from where clients run: with QUIC address discovery on
+(the default), every endpoint probes it on the custom relays, and relays that
+do not answer can delay an endpoint's start by up to iroh's 3 s probe timeout. The
+setting is all or none (`RelayConfig::with_quic_addr_discovery`), so a relay
+list mixing this setup with the Cloudflare Tunnel one below pays that timeout
+for the tunnelled relays, or turns QUIC address discovery off for all.
 
 ## Simple production setup: relay behind Cloudflare Tunnel (single TCP port)
 
@@ -176,10 +169,10 @@ cloudflared tunnel run --token <token>
 > there is no QUIC endpoint, disables QUIC address discovery (one of the signals
 > iroh uses to help peers hole-punch to a direct connection). For a relay whose
 > job is a pure relay-only fallback this is fine; if you want to maximize direct
-> P2P success, use the TLS + QUIC production config above instead. The programs
-> detect that such a relay does not serve QUIC address discovery and stop
-> probing it for that, which would otherwise delay every endpoint start by 3 s
-> (see
+> P2P success, use the TLS + QUIC production config above instead. Configure
+> the programs with QUIC address discovery off for such relays
+> (`RelayConfig::with_quic_addr_discovery(false)`): left on, iroh probes them
+> for it and an endpoint's start can wait up to its 3 s probe timeout (see
 > [relays-and-address-lookup.md](relays-and-address-lookup.md#quic-address-discovery-on-custom-relays)).
 
 ## Relay access token

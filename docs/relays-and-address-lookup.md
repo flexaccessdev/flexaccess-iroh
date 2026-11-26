@@ -125,58 +125,71 @@ private relay must configure the same token.
 
 QUIC address discovery (QAD) is a QUIC endpoint a relay can run on UDP 7842
 that tells an iroh endpoint its public address, one of the signals hole
-punching uses. iroh assumes every relay given by URL serves it, and probes it
-on every relay in the map at the start of each full network report.
+punching uses. iroh assumes every relay given by URL serves it, and at the
+start of each full network report probes it on up to five relays in the map,
+over IPv4 and, where the endpoint has it, IPv6. It stops early once it has
+enough replies (three, or as many as there are relays when the map holds
+fewer, counting a relay's IPv4 and IPv6 replies separately) and at least one
+probe has finished in each address family it tried.
 
 Probing a relay that does not serve it is not free. iroh does not pick a home
 relay until its QAD probes finish, and a probe to a relay with nothing on UDP
 7842 waits out the probe timeout: **3 s on iroh 1.5** (`PROBES_TIMEOUT`,
-net_report). An endpoint is not online until it has a home relay, so that 3 s
-lands on every start of every program, and again on each later full report
-(network changes, every 5 minutes). Measured on 2026-11-25 against two relays
-behind a Cloudflare Tunnel: the first report took 3.0 s with QAD probed and
-0.3 s without.
+net_report). When too few replies come back to stop early (none of the relays
+serves QAD, say, or one of two does not and the other replies over IPv4
+alone), or when no IPv6 probe finishes although enough IPv4 replies are in,
+the report waits up to that 3 s. An endpoint is not online until it has a home relay, so such a delay
+lands on its start, and can again on later full reports (network changes,
+every 5 minutes). Measured on 2026-11-25 against two relays behind a
+Cloudflare Tunnel: the first report took 3.0 s with QAD probed and 0.3 s
+without.
 
 A relay serves QAD only when it terminates TLS itself, runs
 `enable_quic_addr_discovery = true`, and has UDP 7842 reachable. A relay behind
 a Cloudflare Tunnel (see [self-hosting.md](self-hosting.md)) or any other
 HTTP-only front never does.
 
-So the crate **detects it per relay** instead of assuming it, as part of the
-startup probe (next section). The endpoint is bound with QAD off on every
-custom relay, and the probe turns it on, on the live endpoint, for each relay
-that answered (`ProbedRelays::quic_addr_discovery`). An endpoint that
-replaces it mid-session (`endpoint::rebuild_endpoint`) runs no probe of its
-own and starts with QAD on for the relays the first endpoint's probe found
-serving it, waiting for that probe to settle if it still runs. The probe runs
-once: a relay that did not answer QAD then (UDP blocked at the start, its QAD
-service briefly down) stays without it, in the first endpoint and in every
-rebuild, until the process restarts; only the failover's restore probe below
-checks again, for the relay it puts back. Next to each relay's probe endpoint, a second
-throwaway endpoint with UDP transports and QAD on runs a net report with only
-the QAD probes (`NetReportConfig::minimal`); its report shows UDP working
-only if the relay answered. The answer is whatever that endpoint learned by
-the time the relay probe came online, so the check adds no time of its own: a
-relay that serves QAD answers in about one round trip (85–150 ms against n0's
-relays, whose relay probes took 380–520 ms). A relay whose QAD answer is no
-faster than its relay connection (a network that drops UDP, a broken IPv6
-route) would hold the report back as well, so it counts as not serving QAD.
+A relay cannot be asked whether it serves QAD: the iroh relay advertises it
+nowhere (its `/healthz` reports only status and version), and a relay with
+nothing on UDP 7842 is told apart from a slow one only by waiting out a
+timeout, which is the delay to avoid. Nor does the answer belong to the relay
+alone: a network that drops UDP turns a relay that serves QAD into one that
+does not, for that endpoint.
 
-Reading the report needs iroh's `unstable-net-report` feature
-(`Endpoint::net_report`), which the crate enables. The failover's restore
-probe makes the same check, so a relay put back into the map gets QAD exactly
-when it answered then; a relay re-inserted unchanged keeps what it had. The
-default relays are not probed: n0's relays serve QAD, and iroh uses it there
-as before.
+So the application **says it, for all custom relays at once**:
+`RelayConfig::with_quic_addr_discovery(bool)`, on by default. The application
+knows how its relays are deployed, and a deployment's relays are normally all
+alike: all behind Cloudflare Tunnels, or all terminating TLS themselves.
 
-The answer is not checked again while the process runs: a relay found not
-serving QAD stays without it until the failover takes it out and puts it
-back, or the process restarts. A miss costs only the address that relay's QAD
-would have reported; any other relay that serves QAD still reports it.
+- **On** (the default): every relay is in the relay map exactly as iroh has it
+  (`iroh::RelayConfig::from(url)`, QAD on UDP 7842 at the URL's host), and iroh
+  does the rest. A relay whose QAD is down for a while can hold a full report
+  back by up to iroh's 3 s timeout, as it does in iroh; nothing in the crate
+  works around it.
+- **Off**: no relay is probed for QAD (`quic: None` on every entry), so no
+  report waits for it, and no relay reports the endpoint's public address.
+  For relays behind a Cloudflare Tunnel or any other HTTP-only front.
 
-A relay-only endpoint (`EndpointOptions::relay_only`) has no IP transports
-and cannot use QAD, so neither the startup probe nor the failover checks for
-it: those probes send no UDP at all.
+The setting goes everywhere the crate puts a relay into a map: the endpoint's
+relay map (`RelayConfig::relay_mode`), and the failover's re-insertions and
+restores. An application that replaces its endpoint mid-session builds the
+replacement from the same `RelayConfig`, and so gets the same setting. It is an error with the default relays, whichever value is given:
+n0's relays serve QAD, and iroh uses it there as it always does.
+
+Measured on 2026-11-26 with `e2e/run_quic_addr_discovery.sh --n0`, time from
+bind to online:
+
+| Relays | QAD on | QAD off |
+|---|---|---|
+| two local relays, neither serving QAD | 3009 ms | 210 ms |
+| n0's `use1-1` and `euc1-1`, both serving QAD | 1160 ms | 1132 ms |
+
+In these two setups, leaving QAD on costs nothing on relays that all serve it,
+and the full timeout on relays where none does. Other mixes fall between, as
+above.
+
+A relay-only endpoint (`EndpointOptions::relay_only`) has no IP transports,
+so iroh never probes QAD on it whatever the setting.
 
 ## Custom relay validation: the per-relay startup probe
 
@@ -195,12 +208,10 @@ passed. **Startup fails when every probe fails and the endpoint is not
 connected, or when the endpoint is still not online 10 s after the wait began
 or a probe last took a relay out of the map**, so a startup timeout does not
 by itself mean that every relay failed its probe. Only taking a relay out
-restarts the 10 s: turning QUIC address discovery on for a relay changes the
-map too, but leaves the deadline where it was. A probe still running when the
-10 s are up is waited for, since it may yet take out the relay that keeps the
-endpoint offline. Each probe
-also checks its relay for QUIC address discovery, within the time the probe
-takes anyway (see [above](#quic-address-discovery-on-custom-relays)).
+restarts the 10 s. A probe still running when the 10 s are up is waited for,
+since it may yet take out the relay that keeps the endpoint offline. The probe
+checks relay connectivity only; QUIC address discovery is the application's
+setting (see [above](#quic-address-discovery-on-custom-relays)).
 
 `create_endpoint` returns as soon as the endpoint is online, so on healthy
 relays the probe costs the start nothing: it used to run ahead of the bind and
@@ -210,9 +221,7 @@ kept in the caller's `PendingCloses` like a slow close, and settles within
 the probe timeout plus the probe endpoints' bounded close
 (`RelayProbes::settled`). The task holds a handle to the endpoint while it
 runs, which keeps its UDP sockets bound; it lets go when the endpoint's close
-begins, so a caller that rebinds the same port right after closing awaits
-`RelayProbes::released` in between, which does not wait for the probes. That
-close also stops the probes still running, whose endpoints are closed on tasks
+begins. That close also stops the probes still running, whose endpoints are closed on tasks
 kept in `PendingCloses`: a process that shuts down right after its start,
 while a relay that does not answer is still being probed, drains those closes
 and does not wait out the probe timeout. A probe that fails on a relay the endpoint is connected through leaves that
@@ -236,7 +245,7 @@ resolving. The probe therefore takes it out of the live map (never the last
 relay left), which forces a fresh net report that re-homes the endpoint, and
 the wait for the endpoint restarts its 10 s from that change, so the endpoint
 gets a full window on the relays that work. The relays taken out are handed
-on (`CreatedEndpoint::relays`, `ProbedRelays::left_out`) for the failover to
+on (`CreatedEndpoint::relays`, `RelayProbes::settled`) for the failover to
 restore once they are connectable, using this same probe; a process that does
 not run the failover keeps them out for its lifetime. See
 [relay-failover.md](relay-failover.md#starting-during-an-outage).
