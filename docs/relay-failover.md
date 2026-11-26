@@ -162,8 +162,8 @@ through whichever relay it is homed on.
 The exclusion is temporary where the failover runs. `create_endpoint` returns
 `CreatedEndpoint { endpoint, relays }`, and the server passes `relays` to
 `fail_over_home_relay`, which waits for the probe to settle, restore-probes
-the relays it took out every 90 s, and re-inserts each once it is connectable. A relay is re-inserted with QUIC
-address discovery only if the restore probe found it serves it (see
+the relays it took out every 90 s, and re-inserts each once it is connectable. A relay is re-inserted as it is
+configured, QUIC address discovery included: the restore probe does not check for it (see
 [relays-and-address-lookup.md](relays-and-address-lookup.md#quic-address-discovery-on-custom-relays)). A process that does not run
 the failover (a client) keeps them out for its lifetime, which is the right
 call for something that lives one connection; a long-lived client that must

@@ -16,8 +16,8 @@ drifting across three repos.
 
 This design is also **code**, once: [`flexaccess-iroh`](../README.md), the
 Rust crate in this repository, which all three programs depend on by git tag.
-It carries `RelayConfig` (at
-least two custom relays) and the per-relay startup probe, the common endpoint
+It carries `RelayConfig` (one
+or more custom relays, a single one in reduced-redundancy mode) and the per-relay startup probe, the common endpoint
 builder (and relay-only mode), endpoint creation that runs the probe beside
 the endpoint and takes the relays that fail it out of the relay map, the server-side in-place home-relay failover that restores them, and
 the endpoint-bound public-key auth transcript over
