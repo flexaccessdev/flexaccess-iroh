@@ -250,13 +250,16 @@ start would time out although a remaining relay passed its probe, however
 long the window.
 
 So `create_endpoint` does not leave it at that. While the endpoint stays
-offline after a relay was taken out, it re-inserts a relay that is still in
-the map, unchanged: a relay-map change of its own, which asks iroh for the
-full report again and changes nothing else. The first time a report's worth
-of time after the removal (the QAD wait, when the endpoint runs QAD) plus
-2 s, so that a start that is going well is not asked twice, and at that
-interval from then on: every 5 s with QAD on, every 2 s without, which fits
-several requests into the window. A request can be replaced in the queue like
+offline after a relay was taken out, it re-inserts a relay that came online
+for its probe, unchanged: a relay-map change of its own, which asks iroh for
+the full report again and changes nothing else. Only such a relay is used,
+and none is re-inserted until one has come online: the probe is still
+changing the map then, and a relay that passed is the one kind it never takes
+out, so the request cannot put back a relay that is just being removed. The
+first time a report's worth of time after the removal (the QAD wait, when
+the endpoint runs QAD) plus 2 s, so that a start that is going well is not
+asked twice, and at that interval from then on: every 5 s with QAD on, every
+2 s without, which fits several requests into the window. A request can be replaced in the queue like
 the first one, but each takes a port-mapping update or a periodic refresh
 landing behind it again. The log says so each time (`re-inserting <url>
 unchanged to have iroh run a fresh net report`). This works on any iroh 1.5,
