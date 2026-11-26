@@ -159,8 +159,9 @@ server's clients, which dial with every configured relay as a hint, reach it
 through whichever relay it is homed on.
 
 The exclusion is temporary where the failover runs. `create_endpoint` returns
-`CreatedEndpoint { endpoint, relays }`, and the server passes `relays` to
-`fail_over_home_relay`, which waits for the probe to settle, restore-probes
+`CreatedEndpoint { endpoint, relays }`, and the server passes `relays` (and
+the same `PendingCloses`, which keeps the failover's probe tasks until their
+endpoints are closed) to `fail_over_home_relay`, which waits for the probe to settle, restore-probes
 the relays it took out every 90 s, and re-inserts each once it is connectable. A relay is re-inserted with QUIC
 address discovery only if the restore probe found it serves it, and the
 relays in the map not found serving it are probed for it again every 10
