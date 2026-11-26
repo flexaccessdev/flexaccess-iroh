@@ -213,7 +213,7 @@ struct EndpointRelays<'a> {
     urls: Vec<RelayUrl>,
     auth_token: Option<String>,
     /// The TLS trust the restore probes use ([`RelayConfig::extra_ca_roots`]).
-    ca: CaTlsConfig,
+    ca: Option<CaTlsConfig>,
     /// Whether the endpoint has IP transports, without which it cannot use
     /// QUIC address discovery and restore probes do not check for it.
     ip_transports: bool,
@@ -268,7 +268,7 @@ impl FailoverRelays for EndpointRelays<'_> {
         let probe = probe_relay(
             url,
             self.auth_token.as_deref(),
-            &self.ca,
+            self.ca.as_ref(),
             self.ip_transports,
             &closes,
         );

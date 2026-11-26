@@ -156,9 +156,15 @@ impl RelayConfig {
     /// self-signed one. An error with the default relays, which are never
     /// verified against anything but the public roots.
     ///
-    /// The roots are trusted for the relays alone: the endpoints' DNS
-    /// resolvers, whose DNS-over-HTTPS fallbacks are public servers, keep the
-    /// embedded roots only (see [`with_relay_tls`]).
+    /// iroh trusts an endpoint's roots for every TLS connection it makes
+    /// outside iroh's own, not only to its relays: a pkarr publisher or
+    /// resolver, or any other HTTPS address lookup a caller adds to the
+    /// builder, trusts these roots too. The one exception is the endpoint's
+    /// DNS resolver, whose DNS-over-HTTPS fallbacks are public servers: the
+    /// crate gives every endpoint built with extra roots a resolver of its
+    /// own that trusts the embedded roots alone. That resolver uses the ring
+    /// crypto provider the crate's builders set, whatever provider a caller
+    /// sets on the builder afterwards.
     pub fn with_extra_ca_roots(
         self,
         roots: impl IntoIterator<Item = CertificateDer<'static>>,
@@ -193,8 +199,10 @@ impl RelayConfig {
 
     /// The TLS trust for every endpoint built for these relays: iroh's default
     /// (the embedded Mozilla roots) with [`Self::extra_ca_roots`] added.
-    pub(crate) fn ca_tls_config(&self) -> CaTlsConfig {
-        CaTlsConfig::embedded().with_extra_roots(self.extra_ca_roots().iter().cloned())
+    /// `None` without extra roots, for iroh's default as it is.
+    pub(crate) fn ca_tls_config(&self) -> Option<CaTlsConfig> {
+        let roots = self.extra_ca_roots();
+        (!roots.is_empty()).then(|| CaTlsConfig::embedded().with_extra_roots(roots.iter().cloned()))
     }
 
     /// The custom relay URLs; empty for [`RelayConfig::Default`].
@@ -312,7 +320,12 @@ pub(crate) fn relay_entry(
 /// public servers: a private CA given for a relay
 /// ([`RelayConfig::with_extra_ca_roots`]) would be trusted to answer for
 /// those too. The resolver is otherwise the one iroh builds by default.
-pub(crate) fn with_relay_tls(builder: EndpointBuilder, ca: &CaTlsConfig) -> EndpointBuilder {
+/// Without a `ca` (no extra roots) the builder is left as it is, iroh's own
+/// resolver on whatever crypto provider the builder ends up with included.
+pub(crate) fn with_relay_tls(builder: EndpointBuilder, ca: Option<&CaTlsConfig>) -> EndpointBuilder {
+    let Some(ca) = ca else {
+        return builder;
+    };
     let dns_tls = CaTlsConfig::embedded()
         .client_config(Arc::new(rustls::crypto::ring::default_provider()))
         .expect("the embedded roots make a certificate verifier");
@@ -337,7 +350,7 @@ pub(crate) fn with_relay_tls(builder: EndpointBuilder, ca: &CaTlsConfig) -> Endp
 fn probe_endpoint_builder(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
-    ca: &CaTlsConfig,
+    ca: Option<&CaTlsConfig>,
 ) -> iroh::endpoint::Builder {
     let map = RelayMap::from_iter([relay_entry(relay_url, auth_token, false)]);
     // iroh 1.x requires the crypto provider to be set explicitly on the
@@ -359,7 +372,7 @@ fn probe_endpoint_builder(
 fn qad_endpoint_builder(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
-    ca: &CaTlsConfig,
+    ca: Option<&CaTlsConfig>,
 ) -> iroh::endpoint::Builder {
     let map = RelayMap::from_iter([relay_entry(relay_url, auth_token, true)]);
     with_relay_tls(Endpoint::builder(presets::Empty), ca)
@@ -422,7 +435,7 @@ pub(crate) struct RelayProbe {
 pub(crate) async fn probe_relay(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
-    ca: &CaTlsConfig,
+    ca: Option<&CaTlsConfig>,
     check_quic_addr_discovery: bool,
     closes: &PendingCloses,
 ) -> Result<RelayProbe> {
@@ -786,7 +799,7 @@ async fn apply_relay_probes(
     let mut probes: FuturesUnordered<_> = urls
         .iter()
         .map(|url| {
-            let (ca, closes) = (&ca, &closes);
+            let (ca, closes) = (ca.as_ref(), &closes);
             async move {
                 let probe = probe_relay(url, auth_token, ca, check_quic_addr_discovery, closes).await;
                 (url, probe)
@@ -1159,7 +1172,11 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.extra_ca_roots(), [root]);
         assert!(format!("{cfg:?}").contains("ca_roots: 1"));
+        assert!(cfg.ca_tls_config().is_some());
         assert!(RelayConfig::Default.extra_ca_roots().is_empty());
+        // Without extra roots iroh's own TLS trust and resolver stay as they are.
+        assert!(RelayConfig::Default.ca_tls_config().is_none());
+        assert!(RelayConfig::from_urls(&two()).unwrap().ca_tls_config().is_none());
     }
 
     #[test]
@@ -1172,7 +1189,7 @@ mod tests {
     async fn a_relay_only_endpoint_has_no_ip_transports() {
         // A relay-only endpoint needs a relay to bind at all; it is never
         // connected to here.
-        let relay_only = probe_endpoint_builder(&RELAY.parse().unwrap(), None, &CaTlsConfig::embedded())
+        let relay_only = probe_endpoint_builder(&RELAY.parse().unwrap(), None, None)
             .bind()
             .await
             .unwrap();

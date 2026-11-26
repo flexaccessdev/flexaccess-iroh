@@ -193,7 +193,7 @@ pub fn endpoint_builder(relay_config: &RelayConfig, options: EndpointOptions) ->
     // iroh 1.x requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
-    let mut builder = with_relay_tls(Endpoint::builder(presets::Empty), &relay_config.ca_tls_config())
+    let mut builder = with_relay_tls(Endpoint::builder(presets::Empty), relay_config.ca_tls_config().as_ref())
         .relay_mode(relay_config.relay_mode())
         .transport_config(options.transport_config)
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
@@ -232,10 +232,11 @@ pub struct CreatedEndpoint {
     /// connectable again; a process that does not run the failover keeps them
     /// out for its lifetime. Settled at once with the default relays.
     ///
-    /// Until it settles, the probe holds a handle to the endpoint, which keeps
-    /// its UDP sockets bound. A caller that closes the endpoint and then binds
-    /// a new one on the same port awaits [`RelayProbes::released`] in between
-    /// ([`rebuild_endpoint`] does).
+    /// An endpoint's UDP sockets are released only with its last handle, and
+    /// until it settles the probe holds one. A caller that binds a new
+    /// endpoint on the same port closes this one, drops every handle of its
+    /// own to it, and awaits [`RelayProbes::released`] for the probe's
+    /// ([`rebuild_endpoint`] does that last part).
     pub relays: RelayProbes,
 }
 
@@ -317,8 +318,9 @@ pub async fn create_endpoint(
 ///   serving it start with it on (the rest stay without it, as they would at
 ///   creation), and iroh's own net reports take it from there. A rebuild
 ///   while that probe still runs waits for it to settle first, so none of
-///   its findings is lost, and for its task to let go of the first endpoint,
-///   so that endpoint's port is free once it is closed; that wait is over at
+///   its findings is lost, and for its task to let go of the first endpoint;
+///   to bind on that endpoint's port, the caller must also have closed it and
+///   dropped every handle of its own to it first. That wait is over at
 ///   once in the usual case, and at most [`RELAY_CONNECT_TIMEOUT`] plus a
 ///   bounded close otherwise. Every
 ///   configured relay is in the map, those the probe left out included: a
