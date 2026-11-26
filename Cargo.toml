@@ -28,11 +28,7 @@ futures = "0.3"
 # A range, deliberately: every consumer resolves one `iroh` 1.5.x for its own
 # workspace and this crate compiles against it. A consumer on a fork of iroh
 # redirects this dependency too with `[patch.crates-io]` (see README.md).
-# `unstable-net-report` exposes `Endpoint::net_report`, which the startup probe
-# reads to tell whether a custom relay serves QUIC address discovery
-# (`relay::probe_relay`). Being unstable is why the range stays within one
-# minor release.
-iroh = { version = ">=1.5.0, <1.6.0", features = ["unstable-net-report"] }
+iroh = ">=1.5.0, <1.6.0"
 log = "0.4"
 # `relay-health` only. `rustls-no-provider` is the exact reqwest feature iroh
 # already enables, so this adds no new TLS backend (no openssl / aws-lc); the
@@ -67,6 +63,10 @@ swarm-discovery = { version = "0.6.5", optional = true }
 # crate over real relays. Dev-only, so consumers never pay for them.
 clap = { version = "4", features = ["derive", "env"] }
 env_logger = "0.11"
+# The e2e harness only: `unstable-net-report` exposes `Endpoint::net_report`,
+# which it reads to log whether an endpoint's QUIC address discovery answered
+# (`e2e/run_quic_addr_discovery.sh`). Never enabled for consumers.
+iroh = { version = ">=1.5.0, <1.6.0", features = ["unstable-net-report"] }
 # Test double for iroh's `Watcher`-based status APIs (the relay failover tests
 # drive a plain `Watchable`); the same crate iroh itself re-exports `Watcher` from.
 n0-watcher = "1"

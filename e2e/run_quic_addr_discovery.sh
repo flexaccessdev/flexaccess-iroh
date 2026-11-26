@@ -1,33 +1,40 @@
 #!/usr/bin/env bash
 #
-# QUIC address discovery (QAD) end-to-end test for flexaccess-iroh, fully
-# offline against two local `iroh-relay --dev` instances:
+# QUIC address discovery (QAD) end-to-end test for flexaccess-iroh. The QAD
+# setting is all or none (RelayConfig::with_quic_addr_discovery): on (the
+# default), iroh probes every custom relay for it, as it does on its own; off
+# (--no-quic-addr-discovery), it probes none. Each scenario runs a client that
+# creates an endpoint, rebuilds it once with rebuild_endpoint, and reaches the
+# server from both; it checks whether each endpoint's net report saw QAD
+# answer and how long each took to come online.
+#
+# Local section (always; offline), against two local `iroh-relay --dev`:
 #
 #   relay1  serves QAD: a `tls` section with a certificate from a test CA and
 #           `enable_quic_addr_discovery`, its QUIC server on 127.0.0.1:7842
-#           (the port the crate assumes); the relay itself stays plain HTTP
-#   relay2  does not serve QAD (no TLS, nothing on UDP). It is on 127.0.0.2:
-#           the crate looks for a relay's QAD at its URL host on UDP 7842, so
-#           on 127.0.0.1 it would find relay1's
+#           (the port iroh assumes); the relay itself stays plain HTTP
+#   relay2  does not serve QAD (no TLS, nothing on UDP), like a relay behind a
+#           Cloudflare Tunnel or any other HTTP-only front. It is on 127.0.0.2:
+#           iroh looks for a relay's QAD at its URL host on UDP 7842, so on
+#           127.0.0.1 it would find relay1's
 #
-# The server and clients use both relays, trust the test CA through
-# --relay-ca (RelayConfig::with_extra_ca_roots) unless a scenario says
-# otherwise, and run with direct paths allowed: QAD needs the endpoint's UDP
-# sockets.
+#   on          QAD on, the test CA trusted (--relay-ca,
+#               RelayConfig::with_extra_ca_roots): both endpoints see QAD
+#               answer, and both wait out iroh's 3 s QAD probe timeout on relay2
+#               before coming online
+#   off         QAD off: neither endpoint sees it answer, and neither waits
+#   untrusted   control: QAD on without the test CA, relay1's QAD fails its TLS
+#               handshake and neither endpoint sees it answer. This shows the
+#               signal above is QAD, and that the CA reaches the endpoint
 #
-#   1. probe        the startup probe finds that relay1 serves QAD and relay2
-#                   does not
-#   2. endpoint     the created endpoint's net report then sees QAD answer
-#   3. rebuilt      an endpoint replaced with rebuild_endpoint (no probe of its
-#                   own) still has QAD on for relay1: its net report sees QAD
-#                   answer, and it reaches the server
-#   4. untrusted    control: without the test CA, the probe's QAD check fails
-#                   its TLS handshake, so relay1 counts as not serving QAD and
-#                   neither endpoint sees QAD answer. This shows the signal
-#                   above is QAD, and that the CA reaches the probe endpoints
-#                   and not just the main one
+# n0 section (with --n0; needs the internet): n0's production relays
+# (use1-1 and euc1-1.relay.n0.iroh.link) as the custom relays, which all serve
+# QAD over the public internet:
 #
-# Usage: ./e2e/run_quic_addr_discovery.sh
+#   n0-on       QAD on: both endpoints see QAD answer, without the 3 s wait
+#   n0-off      QAD off: neither endpoint sees it answer
+#
+# Usage: ./e2e/run_quic_addr_discovery.sh [--n0]
 #
 # Needs Linux (127.0.0.2 on loopback), iroh-relay and openssl, and UDP
 # 127.0.0.1:7842 free.
@@ -35,8 +42,10 @@
 #
 set -euo pipefail
 
+N0=0
 case "${1:-}" in
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d'; exit 0 ;;
+    --n0) N0=1 ;;
     "") ;;
     *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
 esac
@@ -50,6 +59,11 @@ command -v openssl >/dev/null || die "openssl not found"
 # How long each endpoint gets to see QAD answer. A relay that serves it
 # answers in about one round trip; the wait only bounds the negative cases.
 QAD_WAIT=10
+
+# iroh's QAD probe timeout is 3 s (iroh 1.5): an endpoint start that waited
+# it out takes at least this long, and one that did not stays under QUICK_MS.
+WAITED_MS=2500
+QUICK_MS=2000
 
 # ---------------------------------------------------------------------------
 # Relays
@@ -94,17 +108,32 @@ CA=(--relay-ca "$WORK/ca.crt")
 # Server
 # ---------------------------------------------------------------------------
 keygen "e2e client" "$WORK/client.key" "$WORK/authorized_keys"
-SERVER_LOG="$WORK/server.log"
-log "Starting the server..."
-start_bg "$SERVER_LOG" "$BIN" server --authorized-keys "$WORK/authorized_keys" "${BOTH[@]}" "${CA[@]}"
-SERVER_PID="$BG_PID"
-wait_for_log_or_death "$SERVER_PID" "$SERVER_LOG" "Waiting for clients to connect" "$READY_TIMEOUT" || {
-    dump_log "$SERVER_LOG"
-    die "the server did not come up"
+
+# start_server <name> <relay args...>: start a server (QAD on) and set
+# SERVER_PID, SERVER_LOG and SERVER_ID.
+start_server() {
+    local name="$1"; shift
+    SERVER_LOG="$WORK/server_$name.log"
+    log "Starting the $name server..."
+    start_bg "$SERVER_LOG" "$BIN" server --authorized-keys "$WORK/authorized_keys" "$@"
+    SERVER_PID="$BG_PID"
+    wait_for_log_or_death "$SERVER_PID" "$SERVER_LOG" "Waiting for clients to connect" "$READY_TIMEOUT" || {
+        dump_log "$SERVER_LOG"
+        die "the $name server did not come up"
+    }
+    SERVER_ID="$(server_endpoint_id "$SERVER_LOG")"
+    [[ -n "$SERVER_ID" ]] || die "the $name server did not log its EndpointId"
+    log "Server EndpointId: $SERVER_ID"
 }
-SERVER_ID="$(server_endpoint_id "$SERVER_LOG")"
-[[ -n "$SERVER_ID" ]] || die "the server did not log its EndpointId"
-log "Server EndpointId: $SERVER_ID"
+
+# check_server_alive <name>: fail unless the current server is still running.
+check_server_alive() {
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        log "[$1-server-alive] FAIL: the server exited"
+        dump_log "$SERVER_LOG"
+        RESULT=1
+    fi
+}
 
 # Run a client that rebuilds its endpoint once, reporting QAD for both.
 # Args: <logfile> <relay args...>. Returns the client's exit status.
@@ -131,58 +160,79 @@ expect() {
     grep -Eq "$2" "$1" || { note "$3"; return 1; }
 }
 
+# expect_online <logfile> <label> <waited|quick>: note and fail unless the
+# endpoint logged as <label> came online after at least WAITED_MS (waited) or
+# within QUICK_MS (quick). The time is noted for the summary either way.
+expect_online() {
+    local logfile="$1" label="$2" bound="$3" ms
+    ms="$(sed -nE "s/.*\] $label online after ([0-9]+) ms.*/\1/p" "$logfile" | head -1)"
+    [[ -n "$ms" ]] || { note "$label: no online time logged"; return 1; }
+    TIMES+=("$label ${ms} ms")
+    case "$bound" in
+        waited) (( ms >= WAITED_MS )) ||
+            { note "$label came online after $ms ms, before the 3 s QAD timeout"; return 1; } ;;
+        quick) (( ms < QUICK_MS )) ||
+            { note "$label came online after $ms ms, not within $QUICK_MS ms"; return 1; } ;;
+    esac
+}
+
+# scenario <id> <answered|did not answer> <waited|quick> <what> <relay args...>:
+# run a client that rebuilds once, and check that each endpoint's net report
+# saw QAD answer or not, how long each took to come online, and that both
+# reached the server.
+scenario() {
+    local id="$1" expected="$2" online="$3" what="$4" rc=0 ok=0; shift 4
+    log "[$id] $what"
+    local logfile="$WORK/client_$id.log"
+    run_client "$logfile" "$@" || rc=$?
+    [[ "$rc" -eq 0 ]] || { note "client exited with $rc"; ok=1; }
+    expect "$logfile" "\] Endpoint: QUIC address discovery $expected" \
+        "the created endpoint's QAD did not $expected" || ok=1
+    expect "$logfile" "Rebuilt endpoint: QUIC address discovery $expected" \
+        "the rebuilt endpoint's QAD did not $expected" || ok=1
+    TIMES=()
+    expect_online "$logfile" "Endpoint" "$online" || ok=1
+    expect_online "$logfile" "Rebuilt endpoint" "$online" || ok=1
+    note "online: ${TIMES[*]}"
+    [[ "$(grep -c "Echo OK" "$logfile")" -eq 2 ]] ||
+        { note "expected an echo from each endpoint"; ok=1; }
+    [[ "$ok" -eq 0 ]] || dump_log "$logfile"
+    record "$id" "$ok"
+    SUMMARY[-1]+="  (${TIMES[*]})"
+    LAST_LOG="$logfile"
+}
+
 # ---------------------------------------------------------------------------
-# 1.-3. Both relays, relay1's CA trusted
+# Local relays
 # ---------------------------------------------------------------------------
-log "[probe/endpoint/rebuilt] both relays, relay1's CA trusted"
-CLIENT_LOG="$WORK/client_both.log"
-rc=0
-run_client "$CLIENT_LOG" "${BOTH[@]}" "${CA[@]}" || rc=$?
-[[ "$rc" -eq 0 ]] || note "client exited with $rc"
+start_server local "${BOTH[@]}" "${CA[@]}"
 
-ok=0
-expect "$CLIENT_LOG" "1 of the 2 reachable custom relays serve QUIC address discovery: $RELAY1/?\$" \
-    "the probe did not find relay1 alone serving QAD" || ok=1
-expect "$SERVER_LOG" "1 of the 2 reachable custom relays serve QUIC address discovery: $RELAY1/?\$" \
-    "the server's probe did not find relay1 alone serving QAD" || ok=1
-record probe "$ok"
+scenario on "answered" waited "QAD on, relay1's CA trusted" "${BOTH[@]}" "${CA[@]}"
 
-ok=0
-expect "$CLIENT_LOG" "\] Endpoint: QUIC address discovery answered" \
-    "the created endpoint never saw QAD answer" || ok=1
-record endpoint "$ok"
+scenario off "did not answer" quick "QAD off on every relay" \
+    "${BOTH[@]}" "${CA[@]}" --no-quic-addr-discovery
+expect "$LAST_LOG" "QUIC address discovery is off for the custom relays" \
+    "the client did not log that QAD is off" || record off-logged 1
 
-ok=0
-[[ "$rc" -eq 0 ]] || ok=1
-expect "$CLIENT_LOG" "Rebuilt endpoint: QUIC address discovery answered" \
-    "the rebuilt endpoint never saw QAD answer" || ok=1
-[[ "$(grep -c "Echo OK" "$CLIENT_LOG")" -eq 2 ]] ||
-    { note "expected an echo from each endpoint"; ok=1; }
-record rebuilt "$ok"
-[[ "$RESULT" -eq 0 ]] || dump_log "$CLIENT_LOG"
+scenario untrusted "did not answer" waited "QAD on without the test CA" "${BOTH[@]}"
+
+check_server_alive local
+kill_pid "$SERVER_PID"
 
 # ---------------------------------------------------------------------------
-# 4. Control: the test CA not trusted
+# n0's relays as custom relays
 # ---------------------------------------------------------------------------
-log "[untrusted] without the test CA, relay1 counts as not serving QAD"
-CLIENT_LOG="$WORK/client_untrusted.log"
-rc=0
-run_client "$CLIENT_LOG" "${BOTH[@]}" || rc=$?
-ok=0
-[[ "$rc" -eq 0 ]] || { note "client exited with $rc"; ok=1; }
-expect "$CLIENT_LOG" "None of the 2 reachable custom relays serves QUIC address discovery" \
-    "relay1 counted as serving QAD without its CA" || ok=1
-expect "$CLIENT_LOG" "\] Endpoint: QUIC address discovery did not answer" \
-    "the created endpoint saw QAD answer without the test CA" || ok=1
-expect "$CLIENT_LOG" "Rebuilt endpoint: QUIC address discovery did not answer" \
-    "the rebuilt endpoint saw QAD answer without relay1's CA" || ok=1
-[[ "$ok" -eq 0 ]] || dump_log "$CLIENT_LOG"
-record untrusted "$ok"
+if [[ "$N0" -eq 1 ]]; then
+    N0_RELAYS=(--relay-url "https://use1-1.relay.n0.iroh.link./"
+        --relay-url "https://euc1-1.relay.n0.iroh.link./")
+    start_server n0 "${N0_RELAYS[@]}"
 
-if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    log "[server-alive] FAIL: the server exited"
-    dump_log "$SERVER_LOG"
-    RESULT=1
+    scenario n0-on "answered" quick "n0's relays, QAD on" "${N0_RELAYS[@]}"
+
+    scenario n0-off "did not answer" quick "n0's relays, QAD off" \
+        "${N0_RELAYS[@]}" --no-quic-addr-discovery
+
+    check_server_alive n0
 fi
 
 echo

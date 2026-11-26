@@ -15,7 +15,8 @@
 //! endpoint the way a long-lived client replaces a broken one
 //! ([`flexaccess_iroh::endpoint::rebuild_endpoint`]) and runs the exchange
 //! again on it, and with `--qad-wait-secs` it logs whether each endpoint's net
-//! report saw QUIC address discovery answer. Everything an application would add on
+//! report saw QUIC address discovery answer (which `--no-quic-addr-discovery`
+//! turns off on every custom relay). Everything an application would add on
 //! top — a product ALPN, QUIC tuning, config files, forwarding — is left out
 //! so a failure here is a failure of this crate or of iroh, never of a product.
 //!
@@ -44,7 +45,7 @@ use rustls::pki_types::pem::PemObject;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -125,6 +126,10 @@ struct RelayArgs {
     /// against, such as a local test relay's self-signed certificate.
     #[arg(long)]
     relay_ca: Option<PathBuf>,
+    /// The custom relays serve no QUIC address discovery: never probe any of
+    /// them for it. Requires custom relays.
+    #[arg(long)]
+    no_quic_addr_discovery: bool,
 }
 
 impl RelayArgs {
@@ -138,6 +143,9 @@ impl RelayArgs {
                 bail!("{} holds no certificates", path.display());
             }
             config = config.with_extra_ca_roots(roots)?;
+        }
+        if self.no_quic_addr_discovery {
+            config = config.with_quic_addr_discovery(false)?;
         }
         if self.relay_only && !config.is_custom() {
             bail!("--relay-only requires custom relays (--relay-url)");
@@ -203,14 +211,13 @@ struct ClientArgs {
     /// Seconds between echoes while holding the connection open.
     #[arg(long, default_value_t = 5)]
     echo_interval_secs: u64,
-    /// After the exchange, replace the endpoint with `rebuild_endpoint` (from
-    /// the first endpoint's startup probe) and run the exchange again on it.
+    /// After the exchange, replace the endpoint with `rebuild_endpoint` and
+    /// run the exchange again on it.
     #[arg(long)]
     rebuild: bool,
     /// Before each exchange, wait up to this many seconds for the endpoint's
     /// net report to show QUIC address discovery answering, and log whether
-    /// it did (`QUIC address discovery answered` / `did not answer`). For the
-    /// first endpoint the wait starts once its startup probe has settled.
+    /// it did (`QUIC address discovery answered` / `did not answer`).
     #[arg(long)]
     qad_wait_secs: Option<u64>,
 }
@@ -429,10 +436,11 @@ async fn run_client(args: ClientArgs) -> Result<ExitCode> {
     let outcome = async {
         // A client runs no failover: a relay left out at startup stays out
         // of this endpoint for the (short-lived) process.
+        let started = Instant::now();
         let CreatedEndpoint { endpoint, relays } =
             create_endpoint(&relay_config, builder, &closes).await?;
+        info!("Endpoint online after {} ms", started.elapsed().as_millis());
         if let Some(wait) = args.qad_wait_secs {
-            relays.settled().await;
             report_quic_addr_discovery("Endpoint", &endpoint, Duration::from_secs(wait)).await;
         }
         let outcome = exchange(&endpoint, &args, &relay_config, &key).await;
@@ -445,7 +453,9 @@ async fn run_client(args: ClientArgs) -> Result<ExitCode> {
         }
         info!("Rebuilding the endpoint");
         let builder = endpoint_builder(&relay_config, args.relay.options(false));
-        let endpoint = rebuild_endpoint(&relay_config, builder, &relays, &closes).await?;
+        let started = Instant::now();
+        let endpoint = rebuild_endpoint(builder, &relays, &closes).await?;
+        info!("Rebuilt endpoint online after {} ms", started.elapsed().as_millis());
         if let Some(wait) = args.qad_wait_secs {
             report_quic_addr_discovery("Rebuilt endpoint", &endpoint, Duration::from_secs(wait))
                 .await;

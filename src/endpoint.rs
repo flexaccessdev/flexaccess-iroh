@@ -263,10 +263,6 @@ pub struct CreatedEndpoint {
 /// comes back through the failover's restore probe; see
 /// [`CreatedEndpoint::relays`].
 ///
-/// The endpoint starts without QUIC address discovery on any custom relay,
-/// and the probe turns it on for the relays that serve it: one that does not
-/// would delay every start by iroh's 3 s probe timeout (see [`RelayProbes`]).
-///
 /// On failure after binding the endpoint is closed before the error
 /// propagates (iroh aborts a bound endpoint dropped without `close()`). The
 /// close is waited for up to 5 s, so a slow teardown cannot keep the error
@@ -313,29 +309,21 @@ pub async fn create_endpoint(
 /// for a client whose endpoint is broken beyond what iroh repairs on its own
 /// (a relay link that never re-establishes, stale paths, dead discovery state),
 /// which a fresh endpoint recovers from as a process restart would. `builder`
-/// is built as the first one was; `relays` is that first endpoint's startup
-/// probe ([`CreatedEndpoint::relays`]), whatever endpoint came between.
+/// is built as the first one was ([`endpoint_builder`] with the same
+/// [`RelayConfig`]), so it has every configured relay, those the startup
+/// probe left out included: a process that rebuilds runs no failover to put
+/// them back. `relays` is that first endpoint's startup probe
+/// ([`CreatedEndpoint::relays`]), whatever endpoint came between.
 ///
 /// It differs from [`create_endpoint`] deliberately:
 ///
 /// - **No relay probe.** At creation the probe checked the configuration;
-///   during an outage it would only delay the reconnect it is part of. What
-///   it found about QUIC address discovery is kept: the relays it found
-///   serving it start with it on (the rest stay without it, as they would at
-///   creation), and iroh's own net reports take it from there. The probe
-///   runs once: a relay it found not serving QUIC address discovery (UDP
-///   blocked at the start, its discovery service down for a moment) stays
-///   without it, in the first endpoint and in every rebuild alike, until the
-///   process starts again. A rebuild while that probe still runs waits for
-///   it to settle first, so none of its findings is lost (a probe stopped by
-///   the first endpoint's close hands over what it had found by then), and
-///   for its task to let go of the first endpoint;
-///   to bind on that endpoint's port, the caller must also have closed it and
-///   dropped every handle of its own to it first. That wait is over at
-///   once in the usual case, and at most [`RELAY_CONNECT_TIMEOUT`] plus a
-///   bounded close otherwise. Every
-///   configured relay is in the map, those the probe left out included: a
-///   process that rebuilds runs no failover to put them back.
+///   during an outage it would only delay the reconnect it is part of. The
+///   bind waits only for the first endpoint's probe task to let go of that
+///   endpoint ([`RelayProbes::released`]), so a caller that closed it to bind
+///   on its port does not find the port still taken; the caller must also
+///   have dropped every handle of its own to it. That is over as soon as the
+///   task runs once the first endpoint's close has begun.
 /// - **The online wait is tolerated failing.** A fresh endpoint is no worse
 ///   than the broken one it replaces: a client only dials, its relay hints and
 ///   local discovery can still reach a server without a home relay, and the
@@ -345,12 +333,12 @@ pub async fn create_endpoint(
 /// its own, kept in `closes`, rather than dropping it (iroh aborts a bound
 /// endpoint dropped without `close()`).
 pub async fn rebuild_endpoint(
-    relay_config: &RelayConfig,
     builder: EndpointBuilder,
     relays: &RelayProbes,
     closes: &PendingCloses,
 ) -> Result<Endpoint> {
-    let endpoint = bind_rebuilt(relay_config, builder, relays).await?;
+    relays.released().await;
+    let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
     let mut cancelled = CloseIfCancelled::new(&endpoint, closes);
     let online = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await;
     cancelled.disarm(false);
@@ -364,29 +352,9 @@ pub async fn rebuild_endpoint(
     Ok(endpoint)
 }
 
-/// The bind of [`rebuild_endpoint`]: `builder` on the relay map with QUIC
-/// address discovery on where `relays` found it served, once it has settled
-/// and let go of the endpoint it probed for.
-async fn bind_rebuilt(
-    relay_config: &RelayConfig,
-    builder: EndpointBuilder,
-    relays: &RelayProbes,
-) -> Result<Endpoint> {
-    let serving = relays.settled().await.quic_addr_discovery;
-    // The probe task still holds that endpoint for a moment after its last
-    // result: a caller that closed it to bind this one on its port must not
-    // find the port still taken.
-    relays.released().await;
-    builder
-        .relay_mode(relay_config.relay_mode_with_quic_addr_discovery(&serving))
-        .bind()
-        .await
-        .context("Failed to create iroh endpoint")
-}
-
 /// Armed while [`create_endpoint`] waits for the endpoint, beside the probe
 /// or not, while [`rebuild_endpoint`] does (with no probe), and over each
-/// relay probe's endpoints ([`crate::relay`]'s `probe_relay`): if the wait is
+/// relay probe's endpoint ([`crate::relay`]'s `probe_relay`): if the wait is
 /// dropped unfinished, take the probe task's handle to the endpoint and close
 /// the endpoint, so a cancelled start neither keeps the endpoint's port bound
 /// for as long as the probes run nor drops it without `close()`. It holds a handle of its own for the whole wait, since the
@@ -443,78 +411,55 @@ impl Drop for CloseIfCancelled {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::ProbedRelays;
     use iroh::{RelayMode, RelayUrl};
 
-    /// A rebuilt endpoint has QUIC address discovery on for the relays the
-    /// first endpoint's probe found serving it, and only those, and has back
-    /// the relays that probe left out.
-    #[tokio::test]
-    async fn a_rebuilt_endpoint_keeps_what_the_probe_found() {
-        let serving: RelayUrl = "https://serving.relay.example./".parse().unwrap();
-        let other: RelayUrl = "https://other.relay.example./".parse().unwrap();
-        let left_out: RelayUrl = "https://left-out.relay.example./".parse().unwrap();
-        let config = RelayConfig::from_urls(&[
-            serving.to_string(),
-            other.to_string(),
-            left_out.to_string(),
-        ])
-        .unwrap();
-        let probes = RelayProbes::settled_with(ProbedRelays {
-            left_out: vec![left_out.clone()],
-            quic_addr_discovery: vec![serving.clone()],
-        });
-        let options = EndpointOptions {
+    fn relay_only() -> EndpointOptions {
+        EndpointOptions {
             transport_config: QuicTransportConfig::default(),
             publish_address: false,
             // No sockets: the relays here are never reached.
             relay_only: true,
-        };
-        let endpoint = bind_rebuilt(&config, endpoint_builder(&config, options), &probes)
-            .await
-            .unwrap();
-        // Taking a relay out hands back the entry the map held for it.
-        let entry = |url: RelayUrl| {
-            let endpoint = endpoint.clone();
-            async move { endpoint.remove_relay(&url).await.expect("in the relay map") }
-        };
-        assert!(entry(serving).await.quic.is_some(), "QAD on where it was found");
-        assert!(entry(other).await.quic.is_none(), "and off elsewhere");
-        assert!(entry(left_out).await.quic.is_none(), "a relay left out is back");
-        endpoint.close().await;
+        }
     }
 
-    /// A rebuild while the first endpoint's probe still runs waits for it,
-    /// and gets QUIC address discovery on where the probe finds it later; it
-    /// binds only once the probe has also let go of the first endpoint.
+    /// The endpoint binds with the relays' QUIC address discovery as
+    /// configured: iroh's own entry with it on, none with it off.
     #[tokio::test]
-    async fn a_rebuild_before_the_probe_settles_waits_for_its_findings() {
-        let serving: RelayUrl = "https://serving.relay.example./".parse().unwrap();
-        let config = RelayConfig::from_urls(&[serving.to_string()]).unwrap();
+    async fn an_endpoint_has_quic_addr_discovery_as_configured() {
+        let url: RelayUrl = "https://relay.example./".parse().unwrap();
+        for enabled in [true, false] {
+            let config = RelayConfig::from_urls(&[url.to_string()])
+                .unwrap()
+                .with_quic_addr_discovery(enabled)
+                .unwrap();
+            let endpoint = endpoint_builder(&config, relay_only()).bind().await.unwrap();
+            // Taking a relay out hands back the entry the map held for it.
+            let entry = endpoint.remove_relay(&url).await.expect("in the relay map");
+            assert_eq!(entry.quic.is_some(), enabled);
+            endpoint.close().await;
+        }
+    }
+
+    /// A rebuild binds only once the first endpoint's probe has let go of
+    /// that endpoint, whether or not it has settled.
+    #[tokio::test]
+    async fn a_rebuild_waits_for_the_probe_to_let_go_of_the_first_endpoint() {
+        let config = RelayConfig::from_urls(&["https://relay.example./".to_string()]).unwrap();
         let (probes, settle) = RelayProbes::unsettled();
-        let options = EndpointOptions {
-            transport_config: QuicTransportConfig::default(),
-            publish_address: false,
-            relay_only: true,
-        };
-        let mut rebuilt = Box::pin(bind_rebuilt(&config, endpoint_builder(&config, options), &probes));
+        let closes = PendingCloses::new();
+        let mut rebuilt = Box::pin(rebuild_endpoint(endpoint_builder(&config, relay_only()), &probes, &closes));
         assert!(
             tokio::time::timeout(Duration::from_millis(200), &mut rebuilt).await.is_err(),
-            "the bind waits while the probe runs"
-        );
-        settle.settle(ProbedRelays {
-            left_out: Vec::new(),
-            quic_addr_discovery: vec![serving.clone()],
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut rebuilt).await.is_err(),
-            "and while it still holds the first endpoint"
+            "the bind waits while the probe holds the first endpoint"
         );
         settle.release();
-        let endpoint = rebuilt.await.unwrap();
-        let entry = endpoint.remove_relay(&serving).await.expect("in the relay map");
-        assert!(entry.quic.is_some(), "QAD on where the probe found it late");
-        endpoint.close().await;
+        // Bound now; its online wait never ends, so cancel it there.
+        assert!(tokio::time::timeout(Duration::from_millis(200), &mut rebuilt).await.is_err());
+        drop(rebuilt);
+        assert_eq!(closes.0.lock().unwrap().len(), 1, "the rebuilt endpoint was bound and closed");
+        tokio::time::timeout(ENDPOINT_CLOSE_TIMEOUT, closes.finished())
+            .await
+            .expect("and its close finishes");
     }
 
     /// A rebuild cancelled while it waits for the new endpoint to come online
@@ -523,14 +468,9 @@ mod tests {
     async fn a_cancelled_rebuild_closes_its_endpoint() {
         // Never reached, so the endpoint never comes online.
         let config = RelayConfig::from_urls(&["https://unreachable.relay.example./".to_string()]).unwrap();
-        let options = EndpointOptions {
-            transport_config: QuicTransportConfig::default(),
-            publish_address: false,
-            relay_only: true,
-        };
-        let probes = RelayProbes::settled_with(ProbedRelays::default());
+        let probes = RelayProbes::none();
         let closes = PendingCloses::new();
-        let rebuilt = rebuild_endpoint(&config, endpoint_builder(&config, options), &probes, &closes);
+        let rebuilt = rebuild_endpoint(endpoint_builder(&config, relay_only()), &probes, &closes);
         assert!(
             tokio::time::timeout(Duration::from_millis(500), rebuilt).await.is_err(),
             "cancelled during the online wait"

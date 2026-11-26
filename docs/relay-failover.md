@@ -110,7 +110,7 @@ Checked against the released sources on 2026-09-04.
    hands back the startup probe (`CreatedEndpoint::relays`), which takes the
    relays that fail it out of the live relay map;
    `fail_over_home_relay` waits for it to settle, then restore-probes each
-   relay it took out (`ProbedRelays::left_out`) on the same 90 s cycle as a
+   relay it took out (`RelayProbes::settled`) on the same 90 s cycle as a
    relay it removed itself. Restoring a relay that is *not* in the configuration is
    refused, so a caller cannot smuggle an extra relay in this way.
 
