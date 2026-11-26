@@ -22,7 +22,7 @@ use iroh::{
 };
 use log::{info, warn};
 use std::future::Future;
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -180,9 +180,9 @@ async fn closed_within(
 /// a task that blocks a worker, which on a current-thread runtime would hold
 /// up every timer along with the teardown.
 ///
-/// Should the thread fail to start, the runtime is shut down with the
-/// teardown not run, as a caller without this function would have done, and
-/// this returns `false`.
+/// Should the thread fail to start, the runtime is shut down at once with
+/// the teardown not run, as a caller without this function would have done,
+/// and this returns `false`.
 ///
 /// The shutdown never blocks ([`Runtime::shutdown_background`]): whatever
 /// else is on the runtime is dropped with it, so `teardown` is everything
@@ -196,18 +196,41 @@ pub fn tear_down_runtime(
     limit: Duration,
     thread_name: &str,
 ) -> bool {
-    let (over, wait) = std::sync::mpsc::channel();
-    // A closure that never runs is dropped, and the runtime with it.
-    let kept = std::thread::Builder::new().name(thread_name.to_string()).spawn(move || {
+    let thread = std::thread::Builder::new().name(thread_name.to_string());
+    tear_down_runtime_on(runtime, teardown, limit, |run| thread.spawn(run).map(drop))
+}
+
+/// [`tear_down_runtime`], on the thread that `spawn` starts for it.
+fn tear_down_runtime_on(
+    runtime: Runtime,
+    teardown: impl Future<Output = ()> + Send + 'static,
+    limit: Duration,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> bool {
+    // The runtime is handed to the thread once it runs, and not moved into
+    // its closure: one that never starts is dropped here, and a runtime
+    // dropped with it would wait for whatever blocking work it has.
+    let (hand_over, handed) = mpsc::channel::<Runtime>();
+    let (over, wait) = mpsc::channel();
+    let started = spawn(Box::new(move || {
+        let Ok(runtime) = handed.recv() else {
+            return;
+        };
         // A teardown that panicked is over all the same.
         let teardown = runtime.spawn(teardown);
         drop(runtime.block_on(teardown));
         runtime.shutdown_background();
         // Nobody waits any more past the limit.
         let _ = over.send(());
-    });
-    if let Err(e) = kept {
+    }));
+    if let Err(e) = started {
         warn!("Could not start a thread for the teardown ({e}); it is skipped");
+        runtime.shutdown_background();
+        return false;
+    }
+    if let Err(mpsc::SendError(runtime)) = hand_over.send(runtime) {
+        warn!("The thread for the teardown ended before it began; it is skipped");
+        runtime.shutdown_background();
         return false;
     }
     match wait.recv_timeout(limit) {
@@ -597,6 +620,35 @@ mod tests {
         finished
             .recv_timeout(Duration::from_secs(10))
             .expect("the teardown ran once the runtime was free");
+    }
+
+    /// With no thread to be had, the runtime is shut down without waiting
+    /// for the blocking work on it, which dropping it would do, and the
+    /// teardown is not run.
+    #[test]
+    fn a_teardown_without_its_thread_shuts_the_runtime_down_at_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let (running, is_running) = mpsc::channel();
+        runtime.spawn_blocking(move || {
+            running.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+        });
+        is_running.recv().unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let teardown = {
+            let ran = ran.clone();
+            async move { ran.store(true, Ordering::SeqCst) }
+        };
+        let started = Instant::now();
+        let over = tear_down_runtime_on(runtime, teardown, Duration::from_millis(20), |_run| {
+            Err(std::io::Error::other("no threads left"))
+        });
+        assert!(!over);
+        assert!(started.elapsed() < Duration::from_millis(400), "did not wait for the blocking work");
+        assert!(!ran.load(Ordering::SeqCst), "the teardown was not run");
     }
 
     /// A close that takes its time is waited for up to the limit and no

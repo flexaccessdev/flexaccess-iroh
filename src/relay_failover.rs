@@ -251,7 +251,8 @@ impl FailoverRelays for EndpointRelays<'_> {
         // The failover lives on the process's runtime, where a slow close of
         // the probe endpoint finishes by itself: nothing waits for it.
         let closes = PendingCloses::new();
-        let probe = probe_relay(url, self.auth_token.as_deref(), &closes);
+        // Put back only once the probe is over, its endpoint closed.
+        let probe = probe_relay(url, self.auth_token.as_deref(), &closes, || ());
         match probe.await {
             Ok(()) => {
                 if !self.urls.contains(url) {

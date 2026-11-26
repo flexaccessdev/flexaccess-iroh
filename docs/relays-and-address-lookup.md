@@ -255,13 +255,15 @@ for its probe, unchanged: a relay-map change of its own, which asks iroh for
 the full report again and changes nothing else. Only such a relay is used,
 and none is re-inserted until one has come online: the probe is still
 changing the map then, and a relay that passed is the one kind it never takes
-out, so the request cannot put back a relay that is just being removed. The
-first time a report's worth of time after the removal (the QAD wait, when
-the endpoint runs QAD) plus 2 s, so that a start that is going well is not
-asked twice, and at that interval from then on: every 5 s with QAD on, every
-2 s without, which fits several requests into the window. A request can be replaced in the queue like
-the first one, but each takes a port-mapping update or a periodic refresh
-landing behind it again. The log says so each time (`re-inserting <url>
+out, so the request cannot put back a relay that is just being removed. A
+probe says that its relay connected at once, before it closes its own
+endpoint, and a request that came due with no such relay yet is made as soon
+as there is one. The first time a report's worth of time after the removal
+(the QAD wait, when the endpoint runs QAD) plus 2 s, so that a start that is
+going well is not asked twice, and at that interval from then on: every 5 s
+with QAD on, every 2 s without, which fits several requests into the window.
+A request can be replaced in the queue like the first one, but each takes a
+port-mapping update or a periodic refresh landing behind it again. The log says so each time (`re-inserting <url>
 unchanged to have iroh run a fresh net report`). This works on any iroh 1.5,
 a consumer's fork or the crates.io release, so no consumer has to carry an
 iroh patch for it.
