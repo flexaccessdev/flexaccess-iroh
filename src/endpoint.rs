@@ -318,7 +318,10 @@ pub async fn create_endpoint(
 ///   during an outage it would only delay the reconnect it is part of. What
 ///   it found about QUIC address discovery is kept: the relays it found
 ///   serving it start with it on (the rest stay without it, as they would at
-///   creation), and iroh's own net reports take it from there. Every
+///   creation), and iroh's own net reports take it from there. A rebuild
+///   while that probe still runs waits for it to settle first, so none of
+///   its findings is lost; that wait is over at once in the usual case, and
+///   at most [`RELAY_CONNECT_TIMEOUT`] plus a bounded close otherwise. Every
 ///   configured relay is in the map, those the probe left out included: a
 ///   process that rebuilds runs no failover to put them back.
 /// - **The online wait is tolerated failing.** A fresh endpoint is no worse
@@ -345,13 +348,13 @@ pub async fn rebuild_endpoint(
 }
 
 /// The bind of [`rebuild_endpoint`]: `builder` on the relay map with QUIC
-/// address discovery on where `relays` found it served.
+/// address discovery on where `relays` found it served, once it has settled.
 async fn bind_rebuilt(
     relay_config: &RelayConfig,
     builder: EndpointBuilder,
     relays: &RelayProbes,
 ) -> Result<Endpoint> {
-    let serving = relays.current().quic_addr_discovery;
+    let serving = relays.settled().await.quic_addr_discovery;
     builder
         .relay_mode(relay_config.relay_mode_with_quic_addr_discovery(&serving))
         .bind()
@@ -446,6 +449,33 @@ mod tests {
         assert!(entry(serving).await.quic.is_some(), "QAD on where it was found");
         assert!(entry(other).await.quic.is_none(), "and off elsewhere");
         assert!(entry(left_out).await.quic.is_none(), "a relay left out is back");
+        endpoint.close().await;
+    }
+
+    /// A rebuild while the first endpoint's probe still runs waits for it,
+    /// and gets QUIC address discovery on where the probe finds it later.
+    #[tokio::test]
+    async fn a_rebuild_before_the_probe_settles_waits_for_its_findings() {
+        let serving: RelayUrl = "https://serving.relay.example./".parse().unwrap();
+        let config = RelayConfig::from_urls(&[serving.to_string()]).unwrap();
+        let (probes, settle) = RelayProbes::unsettled();
+        let options = EndpointOptions {
+            transport_config: QuicTransportConfig::default(),
+            publish_address: false,
+            relay_only: true,
+        };
+        let mut rebuilt = Box::pin(bind_rebuilt(&config, endpoint_builder(&config, options), &probes));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut rebuilt).await.is_err(),
+            "the bind waits while the probe runs"
+        );
+        settle.settle(ProbedRelays {
+            left_out: Vec::new(),
+            quic_addr_discovery: vec![serving.clone()],
+        });
+        let endpoint = rebuilt.await.unwrap();
+        let entry = endpoint.remove_relay(&serving).await.expect("in the relay map");
+        assert!(entry.quic.is_some(), "QAD on where the probe found it late");
         endpoint.close().await;
     }
 

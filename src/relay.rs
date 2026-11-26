@@ -587,6 +587,16 @@ impl RelayProbes {
         Self(progress)
     }
 
+    /// A probe of one relay still running, for tests, and what settles it.
+    #[cfg(test)]
+    pub(crate) fn unsettled() -> (Self, ProbeSettler) {
+        let (tx, rx) = watch::channel(ProbeProgress {
+            total: 1,
+            ..ProbeProgress::default()
+        });
+        (Self(rx), ProbeSettler(tx))
+    }
+
     /// A probe that has already settled with `relays`, for tests.
     #[cfg(test)]
     pub(crate) fn settled_with(relays: ProbedRelays) -> Self {
@@ -671,6 +681,21 @@ impl RelayProbes {
     async fn changed(&mut self) -> Option<ProbeProgress> {
         self.0.changed().await.ok()?;
         Some(self.0.borrow_and_update().clone())
+    }
+}
+
+/// Settles a [`RelayProbes::unsettled`] probe, for tests.
+#[cfg(test)]
+pub(crate) struct ProbeSettler(watch::Sender<ProbeProgress>);
+
+#[cfg(test)]
+impl ProbeSettler {
+    pub(crate) fn settle(self, relays: ProbedRelays) {
+        self.0.send_modify(|progress| {
+            progress.probed = progress.total;
+            progress.relays = relays;
+            progress.released = true;
+        });
     }
 }
 

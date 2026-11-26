@@ -148,7 +148,7 @@ custom relay, and the probe turns it on, on the live endpoint, for each relay
 that answered (`ProbedRelays::quic_addr_discovery`). An endpoint that
 replaces it mid-session (`endpoint::rebuild_endpoint`) runs no probe of its
 own and starts with QAD on for the relays the first endpoint's probe found
-serving it. Next to each relay's probe endpoint, a second
+serving it, waiting for that probe to settle if it still runs. Next to each relay's probe endpoint, a second
 throwaway endpoint with UDP transports and QAD on runs a net report with only
 the QAD probes (`NetReportConfig::minimal`); its report shows UDP working
 only if the relay answered. The answer is whatever that endpoint learned by
