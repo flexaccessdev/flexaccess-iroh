@@ -180,9 +180,12 @@ async fn closed_within(
 /// a task that blocks a worker, which on a current-thread runtime would hold
 /// up every timer along with the teardown.
 ///
-/// Should the thread fail to start, the runtime is shut down at once with
-/// the teardown not run, as a caller without this function would have done,
-/// and this returns `false`.
+/// Should the thread fail to start, the runtime is shut down by the caller
+/// with the teardown not run, as a caller without this function would have
+/// done, and this returns `false`. That shutdown is outside `limit`: it does
+/// not wait for blocking work, but a current-thread runtime drops its tasks
+/// on the thread that shuts it down, so a task that is slow to drop holds
+/// the caller up for as long.
 ///
 /// The shutdown never blocks ([`Runtime::shutdown_background`]): whatever
 /// else is on the runtime is dropped with it, so `teardown` is everything

@@ -795,7 +795,8 @@ async fn apply_relay_probes(
 /// a relay is the one kind it never takes out: re-inserting any other could
 /// put back a relay the probe is just removing. A request that came due with
 /// no such relay yet is made as soon as one comes online, rather than at the
-/// next interval, which the window may not have left.
+/// next interval, which the window may not have left. None of this keeps the
+/// wait open: it ends as described above, whatever is owed.
 pub(crate) async fn wait_online_beside(
     endpoint: &Endpoint,
     probes: &RelayProbes,
@@ -881,10 +882,16 @@ pub(crate) async fn wait_online_beside(
                     // The map change just made asks for a report itself.
                     refresh_at = Some(now + refresh_every);
                     refresh_owed = false;
-                } else if refresh_owed && !progress.online.is_empty() {
-                    refresh_at = Some(Instant::now());
-                } else if deadline.is_none() && !probing {
+                    continue;
+                }
+                // Past its window, the wait lasts only as long as the probe
+                // runs, an owed request or not: one result can both bring
+                // the first relay online and settle the probe.
+                if deadline.is_none() && !probing {
                     return Err(timed_out(window));
+                }
+                if refresh_owed && !progress.online.is_empty() {
+                    refresh_at = Some(Instant::now());
                 }
             }
         }
@@ -1430,6 +1437,63 @@ mod tests {
             }
             assert_eq!(asked.at(started, &up), expected, "online at {online_at}s");
         }
+        endpoint.close().await;
+    }
+
+    /// An owed request does not keep the wait open past its end: with the
+    /// window over while the probe was still running, a single result that
+    /// brings the first relay online and settles the probe ends the wait,
+    /// as a result without a relay would.
+    #[tokio::test(start_paused = true)]
+    async fn an_owed_net_report_request_does_not_outlast_the_startup_wait() {
+        // No relays: never online, and no relay traffic.
+        let endpoint = Endpoint::builder(presets::Empty)
+            .relay_mode(RelayMode::Disabled)
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .bind()
+            .await
+            .unwrap();
+        let [up, out]: [RelayUrl; 2] = two().map(|url| url.parse().unwrap());
+
+        // A relay taken out at 1 s: the window closes at 11 s (no QAD wait),
+        // with every request since 3 s owed. The other relay's probe is
+        // still running then, and at 12 s comes online and settles in one.
+        let (tx, rx) = watch::channel(ProbeProgress {
+            total: 2,
+            ..ProbeProgress::default()
+        });
+        let probe = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            tx.send_modify(|progress| {
+                progress.probed += 1;
+                progress.failures.push((out.clone(), "down".to_string()));
+                progress.left_out.push(out.clone());
+            });
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            tx.send_modify(|progress| {
+                progress.online.push(up.clone());
+                progress.probed += 1;
+            });
+            std::future::pending::<()>().await
+        };
+        let started = Instant::now();
+        let mut asked = Asked::default();
+        let probes = RelayProbes(rx);
+        let wait = wait_online_beside(&endpoint, &probes, Duration::ZERO, &mut asked);
+        let err = tokio::select! {
+            outcome = tokio::time::timeout(Duration::from_secs(60), wait) => {
+                outcome.expect("the wait ends").expect_err("never online")
+            }
+            () = probe => unreachable!(),
+        };
+        let took = started.elapsed();
+        // Timers fire to the millisecond.
+        assert!(
+            took >= Duration::from_secs(12) && took < Duration::from_millis(12_010),
+            "took {took:?}, expected to end as the probe settled"
+        );
+        assert!(err.to_string().contains("after 10s"), "unexpected error: {err}");
+        assert!(asked.0.is_empty(), "no relay to ask with while the wait was open");
         endpoint.close().await;
     }
 
