@@ -4,9 +4,8 @@
 # setting is all or none (RelayConfig::with_quic_addr_discovery): on (the
 # default), iroh probes every custom relay for it, as it does on its own; off
 # (--no-quic-addr-discovery), it probes none. Each scenario runs a client that
-# creates an endpoint, rebuilds it once with rebuild_endpoint, and reaches the
-# server from both; it checks whether each endpoint's net report saw QAD
-# answer and how long each took to come online.
+# reaches the server, and checks whether its endpoint's net report saw QAD
+# answer and how long the endpoint took to come online.
 #
 # Local section (always; offline), against two local `iroh-relay --dev`:
 #
@@ -19,20 +18,20 @@
 #           127.0.0.1 it would find relay1's
 #
 #   on          QAD on, the test CA trusted (--relay-ca,
-#               RelayConfig::with_extra_ca_roots): both endpoints see QAD
-#               answer, and both wait out iroh's 3 s QAD probe timeout on relay2
-#               before coming online
-#   off         QAD off: neither endpoint sees it answer, and neither waits
+#               RelayConfig::with_extra_ca_roots): the endpoint sees QAD answer,
+#               and waits out iroh's 3 s QAD probe timeout on relay2 before
+#               coming online
+#   off         QAD off: the endpoint does not see it answer, and does not wait
 #   untrusted   control: QAD on without the test CA, relay1's QAD fails its TLS
-#               handshake and neither endpoint sees it answer. This shows the
-#               signal above is QAD, and that the CA reaches the endpoint
+#               handshake and the endpoint does not see it answer. This shows
+#               the signal above is QAD, and that the CA reaches the endpoint
 #
 # n0 section (with --n0; needs the internet): n0's production relays
 # (use1-1 and euc1-1.relay.n0.iroh.link) as the custom relays, which all serve
 # QAD over the public internet:
 #
-#   n0-on       QAD on: both endpoints see QAD answer, without the 3 s wait
-#   n0-off      QAD off: neither endpoint sees it answer
+#   n0-on       QAD on: the endpoint sees QAD answer, without the 3 s wait
+#   n0-off      QAD off: the endpoint does not see it answer
 #
 # Usage: ./e2e/run_quic_addr_discovery.sh [--n0]
 #
@@ -135,12 +134,12 @@ check_server_alive() {
     fi
 }
 
-# Run a client that rebuilds its endpoint once, reporting QAD for both.
+# Run a client that reports whether its endpoint saw QAD answer.
 # Args: <logfile> <relay args...>. Returns the client's exit status.
 run_client() {
     local logfile="$1" rc=0; shift
     "$BIN" client --server-id "$SERVER_ID" --private-key-file "$WORK/client.key" \
-        --rebuild --qad-wait-secs "$QAD_WAIT" "$@" >"$logfile" 2>&1 || rc=$?
+        --qad-wait-secs "$QAD_WAIT" "$@" >"$logfile" 2>&1 || rc=$?
     return "$rc"
 }
 
@@ -177,9 +176,9 @@ expect_online() {
 }
 
 # scenario <id> <answered|did not answer> <waited|quick> <what> <relay args...>:
-# run a client that rebuilds once, and check that each endpoint's net report
-# saw QAD answer or not, how long each took to come online, and that both
-# reached the server.
+# run a client, and check that its endpoint's net report saw QAD answer or
+# not, how long the endpoint took to come online, and that it reached the
+# server.
 scenario() {
     local id="$1" expected="$2" online="$3" what="$4" rc=0 ok=0; shift 4
     log "[$id] $what"
@@ -187,15 +186,11 @@ scenario() {
     run_client "$logfile" "$@" || rc=$?
     [[ "$rc" -eq 0 ]] || { note "client exited with $rc"; ok=1; }
     expect "$logfile" "\] Endpoint: QUIC address discovery $expected" \
-        "the created endpoint's QAD did not $expected" || ok=1
-    expect "$logfile" "Rebuilt endpoint: QUIC address discovery $expected" \
-        "the rebuilt endpoint's QAD did not $expected" || ok=1
+        "the endpoint's QAD did not $expected" || ok=1
     TIMES=()
     expect_online "$logfile" "Endpoint" "$online" || ok=1
-    expect_online "$logfile" "Rebuilt endpoint" "$online" || ok=1
     note "online: ${TIMES[*]}"
-    [[ "$(grep -c "Echo OK" "$logfile")" -eq 2 ]] ||
-        { note "expected an echo from each endpoint"; ok=1; }
+    expect "$logfile" "Echo OK" "the client got no echo" || ok=1
     [[ "$ok" -eq 0 ]] || dump_log "$logfile"
     record "$id" "$ok"
     SUMMARY[-1]+="  (${TIMES[*]})"

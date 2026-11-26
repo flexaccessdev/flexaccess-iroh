@@ -476,8 +476,6 @@ struct ProbeProgress {
     failures: Vec<(RelayUrl, String)>,
     /// The relays taken out of the endpoint's relay map.
     left_out: Vec<RelayUrl>,
-    /// Whether the probe task has let go of its handle to the endpoint.
-    released: bool,
 }
 
 impl ProbeProgress {
@@ -539,22 +537,9 @@ pub struct RelayProbes(watch::Receiver<ProbeProgress>);
 
 impl RelayProbes {
     /// Nothing to probe: the default relays.
-    pub(crate) fn none() -> Self {
-        let (_, progress) = watch::channel(ProbeProgress {
-            released: true,
-            ..ProbeProgress::default()
-        });
+    fn none() -> Self {
+        let (_, progress) = watch::channel(ProbeProgress::default());
         Self(progress)
-    }
-
-    /// A probe of one relay still running, for tests, and what settles it.
-    #[cfg(test)]
-    pub(crate) fn unsettled() -> (Self, ProbeSettler) {
-        let (tx, rx) = watch::channel(ProbeProgress {
-            total: 1,
-            ..ProbeProgress::default()
-        });
-        (Self(rx), ProbeSettler(tx))
     }
 
     /// Start probing `relay_config`'s custom relays for `endpoint`, on a task
@@ -608,37 +593,10 @@ impl RelayProbes {
         settled.unwrap_or_else(|_| progress.borrow().left_out.clone())
     }
 
-    /// Wait until the probe task no longer holds a handle to the endpoint.
-    ///
-    /// An endpoint's UDP sockets are released only with its last handle, and
-    /// the probe task keeps one while its probes run (up to
-    /// [`RELAY_CONNECT_TIMEOUT`] for a relay that does not answer). It lets
-    /// go as soon as the endpoint's close begins, but only when it next runs.
-    /// A caller that closes the endpoint and binds a new one on the same port
-    /// awaits this between the two; it returns as soon as the task has run,
-    /// without waiting for the probes. Returns at once for the default relays.
-    pub async fn released(&self) {
-        let mut progress = self.0.clone();
-        // An error means the task is gone, and its handle with it.
-        let _ = progress.wait_for(|progress| progress.released).await;
-    }
-
     /// Wait for the next probe result. `None` once nothing more will come.
     async fn changed(&mut self) -> Option<ProbeProgress> {
         self.0.changed().await.ok()?;
         Some(self.0.borrow_and_update().clone())
-    }
-}
-
-/// Settles a [`RelayProbes::unsettled`] probe, for tests.
-#[cfg(test)]
-pub(crate) struct ProbeSettler(watch::Sender<ProbeProgress>);
-
-#[cfg(test)]
-impl ProbeSettler {
-    /// Let go of the endpoint, as the task does after its last result.
-    pub(crate) fn release(self) {
-        self.0.send_modify(|progress| progress.released = true);
     }
 }
 
@@ -676,11 +634,10 @@ fn home_relay_connected(endpoint: &Endpoint, url: &RelayUrl) -> bool {
 /// apply each result to `endpoint` as it lands, and publish the progress.
 ///
 /// The task lets go of the endpoint in `slot` as soon as its close begins
-/// (`closed`, from [`Endpoint::closed`], which holds no handle to it), and says so
-/// ([`RelayProbes::released`]): its sockets are released only with its last
-/// handle, and a caller that closes the endpoint and binds a new one on the
-/// same port must not find it still taken by a probe of a relay that does not
-/// answer. Its close stops the probes still running as well: they are
+/// (`closed`, from [`Endpoint::closed`], which holds no handle to it): its
+/// sockets are released only with its last handle, so a closed endpoint does
+/// not keep its port bound while a relay that does not answer is still being
+/// probed. Its close stops the probes still running as well: they are
 /// dropped, which closes their endpoints on tasks kept in `closes` (see
 /// [`probe_relay`]), so a process that shuts down right after its start
 /// waits for those closes and not for a relay that does not answer. The probe
@@ -755,7 +712,6 @@ async fn apply_relay_probes(
         });
     }
     drop(slot.take());
-    progress.send_modify(|progress| progress.released = true);
     if !probes.is_empty() {
         info!("Stopped probing the custom relays: the endpoint is closing");
         // Their endpoints close on tasks of their own, kept in `closes`.
@@ -1122,7 +1078,6 @@ mod tests {
             for url in [RELAY, RELAY2] {
                 progress.failures.push((url.parse().unwrap(), "down".to_string()));
             }
-            progress.released = true;
         });
         drop(tx);
         let err = tokio::time::timeout(
@@ -1155,9 +1110,6 @@ mod tests {
             .await
             .expect("nothing to wait for");
         assert!(left_out.is_empty());
-        tokio::time::timeout(Duration::from_millis(100), probes.released())
-            .await
-            .expect("no probe task holds the endpoint");
         endpoint.close().await;
     }
 

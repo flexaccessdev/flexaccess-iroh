@@ -164,7 +164,8 @@ alike: all behind Cloudflare Tunnels, or all terminating TLS themselves.
 
 The setting goes everywhere the crate puts a relay into a map: the endpoint's
 relay map (`RelayConfig::relay_mode`), and the failover's re-insertions and
-restores. It is an error with the default relays, whichever value is given:
+restores. An application that replaces its endpoint mid-session builds the
+replacement from the same `RelayConfig`, and so gets the same setting. It is an error with the default relays, whichever value is given:
 n0's relays serve QAD, and iroh uses it there as it always does.
 
 Measured on 2026-11-26 with `e2e/run_quic_addr_discovery.sh --n0`, time from
@@ -211,9 +212,7 @@ kept in the caller's `PendingCloses` like a slow close, and settles within
 the probe timeout plus the probe endpoints' bounded close
 (`RelayProbes::settled`). The task holds a handle to the endpoint while it
 runs, which keeps its UDP sockets bound; it lets go when the endpoint's close
-begins, so a caller that rebinds the same port right after closing awaits
-`RelayProbes::released` in between, which does not wait for the probes. That
-close also stops the probes still running, whose endpoints are closed on tasks
+begins. That close also stops the probes still running, whose endpoints are closed on tasks
 kept in `PendingCloses`: a process that shuts down right after its start,
 while a relay that does not answer is still being probed, drains those closes
 and does not wait out the probe timeout. A probe that fails on a relay the endpoint is connected through leaves that

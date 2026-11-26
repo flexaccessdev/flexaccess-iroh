@@ -238,11 +238,9 @@ pub struct CreatedEndpoint {
     /// connectable again; a process that does not run the failover keeps them
     /// out for its lifetime. Settled at once with the default relays.
     ///
-    /// An endpoint's UDP sockets are released only with its last handle, and
-    /// until it settles the probe holds one. A caller that binds a new
-    /// endpoint on the same port closes this one, drops every handle of its
-    /// own to it, and awaits [`RelayProbes::released`] for the probe's
-    /// ([`rebuild_endpoint`] does that last part).
+    /// Until it settles the probe holds a handle to the endpoint, which keeps
+    /// its UDP sockets bound; it lets go as soon as the endpoint's close
+    /// begins.
     pub relays: RelayProbes,
 }
 
@@ -305,56 +303,8 @@ pub async fn create_endpoint(
     Ok(CreatedEndpoint { endpoint, relays })
 }
 
-/// Bind a replacement for an endpoint [`create_endpoint`] made, mid-session:
-/// for a client whose endpoint is broken beyond what iroh repairs on its own
-/// (a relay link that never re-establishes, stale paths, dead discovery state),
-/// which a fresh endpoint recovers from as a process restart would. `builder`
-/// is built as the first one was ([`endpoint_builder`] with the same
-/// [`RelayConfig`]), so it has every configured relay, those the startup
-/// probe left out included: a process that rebuilds runs no failover to put
-/// them back. `relays` is that first endpoint's startup probe
-/// ([`CreatedEndpoint::relays`]), whatever endpoint came between.
-///
-/// It differs from [`create_endpoint`] deliberately:
-///
-/// - **No relay probe.** At creation the probe checked the configuration;
-///   during an outage it would only delay the reconnect it is part of. The
-///   bind waits only for the first endpoint's probe task to let go of that
-///   endpoint ([`RelayProbes::released`]), so a caller that closed it to bind
-///   on its port does not find the port still taken; the caller must also
-///   have dropped every handle of its own to it. That is over as soon as the
-///   task runs once the first endpoint's close has begun.
-/// - **The online wait is tolerated failing.** A fresh endpoint is no worse
-///   than the broken one it replaces: a client only dials, its relay hints and
-///   local discovery can still reach a server without a home relay, and the
-///   caller tries again if the relays stay unreachable.
-///
-/// Cancelled during the online wait, it closes the new endpoint on a task of
-/// its own, kept in `closes`, rather than dropping it (iroh aborts a bound
-/// endpoint dropped without `close()`).
-pub async fn rebuild_endpoint(
-    builder: EndpointBuilder,
-    relays: &RelayProbes,
-    closes: &PendingCloses,
-) -> Result<Endpoint> {
-    relays.released().await;
-    let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
-    let mut cancelled = CloseIfCancelled::new(&endpoint, closes);
-    let online = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await;
-    cancelled.disarm(false);
-    if online.is_err() {
-        warn!(
-            "Rebuilt endpoint has no connected home relay after {}s; continuing (relay hints \
-             and local discovery may still reach a peer)",
-            RELAY_CONNECT_TIMEOUT.as_secs()
-        );
-    }
-    Ok(endpoint)
-}
-
 /// Armed while [`create_endpoint`] waits for the endpoint, beside the probe
-/// or not, while [`rebuild_endpoint`] does (with no probe), and over each
-/// relay probe's endpoint ([`crate::relay`]'s `probe_relay`): if the wait is
+/// or not, and over each relay probe's endpoint ([`crate::relay`]'s `probe_relay`): if the wait is
 /// dropped unfinished, take the probe task's handle to the endpoint and close
 /// the endpoint, so a cancelled start neither keeps the endpoint's port bound
 /// for as long as the probes run nor drops it without `close()`. It holds a handle of its own for the whole wait, since the
@@ -438,47 +388,6 @@ mod tests {
             assert_eq!(entry.quic.is_some(), enabled);
             endpoint.close().await;
         }
-    }
-
-    /// A rebuild binds only once the first endpoint's probe has let go of
-    /// that endpoint, whether or not it has settled.
-    #[tokio::test]
-    async fn a_rebuild_waits_for_the_probe_to_let_go_of_the_first_endpoint() {
-        let config = RelayConfig::from_urls(&["https://relay.example./".to_string()]).unwrap();
-        let (probes, settle) = RelayProbes::unsettled();
-        let closes = PendingCloses::new();
-        let mut rebuilt = Box::pin(rebuild_endpoint(endpoint_builder(&config, relay_only()), &probes, &closes));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut rebuilt).await.is_err(),
-            "the bind waits while the probe holds the first endpoint"
-        );
-        settle.release();
-        // Bound now; its online wait never ends, so cancel it there.
-        assert!(tokio::time::timeout(Duration::from_millis(200), &mut rebuilt).await.is_err());
-        drop(rebuilt);
-        assert_eq!(closes.0.lock().unwrap().len(), 1, "the rebuilt endpoint was bound and closed");
-        tokio::time::timeout(ENDPOINT_CLOSE_TIMEOUT, closes.finished())
-            .await
-            .expect("and its close finishes");
-    }
-
-    /// A rebuild cancelled while it waits for the new endpoint to come online
-    /// closes that endpoint rather than dropping it, and keeps the close.
-    #[tokio::test]
-    async fn a_cancelled_rebuild_closes_its_endpoint() {
-        // Never reached, so the endpoint never comes online.
-        let config = RelayConfig::from_urls(&["https://unreachable.relay.example./".to_string()]).unwrap();
-        let probes = RelayProbes::none();
-        let closes = PendingCloses::new();
-        let rebuilt = rebuild_endpoint(endpoint_builder(&config, relay_only()), &probes, &closes);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), rebuilt).await.is_err(),
-            "cancelled during the online wait"
-        );
-        assert_eq!(closes.0.lock().unwrap().len(), 1, "its endpoint's close is kept");
-        tokio::time::timeout(ENDPOINT_CLOSE_TIMEOUT, closes.finished())
-            .await
-            .expect("and finishes");
     }
 
     /// A close that takes its time is waited for up to the limit and no

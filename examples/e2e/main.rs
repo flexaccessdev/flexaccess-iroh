@@ -11,12 +11,10 @@
 //! [`EXIT_AUTH_REJECTED`] when the server refuses the key; with `--hold-secs`
 //! it keeps the authenticated connection open and echoes again every few
 //! seconds, logging the path each echo ran over, so a script can watch a live
-//! connection through a relay outage. With `--rebuild` it then replaces its
-//! endpoint the way a long-lived client replaces a broken one
-//! ([`flexaccess_iroh::endpoint::rebuild_endpoint`]) and runs the exchange
-//! again on it, and with `--qad-wait-secs` it logs whether each endpoint's net
-//! report saw QUIC address discovery answer (which `--no-quic-addr-discovery`
-//! turns off on every custom relay). Everything an application would add on
+//! connection through a relay outage. It logs how long its endpoint took to
+//! come online, and with `--qad-wait-secs` whether the endpoint's net report
+//! saw QUIC address discovery answer (which `--no-quic-addr-discovery` turns
+//! off on every custom relay). Everything an application would add on
 //! top — a product ALPN, QUIC tuning, config files, forwarding — is left out
 //! so a failure here is a failure of this crate or of iroh, never of a product.
 //!
@@ -32,7 +30,6 @@ use clap::{Args, Parser, Subcommand};
 use flexaccess_iroh::auth::{ClientKey, verify_endpoint_id_signature};
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, PendingCloses, create_endpoint, endpoint_builder,
-    rebuild_endpoint,
 };
 use flexaccess_iroh::flexaccess_keys::{self, AuthorizedKeys, PrivateKey, PublicKey};
 use flexaccess_iroh::relay::RelayConfig;
@@ -211,11 +208,7 @@ struct ClientArgs {
     /// Seconds between echoes while holding the connection open.
     #[arg(long, default_value_t = 5)]
     echo_interval_secs: u64,
-    /// After the exchange, replace the endpoint with `rebuild_endpoint` and
-    /// run the exchange again on it.
-    #[arg(long)]
-    rebuild: bool,
-    /// Before each exchange, wait up to this many seconds for the endpoint's
+    /// Before the exchange, wait up to this many seconds for the endpoint's
     /// net report to show QUIC address discovery answering, and log whether
     /// it did (`QUIC address discovery answered` / `did not answer`).
     #[arg(long)]
@@ -447,20 +440,6 @@ async fn run_client(args: ClientArgs) -> Result<ExitCode> {
         // The probe reports the relays that did not come online as it settles;
         // the endpoint's close would stop it short.
         relays.settled().await;
-        endpoint.close().await;
-        if !args.rebuild || !matches!(outcome, Ok(code) if code == ExitCode::SUCCESS) {
-            return outcome;
-        }
-        info!("Rebuilding the endpoint");
-        let builder = endpoint_builder(&relay_config, args.relay.options(false));
-        let started = Instant::now();
-        let endpoint = rebuild_endpoint(builder, &relays, &closes).await?;
-        info!("Rebuilt endpoint online after {} ms", started.elapsed().as_millis());
-        if let Some(wait) = args.qad_wait_secs {
-            report_quic_addr_discovery("Rebuilt endpoint", &endpoint, Duration::from_secs(wait))
-                .await;
-        }
-        let outcome = exchange(&endpoint, &args, &relay_config, &key).await;
         endpoint.close().await;
         outcome
     }
