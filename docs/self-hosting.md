@@ -99,10 +99,10 @@ relays that answer.
 A certificate from a private CA instead of a public one is trusted through
 `RelayConfig::with_extra_ca_roots`, which every endpoint the crate builds
 uses, the relay probes and the `/healthz` check included; the programs
-decide how a user supplies the CA. iroh trusts it for every non-iroh TLS
-connection those endpoints make, such as a pkarr publisher or resolver a
-program adds, except their DNS-over-HTTPS fallbacks, which keep the public
-roots. The QUIC address discovery check counts
+decide how a user supplies the CA. It goes into those endpoints' TLS
+config, so iroh's pkarr publisher and resolver trust it too if a program
+adds them, as does any other address lookup that uses that config; their
+DNS-over-HTTPS fallbacks keep the public roots. The QUIC address discovery check counts
 a relay whose certificate is not trusted as not serving it.
 
 ## Simple production setup: relay behind Cloudflare Tunnel (single TCP port)

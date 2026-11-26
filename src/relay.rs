@@ -156,11 +156,12 @@ impl RelayConfig {
     /// self-signed one. An error with the default relays, which are never
     /// verified against anything but the public roots.
     ///
-    /// iroh trusts an endpoint's roots for every TLS connection it makes
-    /// outside iroh's own, not only to its relays: a pkarr publisher or
-    /// resolver, or any other HTTPS address lookup a caller adds to the
-    /// builder, trusts these roots too. The one exception is the endpoint's
-    /// DNS resolver, whose DNS-over-HTTPS fallbacks are public servers: the
+    /// The roots go into the endpoint's TLS config ([`Endpoint::tls_config`]),
+    /// which is not only for its relays: iroh's pkarr publisher and resolver,
+    /// if a caller adds them to the builder, trust these roots too, as does
+    /// any other address lookup that uses that config; one that builds its
+    /// own TLS client trusts whatever roots it chooses. The one exception
+    /// among the endpoint's own connections is its DNS resolver, whose DNS-over-HTTPS fallbacks are public servers: the
     /// crate gives every endpoint built with extra roots a resolver of its
     /// own that trusts the embedded roots alone. That resolver uses the ring
     /// crypto provider the crate's builders set, whatever provider a caller
