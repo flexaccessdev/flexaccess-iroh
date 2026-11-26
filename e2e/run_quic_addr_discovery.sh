@@ -7,36 +7,25 @@
 # reaches the server, and checks whether its endpoint's net report saw QAD
 # answer and how long the endpoint took to come online.
 #
-# Local section (always; offline), against two local `iroh-relay --dev`:
+# Local section (always; offline), against two local `iroh-relay --dev`
+# instances, plain HTTP with nothing on UDP: neither serves QAD, like relays
+# behind a Cloudflare Tunnel or any other HTTP-only front.
 #
-#   relay1  serves QAD: a `tls` section with a certificate from a test CA and
-#           `enable_quic_addr_discovery`, its QUIC server on 127.0.0.1:7842
-#           (the port iroh assumes); the relay itself stays plain HTTP
-#   relay2  does not serve QAD (no TLS, nothing on UDP), like a relay behind a
-#           Cloudflare Tunnel or any other HTTP-only front. It is on 127.0.0.2:
-#           iroh looks for a relay's QAD at its URL host on UDP 7842, so on
-#           127.0.0.1 it would find relay1's
-#
-#   on          QAD on, the test CA trusted (--relay-ca,
-#               RelayConfig::with_extra_ca_roots): the endpoint sees QAD answer,
-#               and waits out iroh's 3 s QAD probe timeout on relay2 before
-#               coming online
-#   off         QAD off: the endpoint does not see it answer, and does not wait
-#   untrusted   control: QAD on without the test CA, relay1's QAD fails its TLS
-#               handshake and the endpoint does not see it answer. This shows
-#               the signal above is QAD, and that the CA reaches the endpoint
+#   on          QAD on: the endpoint waits out iroh's 3 s QAD probe timeout
+#               before coming online, and QAD does not answer
+#   off         QAD off: the endpoint does not wait
 #
 # n0 section (with --n0; needs the internet): n0's production relays
 # (use1-1 and euc1-1.relay.n0.iroh.link) as the custom relays, which all serve
 # QAD over the public internet:
 #
-#   n0-on       QAD on: the endpoint sees QAD answer, without the 3 s wait
+#   n0-on       QAD on: the endpoint sees QAD answer, without the 3 s wait.
+#               This is the suite's only check that QAD answers at all
 #   n0-off      QAD off: the endpoint does not see it answer
 #
 # Usage: ./e2e/run_quic_addr_discovery.sh [--n0]
 #
-# Needs Linux (127.0.0.2 on loopback), iroh-relay and openssl, and UDP
-# 127.0.0.1:7842 free.
+# Needs iroh-relay; the internet for --n0.
 # Environment: E2E_BIN, IROH_RELAY_BIN, KEEP_LOGS, READY_TIMEOUT (see lib.sh).
 #
 set -euo pipefail
@@ -53,7 +42,6 @@ esac
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 require_iroh_relay
-command -v openssl >/dev/null || die "openssl not found"
 
 # How long each endpoint gets to see QAD answer. A relay that serves it
 # answers in about one round trip; the wait only bounds the negative cases.
@@ -67,41 +55,13 @@ QUICK_MS=2000
 # ---------------------------------------------------------------------------
 # Relays
 # ---------------------------------------------------------------------------
-# A test CA and a server certificate it signs: webpki refuses a self-signed
-# CA certificate presented as the server's own (CaUsedAsEndEntity).
-log "Generating a test CA and relay1's certificate..."
-{
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
-        -subj "/CN=flexaccess-iroh e2e CA" -addext "basicConstraints=critical,CA:TRUE" \
-        -addext "keyUsage=critical,keyCertSign" \
-        -keyout "$WORK/ca.key" -out "$WORK/ca.crt" &&
-    openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-        -subj /CN=localhost -keyout "$WORK/relay1.key" -out "$WORK/relay1.csr" &&
-    printf '%s\n' "basicConstraints=critical,CA:FALSE" "extendedKeyUsage=serverAuth" \
-        "subjectAltName=DNS:localhost,IP:127.0.0.1" > "$WORK/relay1.ext" &&
-    openssl x509 -req -in "$WORK/relay1.csr" -CA "$WORK/ca.crt" -CAkey "$WORK/ca.key" \
-        -CAcreateserial -days 1 -extfile "$WORK/relay1.ext" -out "$WORK/relay1.crt"
-} >/dev/null 2>&1 || die "openssl could not create the certificates"
-
 mapfile -t PORTS < <(pick_ports 2)
 define_relay 1 "${PORTS[0]}"
-define_relay 2 "${PORTS[1]}" 127.0.0.2
-cat >> "$WORK/relay1.toml" <<EOF
-enable_quic_addr_discovery = true
-
-[tls]
-cert_mode = "Manual"
-manual_cert_path = "$WORK/relay1.crt"
-manual_key_path = "$WORK/relay1.key"
-quic_bind_addr = "127.0.0.1:7842"
-EOF
-log "Starting the relays (relay1 serves QAD on UDP 127.0.0.1:7842)..."
+define_relay 2 "${PORTS[1]}"
+log "Starting the relays (neither serves QAD)..."
 start_relay 1
 start_relay 2
-RELAY1="http://127.0.0.1:${PORTS[0]}"
-RELAY2="http://127.0.0.2:${PORTS[1]}"
-BOTH=(--relay-url "$RELAY1" --relay-url "$RELAY2")
-CA=(--relay-ca "$WORK/ca.crt")
+BOTH=(--relay-url "http://127.0.0.1:${PORTS[0]}" --relay-url "http://127.0.0.1:${PORTS[1]}")
 
 # ---------------------------------------------------------------------------
 # Server
@@ -200,16 +160,13 @@ scenario() {
 # ---------------------------------------------------------------------------
 # Local relays
 # ---------------------------------------------------------------------------
-start_server local "${BOTH[@]}" "${CA[@]}"
+start_server local "${BOTH[@]}"
 
-scenario on "answered" waited "QAD on, relay1's CA trusted" "${BOTH[@]}" "${CA[@]}"
+scenario on "did not answer" waited "QAD on" "${BOTH[@]}"
 
-scenario off "did not answer" quick "QAD off on every relay" \
-    "${BOTH[@]}" "${CA[@]}" --no-quic-addr-discovery
+scenario off "did not answer" quick "QAD off on every relay" "${BOTH[@]}" --no-quic-addr-discovery
 expect "$LAST_LOG" "QUIC address discovery is off for the custom relays" \
     "the client did not log that QAD is off" || record off-logged 1
-
-scenario untrusted "did not answer" waited "QAD on without the test CA" "${BOTH[@]}"
 
 check_server_alive local
 kill_pid "$SERVER_PID"

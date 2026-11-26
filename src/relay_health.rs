@@ -47,16 +47,10 @@ pub struct CustomRelayStatus {
 /// the health check trusts. reqwest's own default on the `rustls-no-provider`
 /// feature is `rustls-platform-verifier`; handing reqwest a preconfigured config
 /// keeps that verifier out entirely, and needs no process-wide crypto provider.
-/// The relays' extra CA roots ([`RelayConfig::extra_ca_roots`]) are trusted
-/// too, as the endpoint trusts them.
-fn healthz_tls_config(relay_config: &RelayConfig) -> rustls::ClientConfig {
-    let mut roots = rustls::RootCertStore {
+fn healthz_tls_config() -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let (added, ignored) = roots.add_parsable_certificates(relay_config.extra_ca_roots().iter().cloned());
-    if ignored > 0 {
-        log::warn!("{ignored} of {} extra relay CA roots could not be parsed", added + ignored);
-    }
     rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
         .expect("ring supports the default TLS protocol versions")
@@ -73,7 +67,7 @@ pub async fn probe_custom_relay_health(relay_config: &RelayConfig) -> Vec<Custom
         return Vec::new();
     }
     let client = match reqwest::Client::builder()
-        .tls_backend_preconfigured(healthz_tls_config(relay_config))
+        .tls_backend_preconfigured(healthz_tls_config())
         .timeout(HEALTHZ_TIMEOUT)
         .build()
     {

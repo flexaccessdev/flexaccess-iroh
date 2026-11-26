@@ -173,11 +173,11 @@ bind to online:
 
 | Relays | QAD on | QAD off |
 |---|---|---|
-| a local relay serving QAD + one serving none | 3009 ms | 210 ms |
+| two local relays, neither serving QAD | 3009 ms | 210 ms |
 | n0's `use1-1` and `euc1-1`, both serving QAD | 1160 ms | 1132 ms |
 
-On relays that all serve QAD, leaving it on costs nothing; one relay that does
-not costs every start the full timeout.
+On relays that all serve QAD, leaving it on costs nothing; relays that do not
+cost every start the full timeout.
 
 A relay-only endpoint (`EndpointOptions::relay_only`) has no IP transports,
 so iroh never probes QAD on it whatever the setting.

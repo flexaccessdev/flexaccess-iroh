@@ -10,7 +10,7 @@
 //! [`endpoint_builder`], then hand it to [`create_endpoint`].
 
 use crate::relay::{
-    EndpointSlot, RELAY_CONNECT_TIMEOUT, RelayConfig, RelayProbes, wait_online_beside, with_relay_tls,
+    EndpointSlot, RELAY_CONNECT_TIMEOUT, RelayConfig, RelayProbes, wait_online_beside,
 };
 use anyhow::{Context, Result};
 use futures::FutureExt;
@@ -199,7 +199,7 @@ pub fn endpoint_builder(relay_config: &RelayConfig, options: EndpointOptions) ->
     // iroh 1.x requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
-    let mut builder = with_relay_tls(Endpoint::builder(presets::Empty), relay_config.ca_tls_config().as_ref())
+    let mut builder = Endpoint::builder(presets::Empty)
         .relay_mode(relay_config.relay_mode())
         .transport_config(options.transport_config)
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));

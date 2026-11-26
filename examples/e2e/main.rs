@@ -37,8 +37,6 @@ use flexaccess_iroh::relay_failover::fail_over_home_relay;
 use iroh::endpoint::{Connection, Incoming, QuicTransportConfig};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, Watcher};
 use log::{error, info, warn};
-use rustls::pki_types::CertificateDer;
-use rustls::pki_types::pem::PemObject;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -119,10 +117,6 @@ struct RelayArgs {
     /// address lookup of any kind. Requires custom relays.
     #[arg(long)]
     relay_only: bool,
-    /// PEM file of CA certificates the custom relays' TLS is also verified
-    /// against, such as a local test relay's self-signed certificate.
-    #[arg(long)]
-    relay_ca: Option<PathBuf>,
     /// The custom relays serve no QUIC address discovery: never probe any of
     /// them for it. Requires custom relays.
     #[arg(long)]
@@ -132,15 +126,6 @@ struct RelayArgs {
 impl RelayArgs {
     fn resolve(&self) -> Result<RelayConfig> {
         let mut config = RelayConfig::from_urls_with_token(&self.relay_urls, self.relay_auth_token.clone())?;
-        if let Some(path) = &self.relay_ca {
-            let roots = CertificateDer::pem_file_iter(path)
-                .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
-                .with_context(|| format!("reading CA certificates from {}", path.display()))?;
-            if roots.is_empty() {
-                bail!("{} holds no certificates", path.display());
-            }
-            config = config.with_extra_ca_roots(roots)?;
-        }
         if self.no_quic_addr_discovery {
             config = config.with_quic_addr_discovery(false)?;
         }

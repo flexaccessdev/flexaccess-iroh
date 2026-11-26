@@ -98,16 +98,6 @@ setting is all or none (`RelayConfig::with_quic_addr_discovery`), so a relay
 list mixing this setup with the Cloudflare Tunnel one below pays that timeout
 for the tunnelled relays, or turns QUIC address discovery off for all.
 
-A certificate from a private CA instead of a public one is trusted through
-`RelayConfig::with_extra_ca_roots`, which every endpoint the crate builds
-uses, the relay probes and the `/healthz` check included; the programs
-decide how a user supplies the CA. It goes into those endpoints' TLS
-config, so iroh's pkarr publisher and resolver trust it too if a program
-adds them, as does any other address lookup that uses that config; their
-DNS-over-HTTPS fallbacks keep the public roots. QUIC address discovery runs
-over TLS too, so a relay whose certificate is not trusted answers it with a
-failed handshake.
-
 ## Simple production setup: relay behind Cloudflare Tunnel (single TCP port)
 
 If you don't want to manage TLS certificates or open inbound ports, run the
