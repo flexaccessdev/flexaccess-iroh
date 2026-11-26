@@ -153,7 +153,8 @@ answers probes but refuses relay connections puts the process into the stall
 described above: iroh prefers it by latency, never connects, and `online()`
 does not resolve. The probe gives up on it after 10 s and takes it out, which
 forces a fresh net report; the endpoint homes on a relay that works, and
-`create_endpoint`'s wait restarts its 10 s from that change, so the start
+`create_endpoint`'s wait restarts its window (10 s, 16 s when the endpoint
+runs QUIC address discovery) from that change, so the start
 succeeds about as late as it did when the probe ran ahead of the bind. The
 server's clients, which dial with every configured relay as a hint, reach it
 through whichever relay it is homed on.

@@ -164,8 +164,9 @@ alike: all behind Cloudflare Tunnels, or all terminating TLS themselves.
 - **On** (the default): every relay is in the relay map exactly as iroh has it
   (`iroh::RelayConfig::from(url)`, QAD on UDP 7842 at the URL's host), and iroh
   does the rest. A relay whose QAD is down for a while can hold a full report
-  back by up to iroh's 3 s timeout, as it does in iroh; nothing in the crate
-  works around it.
+  back by up to iroh's 3 s timeout, as it does in iroh; the crate only widens
+  its startup window to cover it (see the
+  [startup probe](#custom-relay-validation-the-per-relay-startup-probe)).
 - **Off**: no relay is probed for QAD (`quic: None` on every entry), so no
   report waits for it, and no relay reports the endpoint's public address.
   For relays behind a Cloudflare Tunnel or any other HTTP-only front.
@@ -205,13 +206,52 @@ the last relay left. A probe is a connection of its own, so its result and the
 endpoint's can differ: a probe can fail on a relay the endpoint is connected
 through, which stays, and the endpoint can fail to come online on relays that
 passed. **Startup fails when every probe fails and the endpoint is not
-connected, or when the endpoint is still not online 10 s after the wait began
-or a probe last took a relay out of the map**, so a startup timeout does not
-by itself mean that every relay failed its probe. Only taking a relay out
-restarts the 10 s. A probe still running when the 10 s are up is waited for,
-since it may yet take out the relay that keeps the endpoint offline. The probe
-checks relay connectivity only; QUIC address discovery is the application's
-setting (see [above](#quic-address-discovery-on-custom-relays)).
+connected, or when the endpoint is still not online within its startup window
+after the wait began or a probe last took a relay out of the map**, so a
+startup timeout does not by itself mean that every relay failed its probe.
+Only taking a relay out restarts the window. A probe still running when the
+window is up is waited for, since it may yet take out the relay that keeps the
+endpoint offline. The probe checks relay connectivity only; QUIC address
+discovery is the application's setting (see
+[above](#quic-address-discovery-on-custom-relays)).
+
+The window is the probes' 10 s, plus iroh's 3 s QAD probe timeout
+(`relay::QAD_PROBES_TIMEOUT`) for each net report that can come before the
+endpoint homes on a relay that works, when the endpoint runs QAD: QAD on and
+IP transports present. The probes never run QAD, but such an endpoint opens no
+relay connection until its net report's QAD probes are done, so on 10 s alone
+a relay that connects late in its probe's window would pass the probe and
+still fail the start. From the start that is one report (13 s). After a relay
+is taken out it is two (16 s): iroh runs one report at a time, so the map
+change waits behind the report already running, which may still home the
+endpoint on a relay just taken out, and any later change joins the one
+queued. A relay-only endpoint, or one with QAD off, gets 10 s.
+
+**Known limitation (iroh 1.5).** iroh's queue holds one pending report and
+keeps only the latest reason for it, so a port-mapping update (or the
+periodic refresh) that lands while a report is running replaces a queued
+relay-map change. The report that then runs is incremental, not full, and
+neither of its outcomes is checked against the relay map. With QAD on, it
+keeps the QAD connections it already has (on an IPv4-only host it may probe
+nothing else), so a relay the probe just took out stays preferred while it
+still answers QAD. With QAD off, it plans no probes at all once an earlier
+report has latencies, and an empty report keeps the current home relay.
+Either way the endpoint can stay homed on the relay just taken out, and the
+start times out although a remaining relay passed its probe. It re-homes
+later: with QAD off at the next periodic report (every 20–26 s), which probes
+the map again after an empty one, and with QAD on at the next full report,
+about 5 minutes later. A longer window does not help, and QAD off
+does not avoid it. The fix belongs in iroh's report queue, which should not
+let a later reason replace a queued full refresh; as of 2026-11-26 that is
+unreported upstream, and iroh's `main` still queues this way.
+
+iroh commit [`4c12b0f`](https://github.com/n0-computer/iroh/commit/4c12b0f7bc8560117beb4940d3fbea94a0f88680)
+("give up the home relay when it leaves the relay map", on `main` after
+v1.5.0 and not yet released) narrows this without closing it: a report no
+longer prefers a relay outside the map, and an empty one no longer falls back
+to a home relay that has left it. With it, the endpoint no longer homes on
+the relay just taken out, but an overwritten refresh still leaves it without
+a home relay, and offline, until the same later report.
 
 `create_endpoint` returns as soon as the endpoint is online, so on healthy
 relays the probe costs the start nothing: it used to run ahead of the bind and
@@ -243,7 +283,7 @@ relay by probe latency, so a relay that answers probes but refuses relay
 connections would be preferred, never connect, and keep `online()` from ever
 resolving. The probe therefore takes it out of the live map (never the last
 relay left), which forces a fresh net report that re-homes the endpoint, and
-the wait for the endpoint restarts its 10 s from that change, so the endpoint
+the wait for the endpoint restarts its window from that change, so the endpoint
 gets a full window on the relays that work. The relays taken out are handed
 on (`CreatedEndpoint::relays`, `RelayProbes::settled`) for the failover to
 restore once they are connectable, using this same probe; a process that does
