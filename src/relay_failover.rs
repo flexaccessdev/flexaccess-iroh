@@ -538,7 +538,15 @@ where
         // Whether there is another relay in the map to fail over to.
         let alternative = in_map(relays.configured(), &out).len() > 1;
         tokio::select! {
-            () = sleep_until_opt(outage.report_at) => outage.report(alternative),
+            () = sleep_until_opt(outage.report_at) => {
+                // As for the failover deadline below: a reconnect can be
+                // waiting unread, and ends the outage before it is reported.
+                value = watcher.get();
+                outage.observe(&describe(&value));
+                if outage.report_at.is_some() {
+                    outage.report(alternative);
+                }
+            }
             () = sleep_until_opt(outage.fail_over_at) => {
                 // A reconnect can be waiting unread, ready together with this
                 // deadline or as a probe finished: act on the status as it is.
@@ -767,6 +775,45 @@ mod tests {
     }
 
     const SEC: Duration = Duration::from_secs(1);
+
+    std::thread_local! {
+        /// The warnings logged on this thread since [`capture_warnings`].
+        static WARNINGS: std::cell::RefCell<Vec<String>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    /// A logger that keeps each thread's warnings, so that a test (on a
+    /// thread of its own) sees only those it caused.
+    struct CaptureWarnings;
+
+    impl log::Log for CaptureWarnings {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                WARNINGS.with(|w| w.borrow_mut().push(record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Start capturing this thread's warnings afresh.
+    fn capture_warnings() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&CaptureWarnings).expect("no other logger in the tests");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        WARNINGS.with(|w| w.borrow_mut().clear());
+    }
+
+    fn warnings() -> Vec<String> {
+        WARNINGS.with(|w| w.borrow().clone())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn healthy_relay_never_acts() {
@@ -1158,6 +1205,35 @@ mod tests {
                 }
             };
             tokio::join!(run_for(&status, &mut relays, first + 100 * SEC), flipper);
+            assert_eq!(
+                relays.actions(),
+                vec![Action::Recheck { out: Vec::new(), at: first }]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_as_a_slow_recheck_finishes_is_not_reported_as_an_outage() {
+        // A goes down 3 s before a recheck that takes 40 s and reconnects
+        // just as it finishes, past the time to report the outage: the
+        // update is still unread when that time is taken up. Repeated, since
+        // which ready branch `select!` takes first is random.
+        let first = QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
+        for _ in 0..32 {
+            capture_warnings();
+            let status = Watchable::new(Status::UpOnA);
+            let mut relays = FakeRelays::new(&status, None);
+            relays.recheck_takes = 40 * SEC;
+            relays.after_recheck = Some(Status::UpOnA);
+            let flipper = {
+                let status = status.clone();
+                async move {
+                    tokio::time::sleep(first - 3 * SEC).await;
+                    status.set(Status::DownOnA).ok();
+                }
+            };
+            tokio::join!(run_for(&status, &mut relays, first + 100 * SEC), flipper);
+            assert_eq!(warnings(), Vec::<String>::new());
             assert_eq!(
                 relays.actions(),
                 vec![Action::Recheck { out: Vec::new(), at: first }]
