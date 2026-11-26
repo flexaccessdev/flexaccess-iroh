@@ -157,7 +157,9 @@ alone: a network that drops UDP turns a relay that serves QAD into one that
 does not, for that endpoint.
 
 So the application **says it, for all custom relays at once**:
-`RelayConfig::with_quic_addr_discovery(bool)`, on by default. The application
+`RelayConfig::with_quic_addr_discovery(bool)`, on by default
+(`RelayConfig::from_settings` takes it together with the URLs and the token,
+as an optional setting). The application
 knows how its relays are deployed, and a deployment's relays are normally all
 alike: all behind Cloudflare Tunnels, or all terminating TLS themselves.
 

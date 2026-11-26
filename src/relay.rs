@@ -186,6 +186,27 @@ impl RelayConfig {
         })
     }
 
+    /// The relay configuration from an application's settings as it has
+    /// them: the relay URLs, the shared auth token, and whether the custom
+    /// relays serve QUIC address discovery. [`Self::from_urls_with_token`],
+    /// then [`Self::with_quic_addr_discovery`] when `quic_addr_discovery` is
+    /// set.
+    ///
+    /// Unset keeps the default, on. Set, either way, it is an error with the
+    /// default relays, as a token is: a setting with nothing to apply to is
+    /// a misconfiguration, surfaced before the endpoint starts.
+    pub fn from_settings(
+        urls: &[String],
+        auth_token: Option<String>,
+        quic_addr_discovery: Option<bool>,
+    ) -> Result<Self> {
+        let config = Self::from_urls_with_token(urls, auth_token)?;
+        match quic_addr_discovery {
+            Some(enabled) => config.with_quic_addr_discovery(enabled),
+            None => Ok(config),
+        }
+    }
+
     /// Say whether the custom relays serve QUIC address discovery (QAD), all
     /// of them or none: the application knows how its relays are deployed,
     /// and a relay cannot be asked. The iroh relay advertises QAD nowhere,
@@ -815,6 +836,24 @@ mod tests {
             panic!("custom relays give a custom relay map");
         };
         assert!(map.get(&RELAY.parse::<RelayUrl>().unwrap()).unwrap().quic.is_some());
+    }
+
+    /// The settings constructor is the token constructor plus the QUIC
+    /// address discovery setting when one is given, with the same rules.
+    #[test]
+    fn from_settings_takes_the_quic_addr_discovery_setting_when_given() {
+        let unset = RelayConfig::from_settings(&two(), Some("token".into()), None).unwrap();
+        assert_eq!(unset, RelayConfig::from_urls_with_token(&two(), Some("token".into())).unwrap());
+        assert_eq!(unset.quic_addr_discovery(), Some(true));
+        for enabled in [true, false] {
+            let set = RelayConfig::from_settings(&two(), None, Some(enabled)).unwrap();
+            assert_eq!(set.quic_addr_discovery(), Some(enabled));
+            // With the default relays there is nothing for it to apply to.
+            assert!(RelayConfig::from_settings(&[], None, Some(enabled)).is_err());
+        }
+        assert_eq!(RelayConfig::from_settings(&[], None, None).unwrap(), RelayConfig::Default);
+        assert!(RelayConfig::from_settings(&[], Some("token".into()), None).is_err());
+        assert!(RelayConfig::from_settings(&["not a url".to_string()], None, None).is_err());
     }
 
     #[test]
