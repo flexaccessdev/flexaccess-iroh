@@ -54,6 +54,13 @@
 //! A relay is put back probed for QUIC address discovery only if the restore
 //! probe found it serves it, the same check the startup probe makes; a relay
 //! re-inserted unchanged keeps what the endpoint was last told about it.
+//! The relays in the map not found serving it are probed again every
+//! [`QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL`] with that same probe, and get it
+//! once one finds they serve it: the startup answer holds only for the
+//! network the process started on. The recheck runs in the loop like a
+//! restore probe, so the relay map cannot change under it. An endpoint
+//! without IP transports (relay-only) cannot use QUIC address discovery and
+//! is never rechecked.
 //!
 //! Only the *home* relay matters: non-home relays are connected on demand and
 //! dropped after a minute idle, which is normal and not an outage. With the
@@ -63,7 +70,8 @@
 
 use crate::endpoint::PendingCloses;
 use crate::relay::{
-    RelayConfig, RelayProbes, has_ip_transports, probe_relay, relay_entry, relay_failure,
+    RelayConfig, RelayProbe, RelayProbes, has_ip_transports, probe_relay, relay_entry,
+    relay_failure,
 };
 use iroh::endpoint::RelayStatus;
 use iroh::{Endpoint, RelayUrl, Watcher};
@@ -89,6 +97,10 @@ const RELAY_OUTAGE_LOG_GRACE: Duration = Duration::from_secs(5);
 /// the one that was stuck on it.
 pub const RELAY_RESTORE_INTERVAL: Duration = Duration::from_secs(90);
 
+/// How often the relays in the map not found serving QUIC address discovery
+/// are probed for it again (see the module docs).
+pub const QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL: Duration = Duration::from_secs(600);
+
 /// Watch `endpoint`'s home relay and fail over in place when it is lost for
 /// [`RELAY_OUTAGE_FAILOVER`]; see the module docs. `relays` is the startup
 /// probe ([`crate::endpoint::CreatedEndpoint::relays`]), which is waited for
@@ -96,10 +108,18 @@ pub const RELAY_RESTORE_INTERVAL: Duration = Duration::from_secs(90);
 /// relay removed here, and those serving QUIC address discovery keep it when
 /// re-inserted. Never resolves: run it alongside the accept loop and drop it
 /// with the endpoint. Pending forever with the default relays.
+///
+/// Its restore probes and rechecks run on tasks of their own, kept in
+/// `closes` until their probe endpoints are closed, so that dropping this
+/// future mid-probe drops no endpoint unclosed: a caller whose runtime ends
+/// waits for [`PendingCloses::finished`] first, as after [`create_endpoint`].
+///
+/// [`create_endpoint`]: crate::endpoint::create_endpoint
 pub async fn fail_over_home_relay(
     endpoint: &Endpoint,
     relay_config: &RelayConfig,
     relays: &RelayProbes,
+    closes: &PendingCloses,
 ) {
     let RelayConfig::Custom { urls, auth_token } = relay_config else {
         std::future::pending().await
@@ -136,6 +156,7 @@ pub async fn fail_over_home_relay(
         auth_token: auth_token.clone(),
         ip_transports: has_ip_transports(endpoint),
         quic_addr_discovery: relays.quic_addr_discovery.clone(),
+        closes: closes.clone(),
     };
     run_failover(
         endpoint.home_relay_status(),
@@ -198,6 +219,10 @@ trait FailoverRelays {
     /// Put a removed relay back if it is connectable again. Returns whether
     /// it is back in the map.
     async fn restore(&mut self, url: &RelayUrl) -> bool;
+
+    /// Probe the relays in the map (all but `out`) not found serving QUIC
+    /// address discovery, and turn it on for those that serve it now.
+    async fn recheck_quic_addr_discovery(&mut self, out: &[RelayUrl]);
 }
 
 /// The real endpoint's relay map.
@@ -207,11 +232,13 @@ struct EndpointRelays<'a> {
     urls: Vec<RelayUrl>,
     auth_token: Option<String>,
     /// Whether the endpoint has IP transports, without which it cannot use
-    /// QUIC address discovery and restore probes do not check for it.
+    /// QUIC address discovery and no probe checks for it.
     ip_transports: bool,
     /// The relays last found serving QUIC address discovery: at startup, then
-    /// by each restore probe.
+    /// by each restore probe and recheck.
     quic_addr_discovery: Vec<RelayUrl>,
+    /// Where the probe tasks are kept (see [`probe_detached`]).
+    closes: PendingCloses,
 }
 
 impl EndpointRelays<'_> {
@@ -254,11 +281,8 @@ impl FailoverRelays for EndpointRelays<'_> {
     }
 
     async fn restore(&mut self, url: &RelayUrl) -> bool {
-        // The failover lives on the process's runtime, where a slow close of
-        // the probe endpoint finishes by itself: nothing waits for it.
-        let closes = PendingCloses::new();
-        let probe = probe_relay(url, self.auth_token.as_deref(), self.ip_transports, &closes);
-        match probe.await {
+        let token = self.auth_token.as_deref();
+        match probe_detached(url, token, self.ip_transports, &self.closes).await {
             Ok(probe) => {
                 if !self.urls.contains(url) {
                     log::error!(
@@ -281,6 +305,82 @@ impl FailoverRelays for EndpointRelays<'_> {
                     RELAY_RESTORE_INTERVAL.as_secs()
                 );
                 false
+            }
+        }
+    }
+
+    async fn recheck_quic_addr_discovery(&mut self, out: &[RelayUrl]) {
+        if !self.ip_transports {
+            return;
+        }
+        let unserved: Vec<RelayUrl> = in_map(&self.urls, out)
+            .into_iter()
+            .filter(|url| !self.quic_addr_discovery.contains(url))
+            .collect();
+        let token = self.auth_token.as_deref();
+        let probes = futures::future::join_all(
+            unserved.iter().map(|url| probe_detached(url, token, true, &self.closes)),
+        )
+        .await;
+        for (url, probe) in unserved.into_iter().zip(probes) {
+            match probe {
+                Ok(probe) if probe.quic_addr_discovery => {
+                    log::info!("{url} now serves QUIC address discovery; turning it on");
+                    self.quic_addr_discovery.push(url.clone());
+                    self.insert(&url).await;
+                }
+                Ok(_) => log::debug!("{url} still does not serve QUIC address discovery"),
+                Err(e) => log::debug!("Cannot recheck {url} for QUIC address discovery: {e:#}"),
+            }
+        }
+    }
+}
+
+/// [`probe_relay`] on a task of its own, kept in `closes` with any slow close
+/// of its endpoints, so that it runs to the end and closes them even when the
+/// failover future is dropped mid-probe (the server's accept loop ended), and
+/// a caller whose runtime ends can wait for that.
+async fn probe_detached(
+    url: &RelayUrl,
+    auth_token: Option<&str>,
+    check_quic_addr_discovery: bool,
+    closes: &PendingCloses,
+) -> anyhow::Result<RelayProbe> {
+    let (url, auth_token) = (url.clone(), auth_token.map(str::to_owned));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task_closes = closes.clone();
+    closes.keep(tokio::spawn(async move {
+        let check = check_quic_addr_discovery;
+        let probe = probe_relay(&url, auth_token.as_deref(), check, &task_closes).await;
+        // The failover may be gone: the probe ran to the end all the same.
+        let _ = tx.send(probe);
+    }));
+    rx.await.map_err(|_| anyhow::anyhow!("probe task ended without a result"))?
+}
+
+/// Await `work` while still observing every status change, so that the
+/// outage bookkeeping sees each reconnect and new outage a long probe would
+/// otherwise hide. Deadlines do not act meanwhile: the loop takes them up
+/// once `work` is done, which keeps the relay-map changes in sequence.
+async fn observing<W, D, T>(
+    work: impl Future<Output = T>,
+    watcher: &mut W,
+    describe: &D,
+    outage: &mut Outage,
+    value: &mut W::Value,
+) -> T
+where
+    W: Watcher,
+    D: Fn(&W::Value) -> HomeRelay,
+{
+    let mut work = std::pin::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            done = &mut work => return done,
+            next = next_value(watcher) => {
+                *value = next;
+                outage.observe(&describe(value));
             }
         }
     }
@@ -429,6 +529,7 @@ where
         .into_iter()
         .map(|url| (url, Instant::now() + RELAY_RESTORE_INTERVAL))
         .collect();
+    let mut recheck_at = Instant::now() + QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
     let mut value = watcher.get();
     outage.observe(&describe(&value));
     loop {
@@ -437,8 +538,20 @@ where
         // Whether there is another relay in the map to fail over to.
         let alternative = in_map(relays.configured(), &out).len() > 1;
         tokio::select! {
-            () = sleep_until_opt(outage.report_at) => outage.report(alternative),
+            () = sleep_until_opt(outage.report_at) => {
+                // As for the failover deadline below: a reconnect can be
+                // waiting unread, and ends the outage before it is reported.
+                value = watcher.get();
+                outage.observe(&describe(&value));
+                if outage.report_at.is_some() {
+                    outage.report(alternative);
+                }
+            }
             () = sleep_until_opt(outage.fail_over_at) => {
+                // A reconnect can be waiting unread, ready together with this
+                // deadline or as a probe finished: act on the status as it is.
+                value = watcher.get();
+                outage.observe(&describe(&value));
                 outage.fail_over_at = None;
                 let HomeRelay::Down { home, .. } = describe(&value) else {
                     continue;
@@ -465,15 +578,23 @@ where
             }
             () = sleep_until_opt(check_at) => {
                 let now = Instant::now();
-                for (url, at) in std::mem::take(&mut removed) {
-                    if at > now {
-                        removed.push((url, at));
-                    } else if relays.restore(&url).await {
-                        log::info!("{url} is connectable again and back in the relay map");
-                    } else {
-                        removed.push((url, now + RELAY_RESTORE_INTERVAL));
+                let restores = async {
+                    for (url, at) in std::mem::take(&mut removed) {
+                        if at > now {
+                            removed.push((url, at));
+                        } else if relays.restore(&url).await {
+                            log::info!("{url} is connectable again and back in the relay map");
+                        } else {
+                            removed.push((url, now + RELAY_RESTORE_INTERVAL));
+                        }
                     }
-                }
+                };
+                observing(restores, &mut watcher, &describe, &mut outage, &mut value).await;
+            }
+            () = tokio::time::sleep_until(recheck_at) => {
+                let recheck = relays.recheck_quic_addr_discovery(&out);
+                observing(recheck, &mut watcher, &describe, &mut outage, &mut value).await;
+                recheck_at = Instant::now() + QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
             }
             next = next_value(&mut watcher) => {
                 value = next;
@@ -546,6 +667,7 @@ mod tests {
         Remove { url: RelayUrl, at: Duration },
         Nudge { url: RelayUrl, at: Duration },
         Restore { url: RelayUrl, restored: bool, at: Duration },
+        Recheck { out: Vec<RelayUrl>, at: Duration },
     }
 
     #[derive(Clone)]
@@ -559,6 +681,10 @@ mod tests {
         /// What the status flips to once the loop has acted on the relay
         /// map (`None` = stays as it is).
         after_fail_over: Option<Status>,
+        /// How long a QUIC address discovery recheck takes.
+        recheck_takes: Duration,
+        /// What the status flips to as a recheck finishes.
+        after_recheck: Option<Status>,
     }
 
     impl FakeRelays {
@@ -570,6 +696,8 @@ mod tests {
                 connectable: Arc::new(AtomicBool::new(true)),
                 status: status.clone(),
                 after_fail_over,
+                recheck_takes: Duration::ZERO,
+                after_recheck: None,
             }
         }
 
@@ -614,6 +742,17 @@ mod tests {
             });
             restored
         }
+
+        async fn recheck_quic_addr_discovery(&mut self, out: &[RelayUrl]) {
+            self.actions.lock().unwrap().push(Action::Recheck {
+                out: out.to_vec(),
+                at: self.started.elapsed(),
+            });
+            tokio::time::sleep(self.recheck_takes).await;
+            if let Some(status) = self.after_recheck {
+                self.status.set(status).ok();
+            }
+        }
     }
 
     /// Run the loop against `status` for `bound` of paused time.
@@ -636,6 +775,45 @@ mod tests {
     }
 
     const SEC: Duration = Duration::from_secs(1);
+
+    std::thread_local! {
+        /// The warnings logged on this thread since [`capture_warnings`].
+        static WARNINGS: std::cell::RefCell<Vec<String>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    /// A logger that keeps each thread's warnings, so that a test (on a
+    /// thread of its own) sees only those it caused.
+    struct CaptureWarnings;
+
+    impl log::Log for CaptureWarnings {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                WARNINGS.with(|w| w.borrow_mut().push(record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Start capturing this thread's warnings afresh.
+    fn capture_warnings() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&CaptureWarnings).expect("no other logger in the tests");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        WARNINGS.with(|w| w.borrow_mut().clear());
+    }
+
+    fn warnings() -> Vec<String> {
+        WARNINGS.with(|w| w.borrow().clone())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn healthy_relay_never_acts() {
@@ -909,5 +1087,157 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quic_addr_discovery_is_rechecked_on_schedule_with_the_relays_out_then() {
+        // A wedges after the first recheck and stays out of the map.
+        let status = Watchable::new(Status::UpOnA);
+        let mut relays = FakeRelays::new(&status, Some(Status::UpOnB));
+        relays.connectable.store(false, Ordering::SeqCst);
+        let first = QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
+        let flipper = {
+            let status = status.clone();
+            async move {
+                tokio::time::sleep(first + 5 * SEC).await;
+                status.set(Status::DownOnA).ok();
+            }
+        };
+        tokio::join!(
+            run_for(&status, &mut relays, first * 2 + SEC),
+            flipper
+        );
+        let rechecks: Vec<Action> = relays
+            .actions()
+            .into_iter()
+            .filter(|action| matches!(action, Action::Recheck { .. }))
+            .collect();
+        assert_eq!(
+            rechecks,
+            vec![
+                Action::Recheck { out: Vec::new(), at: first },
+                Action::Recheck { out: vec![relay_a()], at: first * 2 },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_home_relay_that_reconnects_during_a_slow_recheck_is_not_failed_over() {
+        // A goes down 30 s before a recheck that takes 40 s, and reconnects
+        // 10 s into it: the outage deadline passes while the loop is busy,
+        // and the loop must see the reconnect before it acts. Repeated,
+        // since which ready branch `select!` takes first is random.
+        let first = QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
+        for _ in 0..32 {
+            let status = Watchable::new(Status::UpOnA);
+            let mut relays = FakeRelays::new(&status, None);
+            relays.recheck_takes = 40 * SEC;
+            let flipper = {
+                let status = status.clone();
+                async move {
+                    tokio::time::sleep(first - 30 * SEC).await;
+                    status.set(Status::DownOnA).ok();
+                    tokio::time::sleep(40 * SEC).await;
+                    status.set(Status::UpOnA).ok();
+                }
+            };
+            tokio::join!(run_for(&status, &mut relays, first + 100 * SEC), flipper);
+            assert_eq!(
+                relays.actions(),
+                vec![Action::Recheck { out: Vec::new(), at: first }]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_and_new_outage_during_a_slow_recheck_get_a_fresh_window() {
+        // A goes down 50 s before a recheck that takes 40 s; 5 s into it the
+        // endpoint homes on B, and 33 s into it B goes down. B's outage gets
+        // its own 60 s, not what was left of A's.
+        let first = QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
+        let status = Watchable::new(Status::UpOnA);
+        let mut relays = FakeRelays::new(&status, None);
+        relays.recheck_takes = 40 * SEC;
+        let flipper = {
+            let status = status.clone();
+            async move {
+                tokio::time::sleep(first - 50 * SEC).await;
+                status.set(Status::DownOnA).ok();
+                tokio::time::sleep(55 * SEC).await;
+                status.set(Status::UpOnB).ok();
+                tokio::time::sleep(28 * SEC).await;
+                status.set(Status::DownOnB).ok();
+            }
+        };
+        tokio::join!(
+            run_for(&status, &mut relays, first + 33 * SEC + RELAY_OUTAGE_FAILOVER + SEC),
+            flipper
+        );
+        assert_eq!(
+            relays.actions(),
+            vec![
+                Action::Recheck { out: Vec::new(), at: first },
+                Action::Remove {
+                    url: relay_b(),
+                    at: first + 33 * SEC + RELAY_OUTAGE_FAILOVER,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_as_a_slow_recheck_finishes_is_not_failed_over() {
+        // A goes down 30 s before a recheck that takes 40 s and reconnects
+        // just as it finishes, past the outage deadline: the update is still
+        // unread when the deadline is taken up. Repeated, since which ready
+        // branch `select!` takes first is random.
+        let first = QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
+        for _ in 0..32 {
+            let status = Watchable::new(Status::UpOnA);
+            let mut relays = FakeRelays::new(&status, None);
+            relays.recheck_takes = 40 * SEC;
+            relays.after_recheck = Some(Status::UpOnA);
+            let flipper = {
+                let status = status.clone();
+                async move {
+                    tokio::time::sleep(first - 30 * SEC).await;
+                    status.set(Status::DownOnA).ok();
+                }
+            };
+            tokio::join!(run_for(&status, &mut relays, first + 100 * SEC), flipper);
+            assert_eq!(
+                relays.actions(),
+                vec![Action::Recheck { out: Vec::new(), at: first }]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_as_a_slow_recheck_finishes_is_not_reported_as_an_outage() {
+        // A goes down 3 s before a recheck that takes 40 s and reconnects
+        // just as it finishes, past the time to report the outage: the
+        // update is still unread when that time is taken up. Repeated, since
+        // which ready branch `select!` takes first is random.
+        let first = QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
+        for _ in 0..32 {
+            capture_warnings();
+            let status = Watchable::new(Status::UpOnA);
+            let mut relays = FakeRelays::new(&status, None);
+            relays.recheck_takes = 40 * SEC;
+            relays.after_recheck = Some(Status::UpOnA);
+            let flipper = {
+                let status = status.clone();
+                async move {
+                    tokio::time::sleep(first - 3 * SEC).await;
+                    status.set(Status::DownOnA).ok();
+                }
+            };
+            tokio::join!(run_for(&status, &mut relays, first + 100 * SEC), flipper);
+            assert_eq!(warnings(), Vec::<String>::new());
+            assert_eq!(
+                relays.actions(),
+                vec![Action::Recheck { out: Vec::new(), at: first }]
+            );
+        }
     }
 }

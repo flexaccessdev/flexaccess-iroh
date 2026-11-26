@@ -34,9 +34,10 @@ use tokio::task::{AbortHandle, JoinHandle};
 pub(crate) const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The endpoint closes this crate stopped waiting for (after 5 s) and left
-/// running on the runtime, and the startup relay probes still running beside
-/// a created endpoint (see [`RelayProbes`]), whose probe endpoints must be
-/// closed the same way.
+/// running on the runtime, and the relay probes still running beside a
+/// created endpoint (see [`RelayProbes`]) or for its failover (see
+/// [`crate::relay_failover::fail_over_home_relay`]), whose probe endpoints
+/// must be closed the same way.
 ///
 /// Every caller of [`create_endpoint`] hands one in, and so decides what
 /// becomes of them. A runtime that goes away takes the closes still running
