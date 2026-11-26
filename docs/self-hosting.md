@@ -99,7 +99,8 @@ relays that answer.
 A certificate from a private CA instead of a public one is trusted through
 `RelayConfig::with_extra_ca_roots`, which every endpoint the crate builds
 uses, the relay probes and the `/healthz` check included; the programs
-decide how a user supplies the CA. The QUIC address discovery check counts
+decide how a user supplies the CA. It is trusted for the relays only: the
+endpoints' DNS-over-HTTPS fallbacks keep the public roots. The QUIC address discovery check counts
 a relay whose certificate is not trusted as not serving it.
 
 ## Simple production setup: relay behind Cloudflare Tunnel (single TCP port)

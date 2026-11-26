@@ -442,7 +442,7 @@ async fn run_client(args: ClientArgs) -> Result<ExitCode> {
         }
         info!("Rebuilding the endpoint");
         let builder = endpoint_builder(&relay_config, args.relay.options(false));
-        let endpoint = rebuild_endpoint(&relay_config, builder, &relays).await?;
+        let endpoint = rebuild_endpoint(&relay_config, builder, &relays, &closes).await?;
         if let Some(wait) = args.qad_wait_secs {
             report_quic_addr_discovery("Rebuilt endpoint", &endpoint, Duration::from_secs(wait))
                 .await;

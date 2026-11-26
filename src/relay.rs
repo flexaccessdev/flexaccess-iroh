@@ -8,7 +8,8 @@ use crate::endpoint::PendingCloses;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use iroh::endpoint::{NetReportConfig, PortmapperConfig, RelayStatus, presets};
+use iroh::dns::DnsResolver;
+use iroh::endpoint::{Builder as EndpointBuilder, NetReportConfig, PortmapperConfig, RelayStatus, presets};
 use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, Watcher};
 use log::{info, warn};
@@ -154,6 +155,10 @@ impl RelayConfig {
     /// whose certificate comes from a private CA, such as a test relay's
     /// self-signed one. An error with the default relays, which are never
     /// verified against anything but the public roots.
+    ///
+    /// The roots are trusted for the relays alone: the endpoints' DNS
+    /// resolvers, whose DNS-over-HTTPS fallbacks are public servers, keep the
+    /// embedded roots only (see [`with_relay_tls`]).
     pub fn with_extra_ca_roots(
         self,
         roots: impl IntoIterator<Item = CertificateDer<'static>>,
@@ -301,6 +306,24 @@ pub(crate) fn relay_entry(
     }
 }
 
+/// Give `builder` `ca` as its TLS trust, and a DNS resolver of its own that
+/// trusts the embedded roots alone. iroh otherwise hands the endpoint's TLS
+/// trust to its default resolver as well, whose DNS-over-HTTPS fallbacks are
+/// public servers: a private CA given for a relay
+/// ([`RelayConfig::with_extra_ca_roots`]) would be trusted to answer for
+/// those too. The resolver is otherwise the one iroh builds by default.
+pub(crate) fn with_relay_tls(builder: EndpointBuilder, ca: &CaTlsConfig) -> EndpointBuilder {
+    let dns_tls = CaTlsConfig::embedded()
+        .client_config(Arc::new(rustls::crypto::ring::default_provider()))
+        .expect("the embedded roots make a certificate verifier");
+    builder.ca_tls_config(ca.clone()).dns_resolver(
+        DnsResolver::builder()
+            .with_system_defaults()
+            .tls_client_config(dns_tls)
+            .build(),
+    )
+}
+
 /// Build a minimal, relay-only endpoint for probing a single relay.
 ///
 /// It uses an ephemeral identity (no persistent secret, no address publishing)
@@ -320,9 +343,8 @@ fn probe_endpoint_builder(
     // iroh 1.x requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
-    Endpoint::builder(presets::Empty)
+    with_relay_tls(Endpoint::builder(presets::Empty), ca)
         .relay_mode(RelayMode::Custom(map))
-        .ca_tls_config(ca.clone())
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
         // Relay-only: drop direct IP transports so `online()` is a pure relay
         // reachability signal, independent of holepunching.
@@ -340,9 +362,8 @@ fn qad_endpoint_builder(
     ca: &CaTlsConfig,
 ) -> iroh::endpoint::Builder {
     let map = RelayMap::from_iter([relay_entry(relay_url, auth_token, true)]);
-    Endpoint::builder(presets::Empty)
+    with_relay_tls(Endpoint::builder(presets::Empty), ca)
         .relay_mode(RelayMode::Custom(map))
-        .ca_tls_config(ca.clone())
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .net_report_config(NetReportConfig::minimal())
         .portmapper_config(PortmapperConfig::Disabled)
@@ -690,12 +711,17 @@ pub(crate) struct ProbeSettler(watch::Sender<ProbeProgress>);
 
 #[cfg(test)]
 impl ProbeSettler {
-    pub(crate) fn settle(self, relays: ProbedRelays) {
+    /// Settle with `relays`, still holding the endpoint.
+    pub(crate) fn settle(&self, relays: ProbedRelays) {
         self.0.send_modify(|progress| {
             progress.probed = progress.total;
             progress.relays = relays;
-            progress.released = true;
         });
+    }
+
+    /// Let go of the endpoint, as the task does after its last result.
+    pub(crate) fn release(self) {
+        self.0.send_modify(|progress| progress.released = true);
     }
 }
 
