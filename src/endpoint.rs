@@ -182,8 +182,11 @@ async fn closed_within(
 /// up every timer along with the teardown.
 ///
 /// The shutdown waits for nothing that is still on the runtime
-/// ([`Runtime::shutdown_background`]): whatever else is there is dropped
-/// with it, so `teardown` is everything that must finish.
+/// ([`Runtime::shutdown_background`]), so `teardown` is everything that must
+/// finish. The other tasks there are dropped with the runtime. Blocking work
+/// that is already running (`spawn_blocking`) is neither dropped nor waited
+/// for: it goes on, on its own thread, until it returns, which can be after
+/// this function has.
 ///
 /// `limit` bounds the wait for that thread, and that wait is all the caller
 /// does when the thread starts. Should it fail to start, the caller shuts
