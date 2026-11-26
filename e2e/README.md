@@ -48,6 +48,7 @@ cargo install iroh-relay --features server      # one-time
 
 ./e2e/run_quic_addr_discovery.sh                # ~1 minute, offline
 ./e2e/run_quic_addr_discovery.sh --n0           # ... and n0's relays as custom relays (internet)
+./e2e/run_quic_addr_discovery.sh --n0-only      # n0's relays alone (internet)
 ./e2e/run_relay_failover.sh                     # ~8 minutes: two 60 s failover windows + a 90 s restore probe
 ```
 
@@ -72,7 +73,8 @@ lines are what the scripts assert on).
 The `e2e` job in `.github/workflows/ci.yml` runs the offline suites,
 `run_e2e.sh --local-relays`, `run_e2e.sh --local-relays --relay-only`,
 `run_quic_addr_discovery.sh` and `run_relay_failover.sh`, then
-`run_quic_addr_discovery.sh --n0` last, whatever came before: its `--n0`
+`run_quic_addr_discovery.sh --n0-only` last, whatever came before: its n0
 section, the suite's only check that QAD answers, uses n0's public relays as
-custom relays, so its failure never skips an offline suite. The default-relay run of `run_e2e.sh` needs
+custom relays, so its failure never skips an offline suite, and it runs
+without local relays, so their setup cannot keep it from running. The default-relay run of `run_e2e.sh` needs
 n0's DNS as well and is left to a developer machine.

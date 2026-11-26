@@ -25,18 +25,23 @@
 #               connection, which the local cases bound
 #   n0-off      QAD off: the endpoint does not see it answer
 #
-# Usage: ./e2e/run_quic_addr_discovery.sh [--n0]
+# Usage: ./e2e/run_quic_addr_discovery.sh [--n0 | --n0-only]
 #
-# Needs iroh-relay, ss (iproute2) and UDP port 7842 free; the internet for
-# --n0.
+#   --n0        run the n0 section after the local one
+#   --n0-only   run the n0 section alone, with no local relays
+#
+# The local section needs iroh-relay, ss (iproute2) and UDP port 7842 free;
+# the n0 section needs the internet.
 # Environment: E2E_BIN, IROH_RELAY_BIN, KEEP_LOGS, READY_TIMEOUT (see lib.sh).
 #
 set -euo pipefail
 
+LOCAL=1
 N0=0
 case "${1:-}" in
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d'; exit 0 ;;
     --n0) N0=1 ;;
+    --n0-only) LOCAL=0; N0=1 ;;
     "") ;;
     *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
 esac
@@ -44,16 +49,17 @@ esac
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-require_iroh_relay
-
-# iroh probes a relay's QAD at its URL host on UDP 7842, so the local relays'
-# QAD goes to 127.0.0.1:7842 whatever their HTTP ports. A QUIC server already
-# there (another relay, say) answers or fails those probes at once, and the
-# "on" case would not wait for the timeout it checks for.
-command -v ss >/dev/null || die "ss not found: needed to check that UDP port 7842 is free"
-if [[ -n "$(ss -Hluan 'sport = :7842')" ]]; then
-    ss -luanp 'sport = :7842' >&2 || true
-    die "UDP port 7842 is in use; the local QAD checks need it free"
+if [[ "$LOCAL" -eq 1 ]]; then
+    require_iroh_relay
+    # iroh probes a relay's QAD at its URL host on UDP 7842, so the local
+    # relays' QAD goes to 127.0.0.1:7842 whatever their HTTP ports. A QUIC
+    # server already there (another relay, say) answers or fails those probes
+    # at once, and the "on" case would not wait for the timeout it checks for.
+    command -v ss >/dev/null || die "ss not found: needed to check that UDP port 7842 is free"
+    if [[ -n "$(ss -Hluan 'sport = :7842')" ]]; then
+        ss -luanp 'sport = :7842' >&2 || true
+        die "UDP port 7842 is in use; the local QAD checks need it free"
+    fi
 fi
 
 # How long each endpoint gets to see QAD answer. A relay that serves it
@@ -68,13 +74,15 @@ QUICK_MS=2000
 # ---------------------------------------------------------------------------
 # Relays
 # ---------------------------------------------------------------------------
-mapfile -t PORTS < <(pick_ports 2)
-define_relay 1 "${PORTS[0]}"
-define_relay 2 "${PORTS[1]}"
-log "Starting the relays (neither serves QAD)..."
-start_relay 1
-start_relay 2
-BOTH=(--relay-url "http://127.0.0.1:${PORTS[0]}" --relay-url "http://127.0.0.1:${PORTS[1]}")
+if [[ "$LOCAL" -eq 1 ]]; then
+    mapfile -t PORTS < <(pick_ports 2)
+    define_relay 1 "${PORTS[0]}"
+    define_relay 2 "${PORTS[1]}"
+    log "Starting the relays (neither serves QAD)..."
+    start_relay 1
+    start_relay 2
+    BOTH=(--relay-url "http://127.0.0.1:${PORTS[0]}" --relay-url "http://127.0.0.1:${PORTS[1]}")
+fi
 
 # ---------------------------------------------------------------------------
 # Server
@@ -175,16 +183,18 @@ scenario() {
 # ---------------------------------------------------------------------------
 # Local relays
 # ---------------------------------------------------------------------------
-start_server local "${BOTH[@]}"
+if [[ "$LOCAL" -eq 1 ]]; then
+    start_server local "${BOTH[@]}"
 
-scenario on "did not answer" waited "QAD on" "${BOTH[@]}"
+    scenario on "did not answer" waited "QAD on" "${BOTH[@]}"
 
-scenario off "did not answer" quick "QAD off on every relay" "${BOTH[@]}" --no-quic-addr-discovery
-expect "$LAST_LOG" "QUIC address discovery is off for the custom relays" \
-    "the client did not log that QAD is off" || record off-logged 1
+    scenario off "did not answer" quick "QAD off on every relay" "${BOTH[@]}" --no-quic-addr-discovery
+    expect "$LAST_LOG" "QUIC address discovery is off for the custom relays" \
+        "the client did not log that QAD is off" || record off-logged 1
 
-check_server_alive local
-kill_pid "$SERVER_PID"
+    check_server_alive local
+    kill_pid "$SERVER_PID"
+fi
 
 # ---------------------------------------------------------------------------
 # n0's relays as custom relays

@@ -60,7 +60,8 @@ jobs:
   # (which take ~8 minutes by design: a 60 s outage window and a 90 s restore
   # probe relay-only, then another 60 s window with direct paths allowed). The
   # QUIC address discovery suite runs once more at the end against n0's public
-  # relays too (--n0), its only check that QAD answers. See e2e/README.md.
+  # relays alone (--n0-only), its only check that QAD answers. See
+  # e2e/README.md.
   e2e:
     name: e2e (local relays)
     runs-on: ubuntu-latest
@@ -93,6 +94,8 @@ jobs:
         run: ./e2e/run_relay_failover.sh
       # Last, and whatever came before: it depends on n0's public relays, so
       # its failure says nothing about the local suites and must not skip them.
-      - name: QUIC address discovery (local + n0 relays)
+      # n0 only: the local section ran above, and its setup must not keep this
+      # one from running.
+      - name: QUIC address discovery (n0 relays)
         if: ${{ !cancelled() }}
-        run: ./e2e/run_quic_addr_discovery.sh --n0
+        run: ./e2e/run_quic_addr_discovery.sh --n0-only
