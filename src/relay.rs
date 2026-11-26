@@ -39,60 +39,6 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// its probe's window would pass the probe and still fail the start.
 pub const QAD_PROBES_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long after a net report's worth of time ([`qad_wait`]) an endpoint
-/// that the startup probe took a relay away from may stay offline before its
-/// net report is asked for again, and then again at that interval (see
-/// `wait_online_beside`).
-///
-/// Taking a relay out of the map asks iroh for a full net report, which is
-/// what homes the endpoint on a relay still in it. iroh 1.5 keeps one report
-/// queued and only the latest reason for it, so a port-mapping update or its
-/// periodic refresh that lands behind the map change replaces it, and the
-/// report that then runs is incremental: it leaves the endpoint homed on the
-/// relay just taken out, or without a home relay, until a later full report
-/// (minutes away with QAD on). Asking again is what gets that report run. The
-/// interval leaves a report already under way the time to finish and the
-/// relay connection behind it the time to come up, so a start that is going
-/// well is not asked twice.
-pub(crate) const REHOME_GRACE: Duration = Duration::from_secs(2);
-
-/// Asks an endpoint for a fresh, full net report, abstracted so that the
-/// startup wait can be driven by a test double (see `wait_online_beside`).
-pub(crate) trait NetReportRefresh {
-    /// Ask for the report. `relay` came online for its startup probe, so it
-    /// is in the relay map and the probe leaves it there.
-    async fn refresh(&mut self, relay: &RelayUrl);
-}
-
-/// The real endpoint, asked by re-inserting one of its relays unchanged: a
-/// relay-map change is what makes iroh run a full report, and this one
-/// changes nothing else.
-pub(crate) struct ReinsertRelay<'a> {
-    pub(crate) endpoint: &'a Endpoint,
-    pub(crate) relay_config: &'a RelayConfig,
-}
-
-impl NetReportRefresh for ReinsertRelay<'_> {
-    /// Re-insert `relay` exactly as configured. Nothing to do with the
-    /// default relays, which are not probed.
-    async fn refresh(&mut self, relay: &RelayUrl) {
-        let RelayConfig::Custom {
-            auth_token,
-            quic_addr_discovery,
-            ..
-        } = self.relay_config
-        else {
-            return;
-        };
-        info!(
-            "The endpoint is still offline after a relay was taken out of its relay map; \
-             re-inserting {relay} unchanged to have iroh run a fresh net report"
-        );
-        let entry = relay_entry(relay, auth_token.as_deref(), *quic_addr_discovery);
-        self.endpoint.insert_relay(relay.clone(), Arc::new(entry)).await;
-    }
-}
-
 /// How long each net report of `endpoint`, bound from `relay_config`, may
 /// wait on QAD: [`QAD_PROBES_TIMEOUT`] when it probes its relays for QAD,
 /// zero otherwise. iroh's default relays all serve QAD, so with them it is
@@ -435,15 +381,10 @@ fn probe_endpoint_builder(relay_url: &RelayUrl, auth_token: Option<&str>) -> iro
 /// outlives the wait is kept in `closes`. Dropped before it returns, the probe
 /// closes it on a task of its own, kept in `closes` as well, rather than leave
 /// iroh to abort it.
-///
-/// `connected` is called as soon as the relay has connected, ahead of that
-/// close, for a caller that cannot let a slow close hold the news up; the
-/// probe then returns `Ok(())`.
 pub(crate) async fn probe_relay(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
     closes: &PendingCloses,
-    connected: impl FnOnce(),
 ) -> Result<()> {
     let endpoint = probe_endpoint_builder(relay_url, auth_token)
         .bind()
@@ -462,24 +403,7 @@ pub(crate) async fn probe_relay(
     });
     // Closed below, on this function's own path.
     cancelled.disarm(false);
-    let close = crate::endpoint::close_endpoint(endpoint, closes);
-    probe_outcome(failure, connected, close).await
-}
-
-/// The end of a probe, whose relay connected unless there is a `failure`:
-/// say so through `connected` at once, and only then wait for the probe
-/// endpoint's `close`, which can take [`ENDPOINT_CLOSE_TIMEOUT`].
-///
-/// [`ENDPOINT_CLOSE_TIMEOUT`]: crate::endpoint::ENDPOINT_CLOSE_TIMEOUT
-async fn probe_outcome(
-    failure: Option<String>,
-    connected: impl FnOnce(),
-    close: impl Future<Output = ()>,
-) -> Result<()> {
-    if failure.is_none() {
-        connected();
-    }
-    close.await;
+    crate::endpoint::close_endpoint(endpoint, closes).await;
     match failure {
         None => Ok(()),
         Some(failure) => anyhow::bail!(
@@ -509,11 +433,6 @@ struct ProbeProgress {
     total: usize,
     /// Of those, how many have been probed.
     probed: usize,
-    /// The relays that came online for their probe. The probe leaves these
-    /// in the relay map. A relay is here as soon as it has connected, which
-    /// is before it counts as probed: that waits for its probe endpoint to
-    /// close.
-    online: Vec<RelayUrl>,
     /// The relays that did not come online, with why.
     failures: Vec<(RelayUrl, String)>,
     /// The relays taken out of the endpoint's relay map.
@@ -702,12 +621,8 @@ async fn apply_relay_probes(
         .iter()
         .map(|url| {
             let closes = &closes;
-            let progress = &progress;
             async move {
-                // Known at once, not after the probe endpoint's close: the
-                // startup wait needs such a relay to ask for the net report.
-                let connected = || progress.send_modify(|progress| progress.online.push(url.clone()));
-                let probe = probe_relay(url, auth_token, closes, connected).await;
+                let probe = probe_relay(url, auth_token, closes).await;
                 (url, probe)
             }
         })
@@ -785,23 +700,10 @@ async fn apply_relay_probes(
 /// on a relay that cannot be connected re-home on one that can. Nor does the
 /// wait end while a probe is still running, which may yet take out the relay
 /// that keeps it offline.
-///
-/// Once a relay has been taken out, `refresh` is asked every `qad_wait` plus
-/// [`REHOME_GRACE`] for as long as the endpoint stays offline: iroh can lose
-/// the net report a relay-map change asks for (see [`REHOME_GRACE`]), and
-/// `refresh` asks for it again ([`ReinsertRelay`]). It is asked with a relay
-/// that came online for its probe, and not at all until there is one. The
-/// probe task changes the relay map at the same time as this wait, and such
-/// a relay is the one kind it never takes out: re-inserting any other could
-/// put back a relay the probe is just removing. A request that came due with
-/// no such relay yet is made as soon as one comes online, rather than at the
-/// next interval, which the window may not have left. None of this keeps the
-/// wait open: it ends as described above, whatever is owed.
 pub(crate) async fn wait_online_beside(
     endpoint: &Endpoint,
     probes: &RelayProbes,
     qad_wait: Duration,
-    refresh: &mut impl NetReportRefresh,
 ) -> Result<()> {
     // Online means connected to a relay. A probe is a connection of its own
     // and can fail on a relay the endpoint is connected through, so every
@@ -826,12 +728,6 @@ pub(crate) async fn wait_online_beside(
     };
     let mut deadline = Some(Instant::now() + window);
     let mut left_out = 0;
-    // When to ask for the net report again; `None` until a relay is taken
-    // out.
-    let refresh_every = qad_wait + REHOME_GRACE;
-    let mut refresh_at = None;
-    // Whether a request came due with no relay to make it with.
-    let mut refresh_owed = false;
     let mut probing = true;
     let online = endpoint.online();
     tokio::pin!(online);
@@ -847,19 +743,6 @@ pub(crate) async fn wait_online_beside(
                     return Err(timed_out(window));
                 }
                 deadline = None;
-            }
-            () = sleep_until_opt(refresh_at) => {
-                if connected() {
-                    return Ok(());
-                }
-                // As the probe has it now, not as of the last result this
-                // wait took in.
-                let relay = probes.0.borrow().online.first().cloned();
-                refresh_owed = relay.is_none();
-                if let Some(relay) = relay {
-                    refresh.refresh(&relay).await;
-                }
-                refresh_at = Some(Instant::now() + refresh_every);
             }
             progress = probes.changed(), if probing => {
                 let Some(progress) = progress else {
@@ -877,21 +760,9 @@ pub(crate) async fn wait_online_beside(
                 if progress.left_out.len() > left_out {
                     left_out = progress.left_out.len();
                     window = RELAY_CONNECT_TIMEOUT + 2 * qad_wait;
-                    let now = Instant::now();
-                    deadline = Some(now + window);
-                    // The map change just made asks for a report itself.
-                    refresh_at = Some(now + refresh_every);
-                    refresh_owed = false;
-                    continue;
-                }
-                // Past its window, the wait lasts only as long as the probe
-                // runs, an owed request or not: one result can both bring
-                // the first relay online and settle the probe.
-                if deadline.is_none() && !probing {
+                    deadline = Some(Instant::now() + window);
+                } else if deadline.is_none() && !probing {
                     return Err(timed_out(window));
-                }
-                if refresh_owed && !progress.online.is_empty() {
-                    refresh_at = Some(Instant::now());
                 }
             }
         }
@@ -1144,27 +1015,6 @@ mod tests {
         assert_eq!(cfg.relay_auth_token(), None);
     }
 
-    /// A [`NetReportRefresh`] that only records being asked: when, on the
-    /// (paused) clock, and with which relay.
-    #[derive(Default)]
-    struct Asked(Vec<(Instant, RelayUrl)>);
-
-    impl NetReportRefresh for Asked {
-        async fn refresh(&mut self, relay: &RelayUrl) {
-            self.0.push((Instant::now(), relay.clone()));
-        }
-    }
-
-    impl Asked {
-        /// When it was asked, from `started`, having been asked with `relay`
-        /// every time.
-        fn at(self, started: Instant, relay: &RelayUrl) -> Vec<Duration> {
-            let (at, relays): (Vec<_>, Vec<_>) = self.0.into_iter().unzip();
-            assert!(relays.iter().all(|asked| asked == relay), "asked with {relays:?}");
-            at.into_iter().map(|at| at - started).collect()
-        }
-    }
-
     /// A probe that has already settled, every relay failed, when the wait
     /// begins: the start fails at once with why, not after the timeout.
     #[tokio::test]
@@ -1188,7 +1038,7 @@ mod tests {
         drop(tx);
         let err = tokio::time::timeout(
             Duration::from_secs(1),
-            wait_online_beside(&endpoint, &RelayProbes(rx), Duration::ZERO, &mut Asked::default()),
+            wait_online_beside(&endpoint, &RelayProbes(rx), Duration::ZERO),
         )
         .await
         .expect("no wait for the timeout")
@@ -1228,7 +1078,7 @@ mod tests {
             ..ProbeProgress::default()
         });
         let started = Instant::now();
-        let err = wait_online_beside(&endpoint, &RelayProbes(rx), qad, &mut Asked::default())
+        let err = wait_online_beside(&endpoint, &RelayProbes(rx), qad)
             .await
             .expect_err("never online");
         assert_took(started, RELAY_CONNECT_TIMEOUT + qad);
@@ -1253,294 +1103,15 @@ mod tests {
             std::future::pending::<()>().await
         };
         let probes = RelayProbes(rx);
-        let mut asked = Asked::default();
         let started = Instant::now();
         let err = tokio::select! {
-            outcome = wait_online_beside(&endpoint, &probes, qad, &mut asked) => {
+            outcome = wait_online_beside(&endpoint, &probes, qad) => {
                 outcome.expect_err("never online")
             }
             () = probe => unreachable!(),
         };
         assert_took(started, Duration::from_secs(5) + RELAY_CONNECT_TIMEOUT + 2 * qad);
         assert!(err.to_string().contains("after 16s"), "unexpected error: {err}");
-        endpoint.close().await;
-    }
-
-    /// An endpoint that stays offline after the probe took a relay out has
-    /// its net report asked for again, a QAD wait plus [`REHOME_GRACE`] after
-    /// the removal and at that interval from then on, with a relay that came
-    /// online for its probe; one that lost no relay is never asked.
-    #[tokio::test(start_paused = true)]
-    async fn the_startup_wait_asks_for_the_net_report_again_after_a_removal() {
-        // No relays: never online, and no relay traffic.
-        let endpoint = Endpoint::builder(presets::Empty)
-            .relay_mode(RelayMode::Disabled)
-            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .bind()
-            .await
-            .unwrap();
-        let [up, out]: [RelayUrl; 2] = two().map(|url| url.parse().unwrap());
-        let secs = |secs: &[u64]| secs.iter().map(|s| Duration::from_secs(*s)).collect::<Vec<_>>();
-
-        // (QAD wait, when the report is asked for again): one relay online
-        // and the other taken out at 5 s, with the window then open until
-        // 5 s + 10 s + two QAD waits.
-        for (qad, expected) in [
-            (QAD_PROBES_TIMEOUT, secs(&[10, 15, 20])),
-            (Duration::ZERO, secs(&[7, 9, 11, 13])),
-        ] {
-            let (tx, rx) = watch::channel(ProbeProgress {
-                total: 2,
-                ..ProbeProgress::default()
-            });
-            let probe = async {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                tx.send_modify(|progress| {
-                    progress.probed = 2;
-                    progress.online.push(up.clone());
-                    progress.failures.push((out.clone(), "down".to_string()));
-                    progress.left_out.push(out.clone());
-                });
-                std::future::pending::<()>().await
-            };
-            let started = Instant::now();
-            let mut asked = Asked::default();
-            let probes = RelayProbes(rx);
-            tokio::select! {
-                outcome = wait_online_beside(&endpoint, &probes, qad, &mut asked) => {
-                    outcome.expect_err("never online");
-                }
-                () = probe => unreachable!(),
-            }
-            assert_eq!(asked.at(started, &up), expected, "QAD wait {qad:?}");
-        }
-
-        // Nothing taken out: the map never changed, so no report was lost.
-        let (_tx, rx) = watch::channel(ProbeProgress {
-            total: 1,
-            probed: 1,
-            online: vec![up.clone()],
-            ..ProbeProgress::default()
-        });
-        let mut asked = Asked::default();
-        wait_online_beside(&endpoint, &RelayProbes(rx), Duration::ZERO, &mut asked)
-            .await
-            .expect_err("never online");
-        assert!(asked.0.is_empty(), "no relay was taken out");
-        endpoint.close().await;
-    }
-
-    /// The report is asked for with a relay that came online for its probe,
-    /// which the probe never takes out, and with no other: not with one
-    /// still being probed, and so not with one the probe takes out as the
-    /// request is made. Until a relay has come online it is not asked for.
-    #[tokio::test(start_paused = true)]
-    async fn the_net_report_is_asked_for_only_with_a_relay_that_passed_its_probe() {
-        // No relays: never online, and no relay traffic.
-        let endpoint = Endpoint::builder(presets::Empty)
-            .relay_mode(RelayMode::Disabled)
-            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .bind()
-            .await
-            .unwrap();
-        let [first, second, third]: [RelayUrl; 3] =
-            ["https://a.example.com", "https://b.example.com", "https://c.example.com"]
-                .map(|url| url.parse().unwrap());
-        let secs = |secs: &[u64]| secs.iter().map(|s| Duration::from_secs(*s)).collect::<Vec<_>>();
-        let take_out = |progress: &mut ProbeProgress, url: &RelayUrl| {
-            progress.probed += 1;
-            progress.failures.push((url.clone(), "down".to_string()));
-            progress.left_out.push(url.clone());
-        };
-
-        // The first relay is taken out at 5 s, the second at 7 s (the very
-        // moment the report is asked for again) and the third comes online
-        // at 8 s. Asked every 2 s (no QAD wait) from the last removal, until
-        // the window closes 10 s after it: never at 7 s, when the second
-        // relay was the first one not yet out, and with the third each time.
-        let (tx, rx) = watch::channel(ProbeProgress {
-            total: 3,
-            ..ProbeProgress::default()
-        });
-        let probe = async {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            tx.send_modify(|progress| take_out(progress, &first));
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            tx.send_modify(|progress| take_out(progress, &second));
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            tx.send_modify(|progress| {
-                progress.probed += 1;
-                progress.online.push(third.clone());
-            });
-            std::future::pending::<()>().await
-        };
-        let started = Instant::now();
-        let mut asked = Asked::default();
-        let probes = RelayProbes(rx);
-        tokio::select! {
-            outcome = wait_online_beside(&endpoint, &probes, Duration::ZERO, &mut asked) => {
-                outcome.expect_err("never online");
-            }
-            () = probe => unreachable!(),
-        }
-        assert_eq!(asked.at(started, &third), secs(&[9, 11, 13, 15]));
-        endpoint.close().await;
-    }
-
-    /// A request that came due before any relay had come online is made the
-    /// moment one does, and at the interval from there, rather than waiting
-    /// out an interval the window may not have left.
-    #[tokio::test(start_paused = true)]
-    async fn a_net_report_request_that_was_owed_is_made_once_a_relay_is_online() {
-        // No relays: never online, and no relay traffic.
-        let endpoint = Endpoint::builder(presets::Empty)
-            .relay_mode(RelayMode::Disabled)
-            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .bind()
-            .await
-            .unwrap();
-        let [up, out]: [RelayUrl; 2] = two().map(|url| url.parse().unwrap());
-        let secs = |secs: &[u64]| secs.iter().map(|s| Duration::from_secs(*s)).collect::<Vec<_>>();
-
-        // (when the other relay comes online, when the report is asked for):
-        // a relay taken out at 5 s, so asked for every 2 s from 7 s (no QAD
-        // wait) until the window closes at 15 s. Online only at 8 s, after
-        // the request at 7 s came due: asked at once. Online at 6 s, before
-        // any came due: asked on schedule, not early.
-        for (online_at, expected) in [(8, secs(&[8, 10, 12, 14])), (6, secs(&[7, 9, 11, 13]))] {
-            let (tx, rx) = watch::channel(ProbeProgress {
-                total: 2,
-                ..ProbeProgress::default()
-            });
-            let probe = async {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                tx.send_modify(|progress| {
-                    progress.probed += 1;
-                    progress.failures.push((out.clone(), "down".to_string()));
-                    progress.left_out.push(out.clone());
-                });
-                // Connected: online at once, probed when its endpoint closed.
-                tokio::time::sleep(Duration::from_secs(online_at - 5)).await;
-                tx.send_modify(|progress| progress.online.push(up.clone()));
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                tx.send_modify(|progress| progress.probed += 1);
-                std::future::pending::<()>().await
-            };
-            let started = Instant::now();
-            let mut asked = Asked::default();
-            let probes = RelayProbes(rx);
-            tokio::select! {
-                outcome = wait_online_beside(&endpoint, &probes, Duration::ZERO, &mut asked) => {
-                    outcome.expect_err("never online");
-                }
-                () = probe => unreachable!(),
-            }
-            assert_eq!(asked.at(started, &up), expected, "online at {online_at}s");
-        }
-        endpoint.close().await;
-    }
-
-    /// An owed request does not keep the wait open past its end: with the
-    /// window over while the probe was still running, a single result that
-    /// brings the first relay online and settles the probe ends the wait,
-    /// as a result without a relay would.
-    #[tokio::test(start_paused = true)]
-    async fn an_owed_net_report_request_does_not_outlast_the_startup_wait() {
-        // No relays: never online, and no relay traffic.
-        let endpoint = Endpoint::builder(presets::Empty)
-            .relay_mode(RelayMode::Disabled)
-            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .bind()
-            .await
-            .unwrap();
-        let [up, out]: [RelayUrl; 2] = two().map(|url| url.parse().unwrap());
-
-        // A relay taken out at 1 s: the window closes at 11 s (no QAD wait),
-        // with every request since 3 s owed. The other relay's probe is
-        // still running then, and at 12 s comes online and settles in one.
-        let (tx, rx) = watch::channel(ProbeProgress {
-            total: 2,
-            ..ProbeProgress::default()
-        });
-        let probe = async {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            tx.send_modify(|progress| {
-                progress.probed += 1;
-                progress.failures.push((out.clone(), "down".to_string()));
-                progress.left_out.push(out.clone());
-            });
-            tokio::time::sleep(Duration::from_secs(11)).await;
-            tx.send_modify(|progress| {
-                progress.online.push(up.clone());
-                progress.probed += 1;
-            });
-            std::future::pending::<()>().await
-        };
-        let started = Instant::now();
-        let mut asked = Asked::default();
-        let probes = RelayProbes(rx);
-        let wait = wait_online_beside(&endpoint, &probes, Duration::ZERO, &mut asked);
-        let err = tokio::select! {
-            outcome = tokio::time::timeout(Duration::from_secs(60), wait) => {
-                outcome.expect("the wait ends").expect_err("never online")
-            }
-            () = probe => unreachable!(),
-        };
-        let took = started.elapsed();
-        // Timers fire to the millisecond.
-        assert!(
-            took >= Duration::from_secs(12) && took < Duration::from_millis(12_010),
-            "took {took:?}, expected to end as the probe settled"
-        );
-        assert!(err.to_string().contains("after 10s"), "unexpected error: {err}");
-        assert!(asked.0.is_empty(), "no relay to ask with while the wait was open");
-        endpoint.close().await;
-    }
-
-    /// A probe says that its relay connected before it waits for its
-    /// endpoint to close, and does not say so for a relay that failed.
-    #[tokio::test(start_paused = true)]
-    async fn a_probe_reports_its_relay_connected_ahead_of_its_close() {
-        use std::cell::Cell;
-
-        let slow_close = || tokio::time::sleep(crate::endpoint::ENDPOINT_CLOSE_TIMEOUT);
-
-        let connected_at = Cell::new(None);
-        let started = Instant::now();
-        probe_outcome(None, || connected_at.set(Some(started.elapsed())), slow_close())
-            .await
-            .expect("connected");
-        assert_eq!(connected_at.get(), Some(Duration::ZERO), "not held up by the close");
-        assert_eq!(started.elapsed(), crate::endpoint::ENDPOINT_CLOSE_TIMEOUT, "which is waited for");
-
-        let failed = probe_outcome(Some("down".to_string()), || unreachable!("it failed"), slow_close());
-        let err = failed.await.expect_err("did not connect");
-        assert!(err.to_string().contains("down"), "unexpected error: {err}");
-    }
-
-    /// Asking for a fresh net report puts the relay it is asked with in the
-    /// relay map as configured, and touches no other relay.
-    #[tokio::test]
-    async fn refreshing_the_net_report_re_inserts_the_relay_as_configured() {
-        let config = RelayConfig::from_settings(&two(), Some("token".into()), Some(false)).unwrap();
-        let [first, second]: [RelayUrl; 2] = two().map(|url| url.parse().unwrap());
-        // No sockets: the relays here are never reached.
-        let endpoint = Endpoint::builder(presets::Empty)
-            .relay_mode(RelayMode::Custom(RelayMap::empty()))
-            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .clear_ip_transports()
-            .bind()
-            .await
-            .unwrap();
-        let mut reinsert = ReinsertRelay {
-            endpoint: &endpoint,
-            relay_config: &config,
-        };
-        reinsert.refresh(&second).await;
-        assert!(endpoint.remove_relay(&first).await.is_none(), "not asked with it");
-        let entry = endpoint.remove_relay(&second).await.expect("in the relay map");
-        assert!(entry.quic.is_none(), "as configured: QUIC address discovery off");
-        assert_eq!(entry, Arc::new(relay_entry(&second, Some("token"), false)));
         endpoint.close().await;
     }
 
@@ -1614,7 +1185,7 @@ mod tests {
         let (url, stalled) = stalled_relay().await;
         let url: RelayUrl = url.parse().unwrap();
         let closes = PendingCloses::new();
-        let probe = probe_relay(&url, None, &closes, || unreachable!("never connected"));
+        let probe = probe_relay(&url, None, &closes);
         assert!(
             tokio::time::timeout(Duration::from_millis(300), probe).await.is_err(),
             "still probing when dropped"

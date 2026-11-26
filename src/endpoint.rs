@@ -10,7 +10,7 @@
 //! [`endpoint_builder`], then hand it to [`create_endpoint`].
 
 use crate::relay::{
-    EndpointSlot, ReinsertRelay, RelayConfig, RelayProbes, online_timeout, qad_wait, wait_online_beside,
+    EndpointSlot, RelayConfig, RelayProbes, online_timeout, qad_wait, wait_online_beside,
 };
 use anyhow::{Context, Result};
 use futures::FutureExt;
@@ -368,13 +368,6 @@ pub struct CreatedEndpoint {
 /// comes back through the failover's restore probe; see
 /// [`CreatedEndpoint::relays`].
 ///
-/// iroh 1.5 can lose the net report that taking a relay out asks for, which
-/// would leave the endpoint homed on that relay and the start timing out
-/// beside a relay that works. So while the endpoint stays offline after a
-/// relay was taken out, a relay that came online for its probe is
-/// re-inserted unchanged every few seconds, which asks for the report again
-/// (see `docs/relays-and-address-lookup.md`).
-///
 /// On failure after binding the endpoint is closed before the error
 /// propagates (iroh aborts a bound endpoint dropped without `close()`). The
 /// close is waited for up to 5 s, so a slow teardown cannot keep the error
@@ -408,11 +401,7 @@ pub async fn create_endpoint(
         "Waiting for endpoint to come online (timeout: {}s)...",
         online_timeout(relay_config, &endpoint).as_secs()
     );
-    let mut refresh = ReinsertRelay {
-        endpoint: &endpoint,
-        relay_config,
-    };
-    let outcome = wait_online_beside(&endpoint, &relays, qad_wait, &mut refresh).await;
+    let outcome = wait_online_beside(&endpoint, &relays, qad_wait).await;
     // Not cancelled: whatever follows is up to this function's own paths.
     cancelled.disarm(outcome.is_err());
     if let Err(e) = outcome {
@@ -549,16 +538,6 @@ mod tests {
         without_ip.close().await;
         default_with_ip.close().await;
         default_without_ip.close().await;
-    }
-
-    /// `create_endpoint` can be spawned and boxed as `Send`, as consumers do
-    /// with it (a destination's endpoint is built on a task).
-    #[test]
-    fn creating_an_endpoint_is_send() {
-        fn assert_send<T: Send>(_: T) {}
-        let config = RelayConfig::Default;
-        let closes = PendingCloses::new();
-        assert_send(create_endpoint(&config, endpoint_builder(&config, relay_only()), &closes));
     }
 
     /// A teardown over within its limit: the runtime is shut down with

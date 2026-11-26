@@ -233,57 +233,31 @@ mid-session rebuild, say) gets the one-report window from
 `relay::online_timeout`. The default relays serve QAD too, so an endpoint on
 them with IP transports also gets 13 s, at startup as well.
 
-**The report a removal asks for can be lost (iroh 1.5), so the crate asks
-again.** iroh's queue holds one pending report and keeps only the latest
-reason for it, so a port-mapping update (or the periodic refresh) that lands
-while a report is running replaces a queued relay-map change. The report that
-then runs is incremental, not full, and neither of its outcomes is checked
-against the relay map. With QAD on, it keeps the QAD connections it already
-has (on an IPv4-only host it may probe nothing else), so a relay the probe
-just took out stays preferred while it still answers QAD. With QAD off, it
-plans no probes at all once an earlier report has latencies, and an empty
-report keeps the current home relay. Either way the endpoint would stay homed
-on the relay just taken out, until a later report: with QAD off the next
-periodic one (every 20–26 s), which probes the map again after an empty one,
-and with QAD on the next full one, about 5 minutes later. Left at that, the
-start would time out although a remaining relay passed its probe, however
-long the window.
+**Known limitation (iroh 1.5).** iroh's queue holds one pending report and
+keeps only the latest reason for it, so a port-mapping update (or the
+periodic refresh) that lands while a report is running replaces a queued
+relay-map change. The report that then runs is incremental, not full, and
+neither of its outcomes is checked against the relay map. With QAD on, it
+keeps the QAD connections it already has (on an IPv4-only host it may probe
+nothing else), so a relay the probe just took out stays preferred while it
+still answers QAD. With QAD off, it plans no probes at all once an earlier
+report has latencies, and an empty report keeps the current home relay.
+Either way the endpoint can stay homed on the relay just taken out, and the
+start times out although a remaining relay passed its probe. It re-homes
+later: with QAD off at the next periodic report (every 20–26 s), which probes
+the map again after an empty one, and with QAD on at the next full report,
+about 5 minutes later. A longer window does not help, and QAD off
+does not avoid it. The fix belongs in iroh's report queue, which should not
+let a later reason replace a queued full refresh; as of 2026-11-26 that is
+unreported upstream, and iroh's `main` still queues this way.
 
-So `create_endpoint` does not leave it at that. While the endpoint stays
-offline after a relay was taken out, it re-inserts a relay that came online
-for its probe, unchanged: a relay-map change of its own, which asks iroh for
-the full report again and changes nothing else. Only such a relay is used,
-and none is re-inserted until one has come online: the probe is still
-changing the map then, and a relay that passed is the one kind it never takes
-out, so the request cannot put back a relay that is just being removed. A
-probe says that its relay connected at once, before it closes its own
-endpoint, and a request that came due with no such relay yet is made as soon
-as there is one. The first time a report's worth of time after the removal
-(the QAD wait, when the endpoint runs QAD) plus 2 s, so that a start that is
-going well is not asked twice, and at that interval from then on: every 5 s
-with QAD on, every 2 s without, which fits several requests into the window.
-A request can be replaced in the queue like the first one, but each takes a
-port-mapping update or a periodic refresh landing behind it again. The log says so each time (`re-inserting <url>
-unchanged to have iroh run a fresh net report`). This works on any iroh 1.5,
-a consumer's fork or the crates.io release, so no consumer has to carry an
-iroh patch for it.
-
-At runtime the failover is covered the same way by its own schedule: a
-removal that did not re-home the endpoint leaves it without a connected home
-relay, and after another 60 s the failover re-inserts a relay unchanged (see
-[relay-failover.md](relay-failover.md)).
-
-The cause is still iroh's report queue, which should not let a later reason
-replace a queued full refresh; as of 2026-11-26 that is unreported upstream,
-and iroh's `main` still queues this way. iroh commit
-[`4c12b0f`](https://github.com/n0-computer/iroh/commit/4c12b0f7bc8560117beb4940d3fbea94a0f88680)
+iroh commit [`4c12b0f`](https://github.com/n0-computer/iroh/commit/4c12b0f7bc8560117beb4940d3fbea94a0f88680)
 ("give up the home relay when it leaves the relay map", on `main` after
-v1.5.0 and not yet released) narrows it without closing it: a report no
+v1.5.0 and not yet released) narrows this without closing it: a report no
 longer prefers a relay outside the map, and an empty one no longer falls back
 to a home relay that has left it. With it, the endpoint no longer homes on
 the relay just taken out, but an overwritten refresh still leaves it without
-a home relay, and offline, until a later report; asking again covers that
-too.
+a home relay, and offline, until the same later report.
 
 `create_endpoint` returns as soon as the endpoint is online, so on healthy
 relays the probe costs the start nothing: it used to run ahead of the bind and
