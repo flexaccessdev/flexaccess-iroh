@@ -25,7 +25,8 @@
 #
 # Usage: ./e2e/run_quic_addr_discovery.sh [--n0]
 #
-# Needs iroh-relay; the internet for --n0.
+# Needs iroh-relay, ss (iproute2) and UDP port 7842 free; the internet for
+# --n0.
 # Environment: E2E_BIN, IROH_RELAY_BIN, KEEP_LOGS, READY_TIMEOUT (see lib.sh).
 #
 set -euo pipefail
@@ -42,6 +43,16 @@ esac
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 require_iroh_relay
+
+# iroh probes a relay's QAD at its URL host on UDP 7842, so the local relays'
+# QAD goes to 127.0.0.1:7842 whatever their HTTP ports. A QUIC server already
+# there (another relay, say) answers or fails those probes at once, and the
+# "on" case would not wait for the timeout it checks for.
+command -v ss >/dev/null || die "ss not found: needed to check that UDP port 7842 is free"
+if [[ -n "$(ss -Hluan 'sport = :7842')" ]]; then
+    ss -luanp 'sport = :7842' >&2 || true
+    die "UDP port 7842 is in use; the local QAD checks need it free"
+fi
 
 # How long each endpoint gets to see QAD answer. A relay that serves it
 # answers in about one round trip; the wait only bounds the negative cases.

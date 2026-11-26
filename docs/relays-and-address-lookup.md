@@ -125,17 +125,21 @@ private relay must configure the same token.
 
 QUIC address discovery (QAD) is a QUIC endpoint a relay can run on UDP 7842
 that tells an iroh endpoint its public address, one of the signals hole
-punching uses. iroh assumes every relay given by URL serves it, and probes it
-on every relay in the map at the start of each full network report.
+punching uses. iroh assumes every relay given by URL serves it, and at the
+start of each full network report probes it on up to five relays in the map,
+stopping early once enough of them (three, or all of them when the map holds
+fewer) have answered.
 
 Probing a relay that does not serve it is not free. iroh does not pick a home
 relay until its QAD probes finish, and a probe to a relay with nothing on UDP
 7842 waits out the probe timeout: **3 s on iroh 1.5** (`PROBES_TIMEOUT`,
-net_report). An endpoint is not online until it has a home relay, so that 3 s
-lands on every start of every program, and again on each later full report
-(network changes, every 5 minutes). Measured on 2026-11-25 against two relays
-behind a Cloudflare Tunnel: the first report took 3.0 s with QAD probed and
-0.3 s without.
+net_report). When too few of the probed relays answer to stop early (none of
+them serves QAD, say, or one of two does not), the report waits up to that
+3 s. An endpoint is not online until it has a home relay, so such a delay
+lands on its start, and can again on later full reports (network changes,
+every 5 minutes). Measured on 2026-11-25 against two relays behind a
+Cloudflare Tunnel: the first report took 3.0 s with QAD probed and 0.3 s
+without.
 
 A relay serves QAD only when it terminates TLS itself, runs
 `enable_quic_addr_discovery = true`, and has UDP 7842 reachable. A relay behind
@@ -156,8 +160,9 @@ alike: all behind Cloudflare Tunnels, or all terminating TLS themselves.
 
 - **On** (the default): every relay is in the relay map exactly as iroh has it
   (`iroh::RelayConfig::from(url)`, QAD on UDP 7842 at the URL's host), and iroh
-  does the rest. A relay whose QAD is down for a while costs each full report
-  iroh's 3 s timeout, as it does in iroh; nothing in the crate works around it.
+  does the rest. A relay whose QAD is down for a while can hold a full report
+  back by up to iroh's 3 s timeout, as it does in iroh; nothing in the crate
+  works around it.
 - **Off**: no relay is probed for QAD (`quic: None` on every entry), so no
   report waits for it, and no relay reports the endpoint's public address.
   For relays behind a Cloudflare Tunnel or any other HTTP-only front.
@@ -176,8 +181,9 @@ bind to online:
 | two local relays, neither serving QAD | 3009 ms | 210 ms |
 | n0's `use1-1` and `euc1-1`, both serving QAD | 1160 ms | 1132 ms |
 
-On relays that all serve QAD, leaving it on costs nothing; relays that do not
-cost every start the full timeout.
+In these two setups, leaving QAD on costs nothing on relays that all serve it,
+and the full timeout on relays where none does. Other mixes fall between, as
+above.
 
 A relay-only endpoint (`EndpointOptions::relay_only`) has no IP transports,
 so iroh never probes QAD on it whatever the setting.

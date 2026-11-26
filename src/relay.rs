@@ -154,13 +154,15 @@ impl RelayConfig {
     ///
     /// On (the default), every relay is in the relay map exactly as iroh has
     /// it, QAD on UDP 7842 at the URL's host included, and iroh does the rest:
-    /// a relay whose QAD is down for a while costs each full net report
-    /// iroh's own probe timeout (3 s on iroh 1.5), as it does in iroh.
+    /// a relay whose QAD is down for a while can hold a full net report back
+    /// by up to iroh's own probe timeout (3 s on iroh 1.5), as it does in
+    /// iroh.
     ///
     /// Off, no relay is probed for QAD at all. For relays that cannot serve
     /// it, such as relays behind a Cloudflare Tunnel or any other HTTP-only
-    /// front: with QAD on, they would hold every full net report back by that
-    /// timeout, the first one too, which delays every endpoint start. No
+    /// front: with QAD on, when too few of the probed relays answer, a full
+    /// net report waits up to that timeout, the first one too, which delays
+    /// the endpoint's start. No
     /// relay then reports the endpoint's public address to it.
     ///
     /// An error with the default relays, which are iroh's own and keep its

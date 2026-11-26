@@ -92,8 +92,8 @@ manual_key_path = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
 ```
 
 Keep UDP 7842 reachable from where clients run: with QUIC address discovery on
-(the default), every endpoint probes it on every custom relay, and a relay that
-does not answer costs every endpoint start iroh's 3 s probe timeout. The
+(the default), every endpoint probes it on the custom relays, and relays that
+do not answer can delay an endpoint's start by up to iroh's 3 s probe timeout. The
 setting is all or none (`RelayConfig::with_quic_addr_discovery`), so a relay
 list mixing this setup with the Cloudflare Tunnel one below pays that timeout
 for the tunnelled relays, or turns QUIC address discovery off for all.
@@ -172,7 +172,7 @@ cloudflared tunnel run --token <token>
 > P2P success, use the TLS + QUIC production config above instead. Configure
 > the programs with QUIC address discovery off for such relays
 > (`RelayConfig::with_quic_addr_discovery(false)`): left on, iroh probes them
-> for it and every endpoint start waits out its 3 s probe timeout (see
+> for it and an endpoint's start can wait up to its 3 s probe timeout (see
 > [relays-and-address-lookup.md](relays-and-address-lookup.md#quic-address-discovery-on-custom-relays)).
 
 ## Relay access token
