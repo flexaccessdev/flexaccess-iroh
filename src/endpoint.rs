@@ -24,14 +24,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::{AbortHandle, JoinHandle};
 
-/// Bound wait on the graceful close of an endpoint this crate bound and is
-/// giving up on: one that never came online, or a relay probe's. iroh's close
-/// has no deadline of its own, and both are closed exactly when the network
-/// is not answering — a start must fail with its reason, and a probe report
-/// its relay, not sit behind a teardown. The close runs as its own task and
+/// Bound wait on the graceful close of an endpoint being given up on: one
+/// that never came online, a relay probe's, or a consumer's on an error exit
+/// (see [`close_endpoint`]). iroh's close has no deadline of its own, and
+/// these are closed exactly when the network is not answering — a start must
+/// fail with its reason, a probe report its relay, and a process exit with
+/// its status, not sit behind a teardown. The close runs as its own task and
 /// is never cancelled by this wait; one that outlives it is kept in the
 /// caller's [`PendingCloses`].
-pub(crate) const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The endpoint closes this crate stopped waiting for (after 5 s) and left
 /// running on the runtime, and the startup relay probes still running beside
@@ -107,7 +108,18 @@ impl PendingCloses {
 /// without `close()` having been called (logging an error, and tearing it
 /// down without telling its peers), and leaves alone one that is already
 /// closing.
-pub(crate) async fn close_endpoint(endpoint: Endpoint, closes: &PendingCloses) {
+///
+/// For a consumer closing an endpoint on an error path, where the network
+/// may be what failed and the caller has to report the error promptly. A
+/// process that exits right after can drop `closes`: that only stops
+/// tracking a close still running, which the exit (or the runtime shutting
+/// down) then cuts short.
+///
+/// # Panics
+///
+/// Panics if polled outside a Tokio runtime, or on one built without the
+/// time driver enabled.
+pub async fn close_endpoint(endpoint: Endpoint, closes: &PendingCloses) {
     let id = endpoint.id();
     let closed = closed_within(
         ENDPOINT_CLOSE_TIMEOUT,
