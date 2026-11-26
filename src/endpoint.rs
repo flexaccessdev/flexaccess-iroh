@@ -34,10 +34,9 @@ use tokio::task::{AbortHandle, JoinHandle};
 pub(crate) const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The endpoint closes this crate stopped waiting for (after 5 s) and left
-/// running on the runtime, and the relay probes still running beside a
-/// created endpoint (see [`RelayProbes`]) or for its failover (see
-/// [`crate::relay_failover::fail_over_home_relay`]), whose probe endpoints
-/// must be closed the same way.
+/// running on the runtime, and the startup relay probes still running beside
+/// a created endpoint (see [`RelayProbes`]), whose probe endpoints must be
+/// closed the same way.
 ///
 /// Every caller of [`create_endpoint`] hands one in, and so decides what
 /// becomes of them. A runtime that goes away takes the closes still running
@@ -105,8 +104,9 @@ impl PendingCloses {
 ///
 /// Either way the close has begun by the time this returns, which is what a
 /// bound endpoint needs before it is dropped: iroh aborts one that is dropped
-/// without `close()` having been called (fatal under `panic = "abort"`), and
-/// leaves alone one that is already closing.
+/// without `close()` having been called (logging an error, and tearing it
+/// down without telling its peers), and leaves alone one that is already
+/// closing.
 pub(crate) async fn close_endpoint(endpoint: Endpoint, closes: &PendingCloses) {
     let id = endpoint.id();
     let closed = closed_within(
@@ -246,9 +246,9 @@ pub struct CreatedEndpoint {
 /// would delay every start by iroh's 3 s probe timeout (see [`RelayProbes`]).
 ///
 /// On failure after binding the endpoint is closed before the error
-/// propagates (dropping a bound endpoint without `close()` is fatal under
-/// `panic = "abort"`). The close is waited for up to 5 s, so a slow teardown
-/// cannot keep the error back.
+/// propagates (iroh aborts a bound endpoint dropped without `close()`). The
+/// close is waited for up to 5 s, so a slow teardown cannot keep the error
+/// back.
 ///
 /// The probe's task, and any close that outlives that wait (this endpoint's,
 /// or a probe endpoint's), keep running and are kept in `closes`, whether the
@@ -327,8 +327,8 @@ impl Drop for CloseIfCancelled {
         let Some(endpoint) = self.endpoint.take() else {
             return;
         };
-        // Closed rather than dropped: iroh tears down an endpoint whose last
-        // handle goes without `close()` (fatal under `panic = "abort"`).
+        // Closed rather than dropped: iroh aborts an endpoint whose last
+        // handle goes without `close()`, with an error logged.
         match &self.runtime {
             Some(runtime) => self
                 .closes
