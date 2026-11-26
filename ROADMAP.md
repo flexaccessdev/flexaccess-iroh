@@ -39,4 +39,36 @@ What has to be settled first:
 
 Not started; nothing in this repository is arranged around it yet.
 
+## Keep the failover's restore-probe closes in the caller's `PendingCloses`
+
+Today the home-relay failover's restore probe (`relay_failover`) keeps the
+close of its probe endpoint in a set of its own, which nobody waits for. That
+rests on the failover living on the process's runtime, where a slow close
+finishes by itself. It holds for ezvpn, tunnel-rs and flextunnel's CLI server.
+It does not hold for flextunnel's desktop server, whose runtime ends with each
+server session: a server stopped while a restore probe is running (up to 10 s,
+every 90 s, and only while a relay is out of the relay map) lets its runtime
+go with that probe endpoint's close unfinished. The server's own endpoint is
+closed and waited for either way.
+
+What would change:
+
+- `fail_over_home_relay` takes the caller's `PendingCloses`, and the restore
+  probe keeps its closes there. That is a breaking change to its signature,
+  for all three consumers.
+- A consumer whose runtime ends with its server drops the failover future
+  before it waits for the set, so that a probe cancelled by the drop is in the
+  set by then.
+
+What has to be settled first:
+
+- Whether a probe endpoint cut off in the middle of its close does any harm.
+  It has not been reproduced. If all it costs is a log line, the idea should
+  be dropped.
+- Whether stopping a server should wait for a restore probe's close at all,
+  and what bounds that wait in each consumer.
+
+Not started. It came up in a review of flextunnel and was left out there so
+as not to hold that work up with a release of this crate.
+
 [flexaccess-keys]: https://github.com/flexaccessdev/flexaccess-keys
