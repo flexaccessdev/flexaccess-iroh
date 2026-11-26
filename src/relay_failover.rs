@@ -68,6 +68,7 @@ use crate::relay::{
 use iroh::endpoint::RelayStatus;
 use iroh::{Endpoint, RelayUrl, Watcher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -416,7 +417,7 @@ async fn observing<W, D, T>(
     describe: &D,
     outage: &mut Outage,
     value: &mut W::Value,
-    alternative: &std::cell::Cell<bool>,
+    alternative: &AtomicBool,
 ) -> T
 where
     W: Watcher,
@@ -431,7 +432,7 @@ where
                 *value = next;
                 outage.observe(&describe(value));
             }
-            () = sleep_until_opt(outage.report_at) => outage.report(alternative.get()),
+            () = sleep_until_opt(outage.report_at) => outage.report(alternative.load(Ordering::Relaxed)),
         }
     }
 }
@@ -510,7 +511,8 @@ where
             }
             () = sleep_until_opt(check_at) => {
                 let now = Instant::now();
-                let alternative = std::cell::Cell::new(alternative);
+                // Atomic rather than a `Cell`, so that the future stays `Send`.
+                let alternative = AtomicBool::new(alternative);
                 let restores = async {
                     for (url, at) in std::mem::take(&mut removed) {
                         if at > now {
@@ -518,7 +520,7 @@ where
                         } else if relays.restore(&url).await {
                             log::info!("{url} is connectable again and back in the relay map");
                             // Next to the relay that was never taken out.
-                            alternative.set(true);
+                            alternative.store(true, Ordering::Relaxed);
                         } else {
                             removed.push((url, now + RELAY_RESTORE_INTERVAL));
                         }
@@ -539,7 +541,6 @@ where
 mod tests {
     use super::*;
     use n0_watcher::Watchable;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// The home-relay status as a test double sees it.
@@ -711,6 +712,17 @@ mod tests {
     }
 
     const SEC: Duration = Duration::from_secs(1);
+
+    /// Compile-time only: callers run the failover with `tokio::spawn`.
+    #[allow(dead_code)]
+    fn the_failover_future_is_send(
+        endpoint: &Endpoint,
+        relay_config: &RelayConfig,
+        relays: &RelayProbes,
+    ) {
+        fn send<T: Send>(_: T) {}
+        send(fail_over_home_relay(endpoint, relay_config, relays));
+    }
 
     std::thread_local! {
         /// The warnings logged on this thread since [`capture_warnings`].
