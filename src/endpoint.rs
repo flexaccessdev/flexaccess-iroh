@@ -111,8 +111,14 @@ impl PendingCloses {
 ///
 /// For a consumer closing an endpoint on an error path, where the network
 /// may be what failed and the caller has to report the error promptly. A
-/// process that exits right after can drop `closes`, cutting short a close
-/// still running.
+/// process that exits right after can drop `closes`: that only stops
+/// tracking a close still running, which the exit (or the runtime shutting
+/// down) then cuts short.
+///
+/// # Panics
+///
+/// Panics if called outside a Tokio runtime, or on one built without the
+/// time driver enabled.
 pub async fn close_endpoint(endpoint: Endpoint, closes: &PendingCloses) {
     let id = endpoint.id();
     let closed = closed_within(
