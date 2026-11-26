@@ -157,8 +157,9 @@ async fn closed_within(
     tokio::time::timeout(limit, close).await.is_ok()
 }
 
-/// Run `teardown` on `runtime` to its end and then shut the runtime down,
-/// waiting at most `limit` for that. Whether it was over in time.
+/// Run `teardown` on `runtime` to its end and then shut the runtime down, on
+/// a thread of their own, and wait for that thread at most `limit`. Whether
+/// it was over in time.
 ///
 /// For a caller that owns the runtime its endpoints live on and is done with
 /// both: a session being stopped, a one-off request. What it owes those
@@ -180,19 +181,20 @@ async fn closed_within(
 /// a task that blocks a worker, which on a current-thread runtime would hold
 /// up every timer along with the teardown.
 ///
-/// Should the thread fail to start, the runtime is shut down by the caller
-/// with the teardown not run, as a caller without this function would have
-/// done, and this returns `false`. That shutdown is outside `limit`: it does
-/// not wait for blocking work, but a current-thread runtime drops its tasks
-/// on the thread that shuts it down, so a task that is slow to drop holds
-/// the caller up for as long.
+/// The shutdown waits for nothing that is still on the runtime
+/// ([`Runtime::shutdown_background`]): whatever else is there is dropped
+/// with it, so `teardown` is everything that must finish.
 ///
-/// The shutdown never blocks ([`Runtime::shutdown_background`]): whatever
-/// else is on the runtime is dropped with it, so `teardown` is everything
-/// that must finish.
+/// `limit` bounds the wait for that thread, and that wait is all the caller
+/// does when the thread starts. Should it fail to start, the caller shuts
+/// the runtime down itself, with the teardown not run, as a caller without
+/// this function would have done, and this returns `false`. That shutdown
+/// is not under `limit`: it does not wait for blocking work either, but a
+/// current-thread runtime drops its tasks on the thread that shuts it down,
+/// so a task that is slow to drop holds the caller up for as long.
 ///
-/// This blocks the calling thread for up to `limit`, so it is not for a
-/// thread that runs a runtime's tasks.
+/// Either way this blocks the calling thread, so it is not for a thread
+/// that runs a runtime's tasks.
 pub fn tear_down_runtime(
     runtime: Runtime,
     teardown: impl Future<Output = ()> + Send + 'static,
