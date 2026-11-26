@@ -145,7 +145,10 @@ HTTP-only front never does.
 So the crate **detects it per relay** instead of assuming it, as part of the
 startup probe (next section). The endpoint is bound with QAD off on every
 custom relay, and the probe turns it on, on the live endpoint, for each relay
-that answered (`ProbedRelays::quic_addr_discovery`). Next to each relay's probe endpoint, a second
+that answered (`ProbedRelays::quic_addr_discovery`). An endpoint that
+replaces it mid-session (`endpoint::rebuild_endpoint`) runs no probe of its
+own and starts with QAD on for the relays the first endpoint's probe found
+serving it. Next to each relay's probe endpoint, a second
 throwaway endpoint with UDP transports and QAD on runs a net report with only
 the QAD probes (`NetReportConfig::minimal`); its report shows UDP working
 only if the relay answered. The answer is whatever that endpoint learned by

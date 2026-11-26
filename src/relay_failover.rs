@@ -66,6 +66,7 @@ use crate::relay::{
     RelayConfig, RelayProbes, has_ip_transports, probe_relay, relay_entry, relay_failure,
 };
 use iroh::endpoint::RelayStatus;
+use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, RelayUrl, Watcher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,7 +103,10 @@ pub async fn fail_over_home_relay(
     relay_config: &RelayConfig,
     relays: &RelayProbes,
 ) {
-    let RelayConfig::Custom { urls, auth_token } = relay_config else {
+    let RelayConfig::Custom {
+        urls, auth_token, ..
+    } = relay_config
+    else {
         std::future::pending().await
     };
     if urls.is_empty() {
@@ -135,6 +139,7 @@ pub async fn fail_over_home_relay(
         endpoint,
         urls: urls.clone(),
         auth_token: auth_token.clone(),
+        ca: relay_config.ca_tls_config(),
         ip_transports: has_ip_transports(endpoint),
         quic_addr_discovery: relays.quic_addr_discovery.clone(),
     };
@@ -207,6 +212,8 @@ struct EndpointRelays<'a> {
     /// The configured relay URLs, in configured order.
     urls: Vec<RelayUrl>,
     auth_token: Option<String>,
+    /// The TLS trust the restore probes use ([`RelayConfig::extra_ca_roots`]).
+    ca: CaTlsConfig,
     /// Whether the endpoint has IP transports, without which it cannot use
     /// QUIC address discovery and restore probes do not check for it.
     ip_transports: bool,
@@ -258,7 +265,13 @@ impl FailoverRelays for EndpointRelays<'_> {
         // The failover lives on the process's runtime, where a slow close of
         // the probe endpoint finishes by itself: nothing waits for it.
         let closes = PendingCloses::new();
-        let probe = probe_relay(url, self.auth_token.as_deref(), self.ip_transports, &closes);
+        let probe = probe_relay(
+            url,
+            self.auth_token.as_deref(),
+            &self.ca,
+            self.ip_transports,
+            &closes,
+        );
         match probe.await {
             Ok(probe) => {
                 if !self.urls.contains(url) {

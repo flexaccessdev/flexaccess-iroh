@@ -9,8 +9,10 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use iroh::endpoint::{NetReportConfig, PortmapperConfig, RelayStatus, presets};
+use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, Watcher};
 use log::{info, warn};
+use rustls::pki_types::CertificateDer;
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -55,9 +57,14 @@ pub enum RelayConfig {
     /// `Authorization: Bearer <token>` header on the WebSocket upgrade (see
     /// [`Self::relay_mode`]). It is only ever carried by custom relays — the
     /// default relays never receive a token (see [`Self::from_urls_with_token`]).
+    ///
+    /// `ca_roots` are CA certificates trusted for the custom relays' TLS on top
+    /// of the embedded Mozilla roots, for a relay whose certificate comes from
+    /// a private CA (see [`Self::with_extra_ca_roots`]).
     Custom {
         urls: Vec<RelayUrl>,
         auth_token: Option<String>,
+        ca_roots: Vec<CertificateDer<'static>>,
     },
 }
 
@@ -68,10 +75,15 @@ impl fmt::Debug for RelayConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Default => f.write_str("Default"),
-            Self::Custom { urls, auth_token } => f
+            Self::Custom {
+                urls,
+                auth_token,
+                ca_roots,
+            } => f
                 .debug_struct("Custom")
                 .field("urls", urls)
                 .field("auth_token", &auth_token.as_ref().map(|_| RedactedToken))
+                .field("ca_roots", &ca_roots.len())
                 .finish(),
         }
     }
@@ -132,7 +144,52 @@ impl RelayConfig {
         Ok(Self::Custom {
             urls: parsed,
             auth_token,
+            ca_roots: Vec::new(),
         })
+    }
+
+    /// Also trust `roots` for the custom relays' TLS, on top of the embedded
+    /// Mozilla roots: every endpoint this crate builds for them uses it, the
+    /// relay probes and the `/healthz` check included. For a self-hosted relay
+    /// whose certificate comes from a private CA, such as a test relay's
+    /// self-signed one. An error with the default relays, which are never
+    /// verified against anything but the public roots.
+    pub fn with_extra_ca_roots(
+        self,
+        roots: impl IntoIterator<Item = CertificateDer<'static>>,
+    ) -> Result<Self> {
+        match self {
+            Self::Default => anyhow::bail!(
+                "extra CA roots require custom relay_urls; the default iroh relays use the public roots"
+            ),
+            Self::Custom {
+                urls,
+                auth_token,
+                mut ca_roots,
+            } => {
+                ca_roots.extend(roots);
+                Ok(Self::Custom {
+                    urls,
+                    auth_token,
+                    ca_roots,
+                })
+            }
+        }
+    }
+
+    /// The CA certificates trusted on top of the embedded roots; empty for
+    /// [`RelayConfig::Default`].
+    pub fn extra_ca_roots(&self) -> &[CertificateDer<'static>] {
+        match self {
+            Self::Default => &[],
+            Self::Custom { ca_roots, .. } => ca_roots,
+        }
+    }
+
+    /// The TLS trust for every endpoint built for these relays: iroh's default
+    /// (the embedded Mozilla roots) with [`Self::extra_ca_roots`] added.
+    pub(crate) fn ca_tls_config(&self) -> CaTlsConfig {
+        CaTlsConfig::embedded().with_extra_roots(self.extra_ca_roots().iter().cloned())
     }
 
     /// The custom relay URLs; empty for [`RelayConfig::Default`].
@@ -170,11 +227,22 @@ impl RelayConfig {
     /// discovery yet: the startup probe turns it on, on the live endpoint, for
     /// the relays that serve it (see [`RelayProbes`]).
     pub fn relay_mode(&self) -> RelayMode {
+        self.relay_mode_with_quic_addr_discovery(&[])
+    }
+
+    /// [`Self::relay_mode`] with QUIC address discovery already on for the
+    /// relays in `serving`, as a previous probe found them
+    /// ([`ProbedRelays::quic_addr_discovery`]): what
+    /// [`crate::endpoint::rebuild_endpoint`] binds with, having no probe of its
+    /// own to turn it on.
+    pub(crate) fn relay_mode_with_quic_addr_discovery(&self, serving: &[RelayUrl]) -> RelayMode {
         match self {
             Self::Default => RelayMode::Default,
-            Self::Custom { urls, auth_token } => RelayMode::Custom(
+            Self::Custom {
+                urls, auth_token, ..
+            } => RelayMode::Custom(
                 urls.iter()
-                    .map(|url| relay_entry(url, auth_token.as_deref(), false))
+                    .map(|url| relay_entry(url, auth_token.as_deref(), serving.contains(url)))
                     .collect(),
             ),
         }
@@ -246,6 +314,7 @@ pub(crate) fn relay_entry(
 fn probe_endpoint_builder(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
+    ca: &CaTlsConfig,
 ) -> iroh::endpoint::Builder {
     let map = RelayMap::from_iter([relay_entry(relay_url, auth_token, false)]);
     // iroh 1.x requires the crypto provider to be set explicitly on the
@@ -253,6 +322,7 @@ fn probe_endpoint_builder(
     // only makes the ring backend available, it does not wire it in.
     Endpoint::builder(presets::Empty)
         .relay_mode(RelayMode::Custom(map))
+        .ca_tls_config(ca.clone())
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
         // Relay-only: drop direct IP transports so `online()` is a pure relay
         // reachability signal, independent of holepunching.
@@ -264,10 +334,15 @@ fn probe_endpoint_builder(
 /// and none of the net report's other probes, so its report has UDP only when
 /// the relay answered QAD. No portmapping either: the endpoint never carries
 /// a connection.
-fn qad_endpoint_builder(relay_url: &RelayUrl, auth_token: Option<&str>) -> iroh::endpoint::Builder {
+fn qad_endpoint_builder(
+    relay_url: &RelayUrl,
+    auth_token: Option<&str>,
+    ca: &CaTlsConfig,
+) -> iroh::endpoint::Builder {
     let map = RelayMap::from_iter([relay_entry(relay_url, auth_token, true)]);
     Endpoint::builder(presets::Empty)
         .relay_mode(RelayMode::Custom(map))
+        .ca_tls_config(ca.clone())
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .net_report_config(NetReportConfig::minimal())
         .portmapper_config(PortmapperConfig::Disabled)
@@ -326,17 +401,18 @@ pub(crate) struct RelayProbe {
 pub(crate) async fn probe_relay(
     relay_url: &RelayUrl,
     auth_token: Option<&str>,
+    ca: &CaTlsConfig,
     check_quic_addr_discovery: bool,
     closes: &PendingCloses,
 ) -> Result<RelayProbe> {
     let bind_qad = async {
         match check_quic_addr_discovery {
-            true => Some(qad_endpoint_builder(relay_url, auth_token).bind().await),
+            true => Some(qad_endpoint_builder(relay_url, auth_token, ca).bind().await),
             false => None,
         }
     };
     let (endpoint, qad_endpoint) = futures::join!(
-        probe_endpoint_builder(relay_url, auth_token).bind(),
+        probe_endpoint_builder(relay_url, auth_token, ca).bind(),
         bind_qad
     );
     // The QAD check is best effort: an endpoint that cannot bind UDP cannot
@@ -511,6 +587,17 @@ impl RelayProbes {
         Self(progress)
     }
 
+    /// A probe that has already settled with `relays`, for tests.
+    #[cfg(test)]
+    pub(crate) fn settled_with(relays: ProbedRelays) -> Self {
+        let (_, progress) = watch::channel(ProbeProgress {
+            released: true,
+            relays,
+            ..ProbeProgress::default()
+        });
+        Self(progress)
+    }
+
     /// Start probing `relay_config`'s custom relays for `endpoint`, on a task
     /// of its own. Returns the probe and that task, which the caller keeps in
     /// its [`PendingCloses`] (the probe endpoints must be closed before the
@@ -521,19 +608,18 @@ impl RelayProbes {
         relay_config: &RelayConfig,
         closes: &PendingCloses,
     ) -> (Self, Option<(JoinHandle<()>, EndpointSlot)>) {
-        let RelayConfig::Custom { urls, auth_token } = relay_config else {
+        if !relay_config.is_custom() {
             return (Self::none(), None);
-        };
+        }
         let (tx, rx) = watch::channel(ProbeProgress {
-            total: urls.len(),
+            total: relay_config.custom_urls().len(),
             ..ProbeProgress::default()
         });
         let slot = EndpointSlot(Arc::new(Mutex::new(Some(endpoint.clone()))));
         let task = tokio::spawn(apply_relay_probes(
             endpoint.closed(),
             slot.clone(),
-            urls.clone(),
-            auth_token.clone(),
+            relay_config.clone(),
             has_ip_transports(endpoint),
             closes.clone(),
             tx,
@@ -632,12 +718,14 @@ fn home_relay_connected(endpoint: &Endpoint, url: &RelayUrl) -> bool {
 async fn apply_relay_probes(
     closed: impl Future<Output = ()>,
     slot: EndpointSlot,
-    urls: Vec<RelayUrl>,
-    auth_token: Option<String>,
+    relay_config: RelayConfig,
     check_quic_addr_discovery: bool,
     closes: PendingCloses,
     progress: watch::Sender<ProbeProgress>,
 ) {
+    let urls = relay_config.custom_urls();
+    let auth_token = relay_config.relay_auth_token();
+    let ca = relay_config.ca_tls_config();
     tokio::pin!(closed);
     let mut watching_close = true;
     match urls.len() {
@@ -647,9 +735,9 @@ async fn apply_relay_probes(
     let mut probes: FuturesUnordered<_> = urls
         .iter()
         .map(|url| {
-            let (token, closes) = (auth_token.as_deref(), &closes);
+            let (ca, closes) = (&ca, &closes);
             async move {
-                let probe = probe_relay(url, token, check_quic_addr_discovery, closes).await;
+                let probe = probe_relay(url, auth_token, ca, check_quic_addr_discovery, closes).await;
                 (url, probe)
             }
         })
@@ -697,7 +785,7 @@ async fn apply_relay_probes(
             }
         }
         if let (true, Some(endpoint)) = (quic_addr_discovery, &endpoint) {
-            let entry = relay_entry(url, auth_token.as_deref(), true);
+            let entry = relay_entry(url, auth_token, true);
             endpoint.insert_relay(url.clone(), Arc::new(entry)).await;
         }
         progress.send_modify(|progress| {
@@ -852,6 +940,23 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_map_can_start_with_quic_addr_discovery_on_where_it_was_found() {
+        let cfg = RelayConfig::from_urls(&two()).unwrap();
+        let serving: RelayUrl = RELAY2.parse().unwrap();
+        let RelayMode::Custom(map) = cfg.relay_mode_with_quic_addr_discovery(std::slice::from_ref(&serving))
+        else {
+            panic!("custom relays give a custom relay map");
+        };
+        assert_eq!(map.len(), 2);
+        assert!(map.get(&RELAY.parse::<RelayUrl>().unwrap()).unwrap().quic.is_none());
+        assert!(map.get(&serving).unwrap().quic.is_some());
+        assert!(matches!(
+            RelayConfig::Default.relay_mode_with_quic_addr_discovery(&[serving]),
+            RelayMode::Default
+        ));
+    }
+
+    #[test]
     fn a_relay_entry_carries_quic_addr_discovery_only_when_asked() {
         let url: RelayUrl = RELAY.parse().unwrap();
         // What iroh assumes for a relay given by URL alone (UDP 7842).
@@ -994,6 +1099,19 @@ mod tests {
     }
 
     #[test]
+    fn extra_ca_roots_need_custom_relays_and_are_kept() {
+        let root = CertificateDer::from(vec![1u8, 2, 3]);
+        assert!(RelayConfig::Default.with_extra_ca_roots([root.clone()]).is_err());
+        let cfg = RelayConfig::from_urls(&two())
+            .unwrap()
+            .with_extra_ca_roots([root.clone()])
+            .unwrap();
+        assert_eq!(cfg.extra_ca_roots(), [root]);
+        assert!(format!("{cfg:?}").contains("ca_roots: 1"));
+        assert!(RelayConfig::Default.extra_ca_roots().is_empty());
+    }
+
+    #[test]
     fn from_urls_carries_no_token() {
         let cfg = RelayConfig::from_urls(&two()).unwrap();
         assert_eq!(cfg.relay_auth_token(), None);
@@ -1003,7 +1121,7 @@ mod tests {
     async fn a_relay_only_endpoint_has_no_ip_transports() {
         // A relay-only endpoint needs a relay to bind at all; it is never
         // connected to here.
-        let relay_only = probe_endpoint_builder(&RELAY.parse().unwrap(), None)
+        let relay_only = probe_endpoint_builder(&RELAY.parse().unwrap(), None, &CaTlsConfig::embedded())
             .bind()
             .await
             .unwrap();

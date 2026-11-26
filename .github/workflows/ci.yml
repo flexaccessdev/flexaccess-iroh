@@ -86,5 +86,7 @@ jobs:
         run: ./e2e/run_e2e.sh --local-relays
       - name: Auth + connectivity (relay-only)
         run: ./e2e/run_e2e.sh --local-relays --relay-only
+      - name: QUIC address discovery
+        run: ./e2e/run_quic_addr_discovery.sh
       - name: Relay failover
         run: ./e2e/run_relay_failover.sh
