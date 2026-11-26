@@ -7,7 +7,7 @@
 # reaches the server, and checks whether its endpoint's net report saw QAD
 # answer and how long the endpoint took to come online.
 #
-# Local section (always; offline), against two local `iroh-relay --dev`
+# Local section (unless --n0-only; offline), against two local `iroh-relay --dev`
 # instances, plain HTTP with nothing on UDP: neither serves QAD, like relays
 # behind a Cloudflare Tunnel or any other HTTP-only front.
 #
@@ -15,7 +15,7 @@
 #               before coming online, and QAD does not answer
 #   off         QAD off: the endpoint does not wait
 #
-# n0 section (with --n0; needs the internet): n0's production relays
+# n0 section (with --n0 or --n0-only; needs the internet): n0's production relays
 # (use1-1 and euc1-1.relay.n0.iroh.link) as the custom relays, which all serve
 # QAD over the public internet:
 #
