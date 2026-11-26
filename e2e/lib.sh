@@ -141,13 +141,13 @@ wait_for_log_or_death() {
     return 1
 }
 
-# Wait until something accepts TCP connections on 127.0.0.1:$1, or time out
-# after $2 seconds.
+# Wait until something accepts TCP connections on $3 (default 127.0.0.1)
+# port $1, or time out after $2 seconds.
 wait_for_tcp_port() {
-    local port="$1" timeout="$2"
+    local port="$1" timeout="$2" host="${3:-127.0.0.1}"
     local deadline=$(( SECONDS + timeout ))
     while (( SECONDS < deadline )); do
-        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+        if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
             return 0
         fi
         sleep 0.25
@@ -195,24 +195,27 @@ keygen() {
 # Local iroh-relay instances (dev mode, plain HTTP; configs hold no secrets)
 # ---------------------------------------------------------------------------
 declare -A RELAY_PORT=()
+declare -A RELAY_HOST=()
 declare -A RELAY_PID=()
 
-# Register relay $1 on port $2 and write its config.
+# Register relay $1 on port $2 of loopback address $3 (default 127.0.0.1) and
+# write its config.
 define_relay() {
-    local num="$1" port="$2"
+    local num="$1" port="$2" host="${3:-127.0.0.1}"
     RELAY_PORT[$num]="$port"
+    RELAY_HOST[$num]="$host"
     cat > "$WORK/relay$num.toml" <<EOF
 enable_metrics = false
-http_bind_addr = "127.0.0.1:$port"
+http_bind_addr = "$host:$port"
 EOF
 }
 
 start_relay() {
-    local num="$1" port="${RELAY_PORT[$1]}"
+    local num="$1" port="${RELAY_PORT[$1]}" host="${RELAY_HOST[$1]}"
     local logfile="$WORK/relay$num.$(date +%s%N).log"
     start_bg "$logfile" "$RELAY_BIN" --dev -c "$WORK/relay$num.toml"
     RELAY_PID[$num]="$BG_PID"
-    wait_for_tcp_port "$port" 30 || {
+    wait_for_tcp_port "$port" 30 "$host" || {
         dump_log "$logfile"
         die "relay$num did not start"
     }

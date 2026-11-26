@@ -145,7 +145,14 @@ HTTP-only front never does.
 So the crate **detects it per relay** instead of assuming it, as part of the
 startup probe (next section). The endpoint is bound with QAD off on every
 custom relay, and the probe turns it on, on the live endpoint, for each relay
-that answered (`ProbedRelays::quic_addr_discovery`). Next to each relay's probe endpoint, a second
+that answered (`ProbedRelays::quic_addr_discovery`). An endpoint that
+replaces it mid-session (`endpoint::rebuild_endpoint`) runs no probe of its
+own and starts with QAD on for the relays the first endpoint's probe found
+serving it, waiting for that probe to settle if it still runs. The probe runs
+once: a relay that did not answer QAD then (UDP blocked at the start, its QAD
+service briefly down) stays without it, in the first endpoint and in every
+rebuild, until the process restarts; only the failover's restore probe below
+checks again, for the relay it puts back. Next to each relay's probe endpoint, a second
 throwaway endpoint with UDP transports and QAD on runs a net report with only
 the QAD probes (`NetReportConfig::minimal`); its report shows UDP working
 only if the relay answered. The answer is whatever that endpoint learned by
@@ -204,8 +211,11 @@ the probe timeout plus the probe endpoints' bounded close
 (`RelayProbes::settled`). The task holds a handle to the endpoint while it
 runs, which keeps its UDP sockets bound; it lets go when the endpoint's close
 begins, so a caller that rebinds the same port right after closing awaits
-`RelayProbes::released` in between, which does not wait for the probes. A
-probe that fails on a relay the endpoint is connected through leaves that
+`RelayProbes::released` in between, which does not wait for the probes. That
+close also stops the probes still running, whose endpoints are closed on tasks
+kept in `PendingCloses`: a process that shuts down right after its start,
+while a relay that does not answer is still being probed, drains those closes
+and does not wait out the probe timeout. A probe that fails on a relay the endpoint is connected through leaves that
 relay in the map, and never fails a start that is already connected.
 
 Probing each relay on its own is what makes those warnings possible: a single

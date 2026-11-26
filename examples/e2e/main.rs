@@ -11,7 +11,11 @@
 //! [`EXIT_AUTH_REJECTED`] when the server refuses the key; with `--hold-secs`
 //! it keeps the authenticated connection open and echoes again every few
 //! seconds, logging the path each echo ran over, so a script can watch a live
-//! connection through a relay outage. Everything an application would add on
+//! connection through a relay outage. With `--rebuild` it then replaces its
+//! endpoint the way a long-lived client replaces a broken one
+//! ([`flexaccess_iroh::endpoint::rebuild_endpoint`]) and runs the exchange
+//! again on it, and with `--qad-wait-secs` it logs whether each endpoint's net
+//! report saw QUIC address discovery answer. Everything an application would add on
 //! top — a product ALPN, QUIC tuning, config files, forwarding — is left out
 //! so a failure here is a failure of this crate or of iroh, never of a product.
 //!
@@ -27,13 +31,16 @@ use clap::{Args, Parser, Subcommand};
 use flexaccess_iroh::auth::{ClientKey, verify_endpoint_id_signature};
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, PendingCloses, create_endpoint, endpoint_builder,
+    rebuild_endpoint,
 };
 use flexaccess_iroh::flexaccess_keys::{self, AuthorizedKeys, PrivateKey, PublicKey};
 use flexaccess_iroh::relay::RelayConfig;
 use flexaccess_iroh::relay_failover::fail_over_home_relay;
 use iroh::endpoint::{Connection, Incoming, QuicTransportConfig};
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, Watcher};
 use log::{error, info, warn};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -114,11 +121,24 @@ struct RelayArgs {
     /// address lookup of any kind. Requires custom relays.
     #[arg(long)]
     relay_only: bool,
+    /// PEM file of CA certificates the custom relays' TLS is also verified
+    /// against, such as a local test relay's self-signed certificate.
+    #[arg(long)]
+    relay_ca: Option<PathBuf>,
 }
 
 impl RelayArgs {
     fn resolve(&self) -> Result<RelayConfig> {
-        let config = RelayConfig::from_urls_with_token(&self.relay_urls, self.relay_auth_token.clone())?;
+        let mut config = RelayConfig::from_urls_with_token(&self.relay_urls, self.relay_auth_token.clone())?;
+        if let Some(path) = &self.relay_ca {
+            let roots = CertificateDer::pem_file_iter(path)
+                .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+                .with_context(|| format!("reading CA certificates from {}", path.display()))?;
+            if roots.is_empty() {
+                bail!("{} holds no certificates", path.display());
+            }
+            config = config.with_extra_ca_roots(roots)?;
+        }
         if self.relay_only && !config.is_custom() {
             bail!("--relay-only requires custom relays (--relay-url)");
         }
@@ -183,6 +203,16 @@ struct ClientArgs {
     /// Seconds between echoes while holding the connection open.
     #[arg(long, default_value_t = 5)]
     echo_interval_secs: u64,
+    /// After the exchange, replace the endpoint with `rebuild_endpoint` (from
+    /// the first endpoint's startup probe) and run the exchange again on it.
+    #[arg(long)]
+    rebuild: bool,
+    /// Before each exchange, wait up to this many seconds for the endpoint's
+    /// net report to show QUIC address discovery answering, and log whether
+    /// it did (`QUIC address discovery answered` / `did not answer`). For the
+    /// first endpoint the wait starts once its startup probe has settled.
+    #[arg(long)]
+    qad_wait_secs: Option<u64>,
 }
 
 #[derive(Args)]
@@ -398,9 +428,28 @@ async fn run_client(args: ClientArgs) -> Result<ExitCode> {
     let closes = PendingCloses::new();
     let outcome = async {
         // A client runs no failover: a relay left out at startup stays out
-        // for this (short-lived) process.
-        let CreatedEndpoint { endpoint, .. } =
+        // of this endpoint for the (short-lived) process.
+        let CreatedEndpoint { endpoint, relays } =
             create_endpoint(&relay_config, builder, &closes).await?;
+        if let Some(wait) = args.qad_wait_secs {
+            relays.settled().await;
+            report_quic_addr_discovery("Endpoint", &endpoint, Duration::from_secs(wait)).await;
+        }
+        let outcome = exchange(&endpoint, &args, &relay_config, &key).await;
+        // The probe reports the relays that did not come online as it settles;
+        // the endpoint's close would stop it short.
+        relays.settled().await;
+        endpoint.close().await;
+        if !args.rebuild || !matches!(outcome, Ok(code) if code == ExitCode::SUCCESS) {
+            return outcome;
+        }
+        info!("Rebuilding the endpoint");
+        let builder = endpoint_builder(&relay_config, args.relay.options(false));
+        let endpoint = rebuild_endpoint(&relay_config, builder, &relays, &closes).await?;
+        if let Some(wait) = args.qad_wait_secs {
+            report_quic_addr_discovery("Rebuilt endpoint", &endpoint, Duration::from_secs(wait))
+                .await;
+        }
         let outcome = exchange(&endpoint, &args, &relay_config, &key).await;
         endpoint.close().await;
         outcome
@@ -471,6 +520,34 @@ async fn exchange(
     }
     conn.close(0u32.into(), b"done");
     Ok(ExitCode::SUCCESS)
+}
+
+/// Wait up to `wait` for `endpoint`'s net report to show UDP working, which
+/// with custom relays means one of them answered QUIC address discovery, and
+/// log whether it did.
+async fn report_quic_addr_discovery(label: &str, endpoint: &Endpoint, wait: Duration) {
+    let mut reports = endpoint.net_report();
+    let answered = tokio::time::timeout(wait, async {
+        loop {
+            if let Some(report) = reports.get().filter(|report| report.has_udp()) {
+                return report;
+            }
+            if reports.updated().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    })
+    .await;
+    match answered {
+        Ok(report) => info!(
+            "{label}: QUIC address discovery answered (public address {})",
+            report.global_v4.map_or_else(|| "none".to_string(), |addr| addr.to_string())
+        ),
+        Err(_) => info!(
+            "{label}: QUIC address discovery did not answer within {}s",
+            wait.as_secs()
+        ),
+    }
 }
 
 /// Keep the authenticated connection open for `hold`, echoing the message
