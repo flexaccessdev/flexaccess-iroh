@@ -10,7 +10,7 @@
 //! [`endpoint_builder`], then hand it to [`create_endpoint`].
 
 use crate::relay::{
-    EndpointSlot, RelayConfig, RelayProbes, online_timeout, wait_online_beside,
+    EndpointSlot, RelayConfig, RelayProbes, qad_wait, wait_online_beside,
 };
 use anyhow::{Context, Result};
 use futures::FutureExt;
@@ -256,10 +256,11 @@ pub struct CreatedEndpoint {
 /// home relay by probe latency, so a relay that still answers probes but
 /// cannot be connected (the outage [`crate::relay_failover`] exists for) would
 /// otherwise be preferred, never connect, and keep [`Endpoint::online`]
-/// pending. The wait for the endpoint is [`online_timeout`] from the latest
-/// such change (the probes' 10 s, plus iroh's QAD probe timeout when the
-/// endpoint runs QUIC address discovery on custom relays), so taking that
-/// relay out gives it a full window to re-home; the start fails when every relay fails its probe. The relay
+/// pending. The wait for the endpoint is the probes' 10 s from the latest
+/// such change, plus iroh's QAD probe timeout per net report that can come
+/// first when the endpoint runs QUIC address discovery on custom relays (see
+/// [`crate::relay::QAD_PROBES_TIMEOUT`]), so taking that relay out gives it a
+/// full window to re-home; the start fails when every relay fails its probe. The relay
 /// comes back through the failover's restore probe; see
 /// [`CreatedEndpoint::relays`].
 ///
@@ -291,9 +292,12 @@ pub async fn create_endpoint(
         closes.keep(task);
         cancelled.slot = Some(slot);
     }
-    let timeout = online_timeout(relay_config, &endpoint);
-    info!("Waiting for endpoint to come online (timeout: {}s)...", timeout.as_secs());
-    let outcome = wait_online_beside(&endpoint, &relays, timeout).await;
+    let qad_wait = qad_wait(relay_config, &endpoint);
+    info!(
+        "Waiting for endpoint to come online (timeout: {}s)...",
+        (crate::relay::RELAY_CONNECT_TIMEOUT + qad_wait).as_secs()
+    );
+    let outcome = wait_online_beside(&endpoint, &relays, qad_wait).await;
     // Not cancelled: whatever follows is up to this function's own paths.
     cancelled.disarm(outcome.is_err());
     if let Err(e) = outcome {
@@ -361,7 +365,7 @@ impl Drop for CloseIfCancelled {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::{QAD_PROBES_TIMEOUT, RELAY_CONNECT_TIMEOUT};
+    use crate::relay::QAD_PROBES_TIMEOUT;
     use iroh::{RelayMode, RelayUrl};
 
     fn relay_only() -> EndpointOptions {
@@ -391,10 +395,10 @@ mod tests {
         }
     }
 
-    /// The startup window covers iroh's QAD probe timeout exactly when the
+    /// The startup wait covers iroh's QAD probe timeout exactly when the
     /// endpoint probes the custom relays for QAD: on, with IP transports.
     #[tokio::test]
-    async fn the_startup_window_covers_qad_only_when_the_endpoint_runs_it() {
+    async fn the_startup_wait_covers_qad_only_when_the_endpoint_runs_it() {
         let urls = ["https://relay.example./".to_string()];
         let on = RelayConfig::from_urls(&urls).unwrap();
         let off = on.clone().with_quic_addr_discovery(false).unwrap();
@@ -407,13 +411,10 @@ mod tests {
         assert!(!with_ip.bound_sockets().is_empty());
         assert!(without_ip.bound_sockets().is_empty());
 
-        assert_eq!(
-            online_timeout(&on, &with_ip),
-            RELAY_CONNECT_TIMEOUT + QAD_PROBES_TIMEOUT
-        );
-        assert_eq!(online_timeout(&off, &with_ip), RELAY_CONNECT_TIMEOUT);
-        assert_eq!(online_timeout(&on, &without_ip), RELAY_CONNECT_TIMEOUT);
-        assert_eq!(online_timeout(&RelayConfig::Default, &with_ip), RELAY_CONNECT_TIMEOUT);
+        assert_eq!(qad_wait(&on, &with_ip), QAD_PROBES_TIMEOUT);
+        assert_eq!(qad_wait(&off, &with_ip), Duration::ZERO);
+        assert_eq!(qad_wait(&on, &without_ip), Duration::ZERO);
+        assert_eq!(qad_wait(&RelayConfig::Default, &with_ip), Duration::ZERO);
         with_ip.close().await;
         without_ip.close().await;
     }

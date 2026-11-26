@@ -165,7 +165,7 @@ alike: all behind Cloudflare Tunnels, or all terminating TLS themselves.
   (`iroh::RelayConfig::from(url)`, QAD on UDP 7842 at the URL's host), and iroh
   does the rest. A relay whose QAD is down for a while can hold a full report
   back by up to iroh's 3 s timeout, as it does in iroh; the crate only widens
-  its startup window by that much (see the
+  its startup window to cover it (see the
   [startup probe](#custom-relay-validation-the-per-relay-startup-probe)).
 - **Off**: no relay is probed for QAD (`quic: None` on every entry), so no
   report waits for it, and no relay reports the endpoint's public address.
@@ -215,12 +215,17 @@ endpoint offline. The probe checks relay connectivity only; QUIC address
 discovery is the application's setting (see
 [above](#quic-address-discovery-on-custom-relays)).
 
-The window (`relay::online_timeout`) is the probes' 10 s, plus iroh's 3 s QAD
-probe timeout (`QAD_PROBES_TIMEOUT`) when the endpoint runs QAD: QAD on and IP
-transports present. The probes never run QAD, but such an endpoint opens no
+The window is the probes' 10 s, plus iroh's 3 s QAD probe timeout
+(`relay::QAD_PROBES_TIMEOUT`) for each net report that can come before the
+endpoint homes on a relay that works, when the endpoint runs QAD: QAD on and
+IP transports present. The probes never run QAD, but such an endpoint opens no
 relay connection until its net report's QAD probes are done, so on 10 s alone
 a relay that connects late in its probe's window would pass the probe and
-still fail the start. A relay-only endpoint, or one with QAD off, gets 10 s.
+still fail the start. From the start that is one report (13 s). After a relay
+is taken out it is two (16 s): iroh runs one report at a time, so the map
+change waits behind the report already running, which may still home the
+endpoint on a relay just taken out, and any later change joins the one
+queued. A relay-only endpoint, or one with QAD off, gets 10 s.
 
 `create_endpoint` returns as soon as the endpoint is online, so on healthy
 relays the probe costs the start nothing: it used to run ahead of the bind and
