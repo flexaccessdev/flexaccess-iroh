@@ -35,11 +35,11 @@ takes the resulting `iroh::SecretKey` / `flexaccess_keys` values.
 
 ```toml
 [dependencies]
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.24" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.25" }
 # or, with mDNS local-network discovery on every endpoint (compiled out on iOS):
-flexaccess-iroh = { git = "...", tag = "v0.0.24", features = ["mdns"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.25", features = ["mdns"] }
 # or, with the custom-relay `/healthz` check for a status view:
-flexaccess-iroh = { git = "...", tag = "v0.0.24", features = ["relay-health"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.25", features = ["relay-health"] }
 ```
 
 The `flexaccess_keys` crate is re-exported so a consumer signs and verifies
