@@ -436,6 +436,9 @@ async fn run_client(args: ClientArgs) -> Result<ExitCode> {
             report_quic_addr_discovery("Endpoint", &endpoint, Duration::from_secs(wait)).await;
         }
         let outcome = exchange(&endpoint, &args, &relay_config, &key).await;
+        // The probe reports the relays that did not come online as it settles;
+        // the endpoint's close would stop it short.
+        relays.settled().await;
         endpoint.close().await;
         if !args.rebuild || !matches!(outcome, Ok(code) if code == ExitCode::SUCCESS) {
             return outcome;

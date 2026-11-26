@@ -61,6 +61,12 @@ impl PendingCloses {
         Self::default()
     }
 
+    /// How many closes are kept, those over but not yet forgotten included.
+    #[cfg(test)]
+    pub(crate) fn kept_count(&self) -> usize {
+        self.0.lock().expect("pending closes lock").len()
+    }
+
     pub(crate) fn keep(&self, close: JoinHandle<()>) {
         drop(self.kept(close));
     }
@@ -274,8 +280,8 @@ pub struct CreatedEndpoint {
 /// Cancelled (the future dropped before it returns), it lets go of the
 /// endpoint at once: the probe task's handle is taken from it then and there,
 /// and the endpoint is closed on a task of its own, kept in `closes`, so its
-/// UDP port is free again as soon as that close is done rather than when the
-/// probes end. The probes still run to the end.
+/// UDP port is free again as soon as that close is done. Its close stops the
+/// probes too (see [`RelayProbes`]).
 pub async fn create_endpoint(
     relay_config: &RelayConfig,
     builder: EndpointBuilder,
@@ -316,9 +322,14 @@ pub async fn create_endpoint(
 ///   during an outage it would only delay the reconnect it is part of. What
 ///   it found about QUIC address discovery is kept: the relays it found
 ///   serving it start with it on (the rest stay without it, as they would at
-///   creation), and iroh's own net reports take it from there. A rebuild
-///   while that probe still runs waits for it to settle first, so none of
-///   its findings is lost, and for its task to let go of the first endpoint;
+///   creation), and iroh's own net reports take it from there. The probe
+///   runs once: a relay it found not serving QUIC address discovery (UDP
+///   blocked at the start, its discovery service down for a moment) stays
+///   without it, in the first endpoint and in every rebuild alike, until the
+///   process starts again. A rebuild while that probe still runs waits for
+///   it to settle first, so none of its findings is lost (a probe stopped by
+///   the first endpoint's close hands over what it had found by then), and
+///   for its task to let go of the first endpoint;
 ///   to bind on that endpoint's port, the caller must also have closed it and
 ///   dropped every handle of its own to it first. That wait is over at
 ///   once in the usual case, and at most [`RELAY_CONNECT_TIMEOUT`] plus a
@@ -374,13 +385,14 @@ async fn bind_rebuilt(
 }
 
 /// Armed while [`create_endpoint`] waits for the endpoint, beside the probe
-/// or not, and while [`rebuild_endpoint`] does (with no probe): if the wait is
+/// or not, while [`rebuild_endpoint`] does (with no probe), and over each
+/// relay probe's endpoints ([`crate::relay`]'s `probe_relay`): if the wait is
 /// dropped unfinished, take the probe task's handle to the endpoint and close
 /// the endpoint, so a cancelled start neither keeps the endpoint's port bound
 /// for as long as the probes run nor drops it without `close()`. It holds a handle of its own for the whole wait, since the
 /// probe task's may be gone already, and the runtime the endpoint was bound
 /// on, since it may be dropped outside it.
-struct CloseIfCancelled {
+pub(crate) struct CloseIfCancelled {
     endpoint: Option<Endpoint>,
     runtime: Option<tokio::runtime::Handle>,
     slot: Option<EndpointSlot>,
@@ -388,7 +400,7 @@ struct CloseIfCancelled {
 }
 
 impl CloseIfCancelled {
-    fn new(endpoint: &Endpoint, closes: &PendingCloses) -> Self {
+    pub(crate) fn new(endpoint: &Endpoint, closes: &PendingCloses) -> Self {
         Self {
             endpoint: Some(endpoint.clone()),
             runtime: tokio::runtime::Handle::try_current().ok(),
@@ -399,7 +411,7 @@ impl CloseIfCancelled {
 
     /// The wait finished. A start that failed lets go of the endpoint at once
     /// too, before closing it, since the probes may run on for a while.
-    fn disarm(&mut self, failed: bool) {
+    pub(crate) fn disarm(&mut self, failed: bool) {
         self.endpoint = None;
         if let Some(slot) = self.slot.take()
             && failed
