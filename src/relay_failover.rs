@@ -540,6 +540,10 @@ where
         tokio::select! {
             () = sleep_until_opt(outage.report_at) => outage.report(alternative),
             () = sleep_until_opt(outage.fail_over_at) => {
+                // A reconnect can be waiting unread, ready together with this
+                // deadline or as a probe finished: act on the status as it is.
+                value = watcher.get();
+                outage.observe(&describe(&value));
                 outage.fail_over_at = None;
                 let HomeRelay::Down { home, .. } = describe(&value) else {
                     continue;
@@ -671,6 +675,8 @@ mod tests {
         after_fail_over: Option<Status>,
         /// How long a QUIC address discovery recheck takes.
         recheck_takes: Duration,
+        /// What the status flips to as a recheck finishes.
+        after_recheck: Option<Status>,
     }
 
     impl FakeRelays {
@@ -683,6 +689,7 @@ mod tests {
                 status: status.clone(),
                 after_fail_over,
                 recheck_takes: Duration::ZERO,
+                after_recheck: None,
             }
         }
 
@@ -734,6 +741,9 @@ mod tests {
                 at: self.started.elapsed(),
             });
             tokio::time::sleep(self.recheck_takes).await;
+            if let Some(status) = self.after_recheck {
+                self.status.set(status).ok();
+            }
         }
     }
 
@@ -1126,5 +1136,32 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_as_a_slow_recheck_finishes_is_not_failed_over() {
+        // A goes down 30 s before a recheck that takes 40 s and reconnects
+        // just as it finishes, past the outage deadline: the update is still
+        // unread when the deadline is taken up. Repeated, since which ready
+        // branch `select!` takes first is random.
+        let first = QUIC_ADDR_DISCOVERY_RECHECK_INTERVAL;
+        for _ in 0..32 {
+            let status = Watchable::new(Status::UpOnA);
+            let mut relays = FakeRelays::new(&status, None);
+            relays.recheck_takes = 40 * SEC;
+            relays.after_recheck = Some(Status::UpOnA);
+            let flipper = {
+                let status = status.clone();
+                async move {
+                    tokio::time::sleep(first - 30 * SEC).await;
+                    status.set(Status::DownOnA).ok();
+                }
+            };
+            tokio::join!(run_for(&status, &mut relays, first + 100 * SEC), flipper);
+            assert_eq!(
+                relays.actions(),
+                vec![Action::Recheck { out: Vec::new(), at: first }]
+            );
+        }
     }
 }
