@@ -258,8 +258,8 @@ pub struct CreatedEndpoint {
 /// otherwise be preferred, never connect, and keep [`Endpoint::online`]
 /// pending. The wait for the endpoint is the probes' 10 s from the latest
 /// such change, plus iroh's QAD probe timeout per net report that can come
-/// first when the endpoint runs QUIC address discovery on custom relays (see
-/// [`crate::relay::QAD_PROBES_TIMEOUT`]), so taking that relay out gives it a
+/// first when the endpoint runs QUIC address discovery: on the default relays,
+/// or on custom relays with it on (see [`crate::relay::QAD_PROBES_TIMEOUT`]), so taking that relay out gives it a
 /// full window to re-home; the start fails when every relay fails its probe. The relay
 /// comes back through the failover's restore probe; see
 /// [`CreatedEndpoint::relays`].
@@ -396,7 +396,8 @@ mod tests {
     }
 
     /// The startup wait covers iroh's QAD probe timeout exactly when the
-    /// endpoint probes the custom relays for QAD: on, with IP transports.
+    /// endpoint probes its relays for QAD: IP transports, and the default
+    /// relays or custom ones with QAD on.
     #[tokio::test]
     async fn the_startup_wait_covers_qad_only_when_the_endpoint_runs_it() {
         let urls = ["https://relay.example./".to_string()];
@@ -406,21 +407,33 @@ mod tests {
             relay_only: false,
             ..relay_only()
         };
-        let with_ip = endpoint_builder(&on, ip).bind().await.unwrap();
+        let with_ip = endpoint_builder(&on, ip.clone()).bind().await.unwrap();
         let without_ip = endpoint_builder(&on, relay_only()).bind().await.unwrap();
+        let default_with_ip = endpoint_builder(&RelayConfig::Default, ip).bind().await.unwrap();
+        let default_without_ip = endpoint_builder(&RelayConfig::Default, relay_only()).bind().await.unwrap();
         assert!(!with_ip.bound_sockets().is_empty());
         assert!(without_ip.bound_sockets().is_empty());
+        assert!(!default_with_ip.bound_sockets().is_empty());
+        assert!(default_without_ip.bound_sockets().is_empty());
 
         assert_eq!(qad_wait(&on, &with_ip), QAD_PROBES_TIMEOUT);
         assert_eq!(qad_wait(&off, &with_ip), Duration::ZERO);
         assert_eq!(qad_wait(&on, &without_ip), Duration::ZERO);
-        assert_eq!(qad_wait(&RelayConfig::Default, &with_ip), Duration::ZERO);
+        // iroh's default relays serve QAD, so their endpoint waits on it too.
+        assert_eq!(qad_wait(&RelayConfig::Default, &default_with_ip), QAD_PROBES_TIMEOUT);
+        assert_eq!(qad_wait(&RelayConfig::Default, &default_without_ip), Duration::ZERO);
         assert_eq!(online_timeout(&on, &with_ip), RELAY_CONNECT_TIMEOUT + QAD_PROBES_TIMEOUT);
         assert_eq!(online_timeout(&off, &with_ip), RELAY_CONNECT_TIMEOUT);
         assert_eq!(online_timeout(&on, &without_ip), RELAY_CONNECT_TIMEOUT);
-        assert_eq!(online_timeout(&RelayConfig::Default, &with_ip), RELAY_CONNECT_TIMEOUT);
+        assert_eq!(
+            online_timeout(&RelayConfig::Default, &default_with_ip),
+            RELAY_CONNECT_TIMEOUT + QAD_PROBES_TIMEOUT
+        );
+        assert_eq!(online_timeout(&RelayConfig::Default, &default_without_ip), RELAY_CONNECT_TIMEOUT);
         with_ip.close().await;
         without_ip.close().await;
+        default_with_ip.close().await;
+        default_without_ip.close().await;
     }
 
     /// A close that takes its time is waited for up to the limit and no
