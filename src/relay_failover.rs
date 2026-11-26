@@ -407,15 +407,16 @@ async fn fail_over<R: FailoverRelays>(
 /// Await `work` while still observing every status change, so that the
 /// outage bookkeeping sees each reconnect and new outage a long restore probe
 /// would otherwise hide. An outage is still reported on time (`alternative`
-/// as in [`Outage::report`]), since that is only a log; the failover deadline
-/// waits until `work` is done, which keeps the relay-map changes in sequence.
+/// as in [`Outage::report`], which `work` updates as it puts relays back),
+/// since that is only a log; the failover deadline waits until `work` is
+/// done, which keeps the relay-map changes in sequence.
 async fn observing<W, D, T>(
     work: impl Future<Output = T>,
     watcher: &mut W,
     describe: &D,
     outage: &mut Outage,
     value: &mut W::Value,
-    alternative: bool,
+    alternative: &std::cell::Cell<bool>,
 ) -> T
 where
     W: Watcher,
@@ -430,7 +431,7 @@ where
                 *value = next;
                 outage.observe(&describe(value));
             }
-            () = sleep_until_opt(outage.report_at) => outage.report(alternative),
+            () = sleep_until_opt(outage.report_at) => outage.report(alternative.get()),
         }
     }
 }
@@ -509,19 +510,22 @@ where
             }
             () = sleep_until_opt(check_at) => {
                 let now = Instant::now();
+                let alternative = std::cell::Cell::new(alternative);
                 let restores = async {
                     for (url, at) in std::mem::take(&mut removed) {
                         if at > now {
                             removed.push((url, at));
                         } else if relays.restore(&url).await {
                             log::info!("{url} is connectable again and back in the relay map");
+                            // Next to the relay that was never taken out.
+                            alternative.set(true);
                         } else {
                             removed.push((url, now + RELAY_RESTORE_INTERVAL));
                         }
                     }
                 };
                 let (status, outage) = (&mut watcher, &mut outage);
-                observing(restores, status, &describe, outage, &mut value, alternative).await;
+                observing(restores, status, &describe, outage, &mut value, &alternative).await;
             }
             next = next_value(&mut watcher) => {
                 value = next;
@@ -607,8 +611,8 @@ mod tests {
         /// What the status flips to once the loop has acted on the relay
         /// map (`None` = stays as it is).
         after_fail_over: Option<Status>,
-        /// How long the next restore probe takes (once).
-        slow_restore: Option<Duration>,
+        /// A relay whose next restore probe takes this long (once) and fails.
+        slow_restore: Option<(RelayUrl, Duration)>,
         /// What the status flips to as that slow restore probe finishes.
         after_slow_restore: Option<Status>,
     }
@@ -667,13 +671,17 @@ mod tests {
         }
 
         async fn restore(&mut self, url: &RelayUrl) -> bool {
-            if let Some(takes) = self.slow_restore.take() {
+            let slow = match &self.slow_restore {
+                Some((slow, _)) if slow == url => self.slow_restore.take(),
+                _ => None,
+            };
+            if let Some((_, takes)) = slow {
                 tokio::time::sleep(takes).await;
                 if let Some(status) = self.after_slow_restore.take() {
                     self.status.set(status).ok();
                 }
             }
-            let restored = self.connectable.load(Ordering::SeqCst);
+            let restored = slow.is_none() && self.connectable.load(Ordering::SeqCst);
             self.actions.lock().unwrap().push(Action::Restore {
                 url: url.clone(),
                 restored,
@@ -755,7 +763,7 @@ mod tests {
         bound: Duration,
     ) {
         relays.connectable.store(false, Ordering::SeqCst);
-        relays.slow_restore = Some(40 * SEC);
+        relays.slow_restore = Some((relay_c(), 40 * SEC));
         relays.after_slow_restore = after;
         tokio::join!(run_for_with(status, relays, bound, vec![relay_c()]), flips);
     }
@@ -1135,5 +1143,32 @@ mod tests {
             assert!(warnings[0].starts_with("No connected home relay"), "{warnings:?}");
             assert_eq!(relays.map_changes(), Vec::new());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_reported_during_restore_probes_counts_a_relay_put_back_by_them() {
+        // B and C are out, so A is the only relay in the map. At the first
+        // restore probes B is put back at once and C's probe takes 40 s; A
+        // goes down 5 s in, and the outage is reported during C's probe with
+        // B there to fail over to.
+        let at = RELAY_RESTORE_INTERVAL;
+        capture_warnings();
+        let status = Watchable::new(Status::UpOnA);
+        let mut relays = FakeRelays::new(&status, None);
+        relays.slow_restore = Some((relay_c(), 40 * SEC));
+        let flips = {
+            let status = status.clone();
+            async move {
+                tokio::time::sleep(at + 5 * SEC).await;
+                status.set(Status::DownOnA).ok();
+            }
+        };
+        tokio::join!(
+            run_for_with(&status, &mut relays, at + 20 * SEC, vec![relay_b(), relay_c()]),
+            flips
+        );
+        let warnings = warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Failing over to another relay"), "{warnings:?}");
     }
 }
