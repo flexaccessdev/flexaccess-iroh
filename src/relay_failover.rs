@@ -406,14 +406,16 @@ async fn fail_over<R: FailoverRelays>(
 
 /// Await `work` while still observing every status change, so that the
 /// outage bookkeeping sees each reconnect and new outage a long restore probe
-/// would otherwise hide. Deadlines do not act meanwhile: the loop takes them
-/// up once `work` is done, which keeps the relay-map changes in sequence.
+/// would otherwise hide. An outage is still reported on time (`alternative`
+/// as in [`Outage::report`]), since that is only a log; the failover deadline
+/// waits until `work` is done, which keeps the relay-map changes in sequence.
 async fn observing<W, D, T>(
     work: impl Future<Output = T>,
     watcher: &mut W,
     describe: &D,
     outage: &mut Outage,
     value: &mut W::Value,
+    alternative: bool,
 ) -> T
 where
     W: Watcher,
@@ -428,6 +430,7 @@ where
                 *value = next;
                 outage.observe(&describe(value));
             }
+            () = sleep_until_opt(outage.report_at) => outage.report(alternative),
         }
     }
 }
@@ -517,7 +520,8 @@ where
                         }
                     }
                 };
-                observing(restores, &mut watcher, &describe, &mut outage, &mut value).await;
+                let (status, outage) = (&mut watcher, &mut outage);
+                observing(restores, status, &describe, outage, &mut value, alternative).await;
             }
             next = next_value(&mut watcher) => {
                 value = next;
@@ -1106,11 +1110,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_reconnect_as_a_slow_restore_probe_finishes_is_not_reported_as_an_outage() {
+    async fn an_outage_during_a_slow_restore_probe_is_reported_once_on_time() {
         // A goes down 3 s before a restore probe that takes 40 s and
-        // reconnects just as it finishes, past the time to report the
-        // outage: the update is still unread when that time is taken up.
-        // Repeated, since which ready branch `select!` takes first is random.
+        // reconnects just as it finishes: the outage outlasts the grace
+        // period during the probe, is reported then, and is not reported
+        // again as the probe finishes. Repeated, since which ready branch
+        // `select!` takes first is random.
         let at = RELAY_RESTORE_INTERVAL;
         for _ in 0..32 {
             capture_warnings();
@@ -1125,7 +1130,9 @@ mod tests {
             };
             let after = Some(Status::UpOnA);
             run_with_a_slow_restore(&mut relays, &status, after, flips, at + 100 * SEC).await;
-            assert_eq!(warnings(), Vec::<String>::new());
+            let warnings = warnings();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].starts_with("No connected home relay"), "{warnings:?}");
             assert_eq!(relays.map_changes(), Vec::new());
         }
     }
