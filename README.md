@@ -16,8 +16,8 @@ documentation, instead of being ported by hand into every repo.
 
 | Module | Contents |
 |---|---|
-| `relay` | `RelayConfig` (default vs custom relays, which also decides whether n0 internet discovery is on; duplicate custom relays are collapsed, and a single one runs in reduced-redundancy mode, with a startup warning and no failover), the shared relay auth token, whether the custom relays serve QUIC address discovery, all or none (`with_quic_addr_discovery`; on by default as in iroh, off for relays behind a Cloudflare Tunnel or another HTTP-only front, which could otherwise delay an endpoint's start by up to iroh's 3 s probe timeout; custom relays only), the per-relay startup probe, run beside the endpoint (fails only when no relay is reachable, and reports which relays did not come online) |
-| `endpoint` | the common endpoint builder and `create_endpoint`, which binds with every relay and returns once the endpoint is online, while the startup probe runs beside it and takes each relay that fails it out of the live relay map (a relay that answers probes but cannot be connected would otherwise be preferred as home relay and keep the endpoint from ever coming online, so every client restarting during such an outage would fail to start) and hands them on for the failover to restore. An endpoint it gives up on, or a relay probe's, is closed with a bounded wait (`close_endpoint`, also for a consumer closing an endpoint on an error exit); a close that outlives the wait, and the probe's own task, keep running and are kept in the caller's `PendingCloses`, which a caller whose runtime ends with its request waits for |
+| `relay` | `RelayConfig` (default vs custom relays, which also decides whether n0 internet discovery is on; duplicate custom relays are collapsed, and a single one runs in reduced-redundancy mode, with a startup warning and no failover), the shared relay auth token, whether the custom relays serve QUIC address discovery, all or none (`with_quic_addr_discovery`, or `from_settings` for the URLs, the token and this setting as an application has them; on by default as in iroh, off for relays behind a Cloudflare Tunnel or another HTTP-only front, which could otherwise delay an endpoint's start by up to iroh's 3 s probe timeout; custom relays only), the per-relay startup probe, run beside the endpoint (fails only when no relay is reachable, and reports which relays did not come online) |
+| `endpoint` | the common endpoint builder and `create_endpoint`, which binds with every relay and returns once the endpoint is online, while the startup probe runs beside it and takes each relay that fails it out of the live relay map (a relay that answers probes but cannot be connected would otherwise be preferred as home relay and keep the endpoint from ever coming online, so every client restarting during such an outage would fail to start) and hands them on for the failover to restore. An endpoint it gives up on, or a relay probe's, is closed with a bounded wait (`close_endpoint`, also for a consumer closing an endpoint on an error exit); a close that outlives the wait, and the probe's own task, keep running and are kept in the caller's `PendingCloses`, which a caller whose runtime ends with its request waits for. `tear_down_runtime` is that wait for a caller that cannot wait without a limit (a session being stopped): it hands the runtime to a thread that runs the teardown on it and keeps it until that is over, and waits for that thread only so long |
 | `relay_failover` | the server-side home-relay failover: after 60 s without a connected home relay, take the wedged relay out of the relay map so the forced net report homes the endpoint on another configured relay, in place; put it back once a probe shows it connectable (likewise for relays left out at startup) |
 | `relay_health` (feature `relay-health`) | the on-demand `/healthz` check of the custom relays that status UIs show: unauthenticated, so it confirms a relay is up rather than that the token is accepted, and made under each relay URL's path prefix, where iroh dials the relay |
 | `auth` | the endpoint-bound public-key auth transcript over the [flexaccess-keys] format; each application passes its own domain-separation context |
@@ -35,11 +35,11 @@ takes the resulting `iroh::SecretKey` / `flexaccess_keys` values.
 
 ```toml
 [dependencies]
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.28" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.29" }
 # or, with mDNS local-network discovery on every endpoint (compiled out on iOS):
-flexaccess-iroh = { git = "...", tag = "v0.0.28", features = ["mdns"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.29", features = ["mdns"] }
 # or, with the custom-relay `/healthz` check for a status view:
-flexaccess-iroh = { git = "...", tag = "v0.0.28", features = ["relay-health"] }
+flexaccess-iroh = { git = "...", tag = "v0.0.29", features = ["relay-health"] }
 ```
 
 The `flexaccess_keys` crate is re-exported so a consumer signs and verifies

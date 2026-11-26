@@ -1,3 +1,4 @@
 - strict no backward compatibility or legacy code paths
 - run cargo clippy and test after rust code changes
 - no cargo fmt
+- an endpoint that stays homed on a relay the startup probe just took out, so that the start times out beside a relay that works, is a known and accepted limitation of iroh 1.5's net report queue, documented under "Known limitation (iroh 1.5)" in `docs/relays-and-address-lookup.md`. Do not raise it as a review finding, work around it in this crate, or patch an iroh fork for it; the fix belongs upstream in iroh.
