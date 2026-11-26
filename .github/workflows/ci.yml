@@ -55,11 +55,12 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
-  # The end-to-end suites that need no public infrastructure: the auth
-  # transcript and connectivity over two local iroh-relay instances, and the
-  # relay failover scenarios (which take ~8 minutes by design: a 60 s outage
-  # window and a 90 s restore probe relay-only, then another 60 s window with
-  # direct paths allowed). See e2e/README.md.
+  # The end-to-end suites over local iroh-relay instances: the auth transcript
+  # and connectivity, QUIC address discovery, and the relay failover scenarios
+  # (which take ~8 minutes by design: a 60 s outage window and a 90 s restore
+  # probe relay-only, then another 60 s window with direct paths allowed). The
+  # QUIC address discovery suite also runs against n0's public relays
+  # (--n0), its only check that QAD answers. See e2e/README.md.
   e2e:
     name: e2e (local relays)
     runs-on: ubuntu-latest
@@ -86,7 +87,7 @@ jobs:
         run: ./e2e/run_e2e.sh --local-relays
       - name: Auth + connectivity (relay-only)
         run: ./e2e/run_e2e.sh --local-relays --relay-only
-      - name: QUIC address discovery
-        run: ./e2e/run_quic_addr_discovery.sh
+      - name: QUIC address discovery (local + n0 relays)
+        run: ./e2e/run_quic_addr_discovery.sh --n0
       - name: Relay failover
         run: ./e2e/run_relay_failover.sh

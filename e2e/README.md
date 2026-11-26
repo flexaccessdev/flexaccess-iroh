@@ -69,7 +69,9 @@ lines are what the scripts assert on).
 
 ## CI
 
-The `e2e` job in `.github/workflows/ci.yml` runs the offline suites:
-`run_e2e.sh --local-relays`, `run_e2e.sh --local-relays --relay-only`,
-`run_quic_addr_discovery.sh` (without `--n0`, its only check that QAD answers, which needs n0's public relays) and `run_relay_failover.sh`. The default-relay run needs n0's public relays and
-DNS and is left to a developer machine.
+The `e2e` job in `.github/workflows/ci.yml` runs `run_e2e.sh --local-relays`,
+`run_e2e.sh --local-relays --relay-only`, `run_quic_addr_discovery.sh --n0`
+and `run_relay_failover.sh`. All are offline except the `--n0` section of the
+QUIC address discovery suite, its only check that QAD answers, which uses n0's
+public relays as custom relays. The default-relay run of `run_e2e.sh` needs
+n0's DNS as well and is left to a developer machine.
