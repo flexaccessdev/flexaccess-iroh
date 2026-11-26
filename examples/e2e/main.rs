@@ -252,26 +252,18 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let builder = endpoint_builder(&relay_config, args.relay.options(true))
         .alpns(vec![ALPN.to_vec()])
         .secret_key(secret);
+    let CreatedEndpoint {
+        endpoint,
+        relays,
+    } = create_endpoint(&relay_config, builder, &PendingCloses::new()).await?;
+    info!("Waiting for clients to connect");
+
     let authorized = Arc::new(authorized);
-    // The runtime ends with this process: the closes the endpoint's creation
-    // stopped waiting for, and the startup and failover probes still
-    // running, are seen through first, whether it started or not.
-    let closes = PendingCloses::new();
-    let outcome = async {
-        let CreatedEndpoint {
-            endpoint,
-            relays,
-        } = create_endpoint(&relay_config, builder, &closes).await?;
-        info!("Waiting for clients to connect");
-        let outcome = tokio::select! {
-            outcome = accept_loop(&endpoint, &authorized) => outcome,
-            () = fail_over_home_relay(&endpoint, &relay_config, &relays, &closes) => Ok(()),
-        };
-        endpoint.close().await;
-        outcome
-    }
-    .await;
-    closes.finished().await;
+    let outcome = tokio::select! {
+        outcome = accept_loop(&endpoint, &authorized) => outcome,
+        () = fail_over_home_relay(&endpoint, &relay_config, &relays) => Ok(()),
+    };
+    endpoint.close().await;
     outcome
 }
 
