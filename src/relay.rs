@@ -46,8 +46,13 @@ pub const QAD_PROBES_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) fn qad_wait(relay_config: &RelayConfig, endpoint: &Endpoint) -> Duration {
     // iroh runs QAD only on an endpoint with IP transports, so a relay-only
     // one (no bound sockets) never waits for it.
-    let qad = relay_config.quic_addr_discovery() != Some(false) && !endpoint.bound_sockets().is_empty();
-    if qad { QAD_PROBES_TIMEOUT } else { Duration::ZERO }
+    let qad =
+        relay_config.quic_addr_discovery() != Some(false) && !endpoint.bound_sockets().is_empty();
+    if qad {
+        QAD_PROBES_TIMEOUT
+    } else {
+        Duration::ZERO
+    }
 }
 
 /// How long `endpoint`, freshly bound from `relay_config` (with
@@ -358,7 +363,10 @@ pub(crate) fn relay_entry(
 /// too. iroh's default QUIC transport settings are fine here: the probe only
 /// needs the relay link to come up, never a data path. Without IP transports
 /// iroh never probes QUIC address discovery, so the entry leaves it off.
-fn probe_endpoint_builder(relay_url: &RelayUrl, auth_token: Option<&str>) -> iroh::endpoint::Builder {
+fn probe_endpoint_builder(
+    relay_url: &RelayUrl,
+    auth_token: Option<&str>,
+) -> iroh::endpoint::Builder {
     let map = RelayMap::from_iter([relay_entry(relay_url, auth_token, false)]);
     // iroh 1.x requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
@@ -573,7 +581,9 @@ impl EndpointSlot {
     /// A clone of the endpoint, unless it has been let go of or is closed.
     fn get(&self) -> Option<Endpoint> {
         let slot = self.0.lock().expect("endpoint slot lock");
-        slot.as_ref().filter(|endpoint| !endpoint.is_closed()).cloned()
+        slot.as_ref()
+            .filter(|endpoint| !endpoint.is_closed())
+            .cloned()
     }
 
     /// Let go of the endpoint, handing over the slot's handle to it.
@@ -800,7 +810,11 @@ mod tests {
     #[test]
     fn the_relay_map_holds_every_custom_relay_with_the_token_and_iroh_s_quic_addr_discovery() {
         let cfg = RelayConfig::from_urls_with_token(&two(), Some("secret".to_string())).unwrap();
-        assert_eq!(cfg.quic_addr_discovery(), Some(true), "on by default, as in iroh");
+        assert_eq!(
+            cfg.quic_addr_discovery(),
+            Some(true),
+            "on by default, as in iroh"
+        );
         let RelayMode::Custom(map) = cfg.relay_mode() else {
             panic!("custom relays give a custom relay map");
         };
@@ -809,9 +823,15 @@ mod tests {
             let url: RelayUrl = url.parse().unwrap();
             let relay = map.get(&url).unwrap();
             assert_eq!(relay.auth_token.as_deref(), Some("secret"));
-            assert_eq!(relay.quic.as_ref().map(|quic| quic.port), Some(iroh_default_qad_port(&url)));
+            assert_eq!(
+                relay.quic.as_ref().map(|quic| quic.port),
+                Some(iroh_default_qad_port(&url))
+            );
         }
-        assert!(matches!(RelayConfig::Default.relay_mode(), RelayMode::Default));
+        assert!(matches!(
+            RelayConfig::Default.relay_mode(),
+            RelayMode::Default
+        ));
     }
 
     #[test]
@@ -835,7 +855,12 @@ mod tests {
         let RelayMode::Custom(map) = cfg.relay_mode() else {
             panic!("custom relays give a custom relay map");
         };
-        assert!(map.get(&RELAY.parse::<RelayUrl>().unwrap()).unwrap().quic.is_some());
+        assert!(
+            map.get(&RELAY.parse::<RelayUrl>().unwrap())
+                .unwrap()
+                .quic
+                .is_some()
+        );
     }
 
     /// The settings constructor is the token constructor plus the QUIC
@@ -843,7 +868,10 @@ mod tests {
     #[test]
     fn from_settings_takes_the_quic_addr_discovery_setting_when_given() {
         let unset = RelayConfig::from_settings(&two(), Some("token".into()), None).unwrap();
-        assert_eq!(unset, RelayConfig::from_urls_with_token(&two(), Some("token".into())).unwrap());
+        assert_eq!(
+            unset,
+            RelayConfig::from_urls_with_token(&two(), Some("token".into())).unwrap()
+        );
         assert_eq!(unset.quic_addr_discovery(), Some(true));
         for enabled in [true, false] {
             let set = RelayConfig::from_settings(&two(), None, Some(enabled)).unwrap();
@@ -851,7 +879,10 @@ mod tests {
             // With the default relays there is nothing for it to apply to.
             assert!(RelayConfig::from_settings(&[], None, Some(enabled)).is_err());
         }
-        assert_eq!(RelayConfig::from_settings(&[], None, None).unwrap(), RelayConfig::Default);
+        assert_eq!(
+            RelayConfig::from_settings(&[], None, None).unwrap(),
+            RelayConfig::Default
+        );
         assert!(RelayConfig::from_settings(&[], Some("token".into()), None).is_err());
         assert!(RelayConfig::from_settings(&["not a url".to_string()], None, None).is_err());
     }
@@ -874,7 +905,10 @@ mod tests {
     fn a_relay_entry_carries_quic_addr_discovery_only_when_asked() {
         let url: RelayUrl = RELAY.parse().unwrap();
         let with = relay_entry(&url, Some("secret"), true);
-        assert_eq!(with.quic.map(|quic| quic.port), Some(iroh_default_qad_port(&url)));
+        assert_eq!(
+            with.quic.map(|quic| quic.port),
+            Some(iroh_default_qad_port(&url))
+        );
         assert_eq!(with.auth_token.as_deref(), Some("secret"));
         let without = relay_entry(&url, None, false);
         assert!(without.quic.is_none());
@@ -920,8 +954,9 @@ mod tests {
 
     #[test]
     fn a_single_custom_url_is_reduced_redundancy_mode() {
-        let cfg = RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("secret".to_string()))
-            .expect("one custom relay is accepted");
+        let cfg =
+            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("secret".to_string()))
+                .expect("one custom relay is accepted");
         assert!(cfg.is_custom());
         assert!(cfg.is_single_relay());
         assert_eq!(cfg.relay_auth_token(), Some("secret"));
@@ -943,7 +978,9 @@ mod tests {
             probed: 1,
             ..ProbeProgress::default()
         };
-        progress.failures.push((RELAY.parse().unwrap(), "down".to_string()));
+        progress
+            .failures
+            .push((RELAY.parse().unwrap(), "down".to_string()));
         assert!(progress.all_failed());
         let err = progress.all_failed_error().to_string();
         assert!(
@@ -977,7 +1014,8 @@ mod tests {
 
     #[test]
     fn custom_urls_with_token_trimmed() {
-        let cfg = RelayConfig::from_urls_with_token(&two(), Some("  secret\n".to_string())).unwrap();
+        let cfg =
+            RelayConfig::from_urls_with_token(&two(), Some("  secret\n".to_string())).unwrap();
         assert!(cfg.is_custom());
         assert_eq!(cfg.relay_auth_token(), Some("secret"));
         assert!(matches!(cfg.relay_mode(), RelayMode::Custom(_)));
@@ -1002,7 +1040,10 @@ mod tests {
         assert!(dbg.contains("<redacted>"), "unexpected Debug output: {dbg}");
         assert!(dbg.contains(RELAY), "urls missing from Debug output: {dbg}");
 
-        assert!(dbg.contains("quic_addr_discovery: true"), "unexpected Debug output: {dbg}");
+        assert!(
+            dbg.contains("quic_addr_discovery: true"),
+            "unexpected Debug output: {dbg}"
+        );
 
         let no_token = RelayConfig::from_urls(&two()).unwrap();
         assert!(format!("{no_token:?}").contains("auth_token: None"));
@@ -1032,7 +1073,9 @@ mod tests {
         tx.send_modify(|progress| {
             progress.probed = 2;
             for url in [RELAY, RELAY2] {
-                progress.failures.push((url.parse().unwrap(), "down".to_string()));
+                progress
+                    .failures
+                    .push((url.parse().unwrap(), "down".to_string()));
             }
         });
         drop(tx);
@@ -1044,7 +1087,8 @@ mod tests {
         .expect("no wait for the timeout")
         .expect_err("every relay failed");
         assert!(
-            err.to_string().contains("all 2 custom relays failed to come online"),
+            err.to_string()
+                .contains("all 2 custom relays failed to come online"),
             "unexpected error: {err}"
         );
         endpoint.close().await;
@@ -1082,7 +1126,10 @@ mod tests {
             .await
             .expect_err("never online");
         assert_took(started, RELAY_CONNECT_TIMEOUT + qad);
-        assert!(err.to_string().contains("after 13s"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("after 13s"),
+            "unexpected error: {err}"
+        );
 
         // A relay taken out at 5 s, the other relay probed fine at 6 s: the
         // window restarts at 5 s, two QAD waits wide.
@@ -1110,8 +1157,14 @@ mod tests {
             }
             () = probe => unreachable!(),
         };
-        assert_took(started, Duration::from_secs(5) + RELAY_CONNECT_TIMEOUT + 2 * qad);
-        assert!(err.to_string().contains("after 16s"), "unexpected error: {err}");
+        assert_took(
+            started,
+            Duration::from_secs(5) + RELAY_CONNECT_TIMEOUT + 2 * qad,
+        );
+        assert!(
+            err.to_string().contains("after 16s"),
+            "unexpected error: {err}"
+        );
         endpoint.close().await;
     }
 
@@ -1123,7 +1176,8 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let (probes, task) = RelayProbes::start(&endpoint, &RelayConfig::Default, &PendingCloses::new());
+        let (probes, task) =
+            RelayProbes::start(&endpoint, &RelayConfig::Default, &PendingCloses::new());
         assert!(task.is_none(), "no probe task for the default relays");
         assert!(probes.is_settled());
         // Settled from the start, without touching the network.
@@ -1170,8 +1224,14 @@ mod tests {
             .await
             .expect("stopped well before the relay timeout")
             .unwrap();
-        assert!(!probes.is_settled(), "the relay was never probed to the end");
-        assert!(closes.kept_count() >= 1, "the probe endpoint's close is kept");
+        assert!(
+            !probes.is_settled(),
+            "the relay was never probed to the end"
+        );
+        assert!(
+            closes.kept_count() >= 1,
+            "the probe endpoint's close is kept"
+        );
         tokio::time::timeout(crate::endpoint::ENDPOINT_CLOSE_TIMEOUT, closes.finished())
             .await
             .expect("and finish");
@@ -1187,7 +1247,9 @@ mod tests {
         let closes = PendingCloses::new();
         let probe = probe_relay(&url, None, &closes);
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), probe).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(300), probe)
+                .await
+                .is_err(),
             "still probing when dropped"
         );
         assert_eq!(closes.kept_count(), 1, "the probe endpoint is closing");

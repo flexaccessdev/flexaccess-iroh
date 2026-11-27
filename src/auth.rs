@@ -161,7 +161,11 @@ mod tests {
         // Bad base64.
         assert!(ClientKey::from_secret_str("ed25519-sec:!!!").is_err());
         // Wrong length.
-        let short = format!("{}{}", PRIVATE_KEY_PREFIX, URL_SAFE_NO_PAD.encode([0u8; 16]));
+        let short = format!(
+            "{}{}",
+            PRIVATE_KEY_PREFIX,
+            URL_SAFE_NO_PAD.encode([0u8; 16])
+        );
         assert!(ClientKey::from_secret_str(&short).is_err());
     }
 
@@ -170,15 +174,30 @@ mod tests {
         let key = ClientKey::generate().unwrap();
         let id = ephemeral_endpoint_id();
         let sig = key.sign_endpoint_id(CONTEXT, &id);
-        assert!(verify_endpoint_id_signature(&key.public_key(), CONTEXT, &id, &sig));
+        assert!(verify_endpoint_id_signature(
+            &key.public_key(),
+            CONTEXT,
+            &id,
+            &sig
+        ));
 
         // A different endpoint id (replay from another endpoint) fails.
         let other_id = ephemeral_endpoint_id();
-        assert!(!verify_endpoint_id_signature(&key.public_key(), CONTEXT, &other_id, &sig));
+        assert!(!verify_endpoint_id_signature(
+            &key.public_key(),
+            CONTEXT,
+            &other_id,
+            &sig
+        ));
 
         // A different key fails.
         let other_key = ClientKey::generate().unwrap();
-        assert!(!verify_endpoint_id_signature(&other_key.public_key(), CONTEXT, &id, &sig));
+        assert!(!verify_endpoint_id_signature(
+            &other_key.public_key(),
+            CONTEXT,
+            &id,
+            &sig
+        ));
 
         // A different application's context fails: the same key, id, and
         // signature never carry over between programs sharing the key format.
@@ -190,8 +209,17 @@ mod tests {
         ));
 
         // Garbage signatures fail instead of erroring.
-        assert!(!verify_endpoint_id_signature(&key.public_key(), CONTEXT, &id, "!!!"));
-        assert!(!verify_endpoint_id_signature(&key.public_key(), CONTEXT, &id, ""));
+        assert!(!verify_endpoint_id_signature(
+            &key.public_key(),
+            CONTEXT,
+            &id,
+            "!!!"
+        ));
+        assert!(!verify_endpoint_id_signature(
+            &key.public_key(),
+            CONTEXT,
+            &id,
+            ""
+        ));
     }
-
 }

@@ -100,7 +100,9 @@ impl PendingCloses {
             let closes = {
                 let mut kept = self.0.lock().expect("pending closes lock");
                 kept.retain(|(over, _)| !over.is_finished());
-                kept.iter().map(|(_, close)| close.clone()).collect::<Vec<_>>()
+                kept.iter()
+                    .map(|(_, close)| close.clone())
+                    .collect::<Vec<_>>()
             };
             if closes.is_empty() {
                 return;
@@ -139,9 +141,7 @@ pub async fn close_endpoint(endpoint: Endpoint, closes: &PendingCloses) {
         closes,
     );
     if !closed.await {
-        warn!(
-            "Endpoint {id} is slow to close; leaving it to finish in the background"
-        );
+        warn!("Endpoint {id} is slow to close; leaving it to finish in the background");
     }
 }
 
@@ -397,7 +397,10 @@ pub async fn create_endpoint(
     closes: &PendingCloses,
 ) -> Result<CreatedEndpoint> {
     relay_config.log_status();
-    let endpoint = builder.bind().await.context("Failed to create iroh endpoint")?;
+    let endpoint = builder
+        .bind()
+        .await
+        .context("Failed to create iroh endpoint")?;
     let (relays, probing) = RelayProbes::start(&endpoint, relay_config, closes);
     let mut cancelled = CloseIfCancelled::new(&endpoint, closes);
     if let Some((task, slot)) = probing {
@@ -499,7 +502,10 @@ mod tests {
                 .unwrap()
                 .with_quic_addr_discovery(enabled)
                 .unwrap();
-            let endpoint = endpoint_builder(&config, relay_only()).bind().await.unwrap();
+            let endpoint = endpoint_builder(&config, relay_only())
+                .bind()
+                .await
+                .unwrap();
             // Taking a relay out hands back the entry the map held for it.
             let entry = endpoint.remove_relay(&url).await.expect("in the relay map");
             assert_eq!(entry.quic.is_some(), enabled);
@@ -521,8 +527,14 @@ mod tests {
         };
         let with_ip = endpoint_builder(&on, ip.clone()).bind().await.unwrap();
         let without_ip = endpoint_builder(&on, relay_only()).bind().await.unwrap();
-        let default_with_ip = endpoint_builder(&RelayConfig::Default, ip).bind().await.unwrap();
-        let default_without_ip = endpoint_builder(&RelayConfig::Default, relay_only()).bind().await.unwrap();
+        let default_with_ip = endpoint_builder(&RelayConfig::Default, ip)
+            .bind()
+            .await
+            .unwrap();
+        let default_without_ip = endpoint_builder(&RelayConfig::Default, relay_only())
+            .bind()
+            .await
+            .unwrap();
         assert!(!with_ip.bound_sockets().is_empty());
         assert!(without_ip.bound_sockets().is_empty());
         assert!(!default_with_ip.bound_sockets().is_empty());
@@ -532,16 +544,28 @@ mod tests {
         assert_eq!(qad_wait(&off, &with_ip), Duration::ZERO);
         assert_eq!(qad_wait(&on, &without_ip), Duration::ZERO);
         // iroh's default relays serve QAD, so their endpoint waits on it too.
-        assert_eq!(qad_wait(&RelayConfig::Default, &default_with_ip), QAD_PROBES_TIMEOUT);
-        assert_eq!(qad_wait(&RelayConfig::Default, &default_without_ip), Duration::ZERO);
-        assert_eq!(online_timeout(&on, &with_ip), RELAY_CONNECT_TIMEOUT + QAD_PROBES_TIMEOUT);
+        assert_eq!(
+            qad_wait(&RelayConfig::Default, &default_with_ip),
+            QAD_PROBES_TIMEOUT
+        );
+        assert_eq!(
+            qad_wait(&RelayConfig::Default, &default_without_ip),
+            Duration::ZERO
+        );
+        assert_eq!(
+            online_timeout(&on, &with_ip),
+            RELAY_CONNECT_TIMEOUT + QAD_PROBES_TIMEOUT
+        );
         assert_eq!(online_timeout(&off, &with_ip), RELAY_CONNECT_TIMEOUT);
         assert_eq!(online_timeout(&on, &without_ip), RELAY_CONNECT_TIMEOUT);
         assert_eq!(
             online_timeout(&RelayConfig::Default, &default_with_ip),
             RELAY_CONNECT_TIMEOUT + QAD_PROBES_TIMEOUT
         );
-        assert_eq!(online_timeout(&RelayConfig::Default, &default_without_ip), RELAY_CONNECT_TIMEOUT);
+        assert_eq!(
+            online_timeout(&RelayConfig::Default, &default_without_ip),
+            RELAY_CONNECT_TIMEOUT
+        );
         with_ip.close().await;
         without_ip.close().await;
         default_with_ip.close().await;
@@ -565,7 +589,11 @@ mod tests {
         let runtimes = || {
             [
                 Builder::new_current_thread().enable_all().build().unwrap(),
-                Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap(),
+                Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap(),
             ]
         };
 
@@ -575,7 +603,12 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 done.send(()).unwrap();
             };
-            assert!(tear_down_runtime(runtime, teardown, Duration::from_secs(10), "test-teardown"));
+            assert!(tear_down_runtime(
+                runtime,
+                teardown,
+                Duration::from_secs(10),
+                "test-teardown"
+            ));
             finished.try_recv().expect("over when the call returns");
         }
 
@@ -587,10 +620,18 @@ mod tests {
                 // for it, this would give up and let the call report it over.
                 let _ = tokio::time::timeout(HELD, released).await;
                 // Needs the runtime alive: a timer, and a task on it.
-                tokio::spawn(tokio::time::sleep(Duration::from_millis(50))).await.unwrap();
-                done.send(std::thread::current().name().map(str::to_string)).unwrap();
+                tokio::spawn(tokio::time::sleep(Duration::from_millis(50)))
+                    .await
+                    .unwrap();
+                done.send(std::thread::current().name().map(str::to_string))
+                    .unwrap();
             };
-            assert!(!tear_down_runtime(runtime, teardown, Duration::from_millis(50), "test-teardown"));
+            assert!(!tear_down_runtime(
+                runtime,
+                teardown,
+                Duration::from_millis(50),
+                "test-teardown"
+            ));
             assert!(finished.try_recv().is_err(), "still tearing down");
             release.send(()).unwrap();
             let thread = finished
@@ -611,15 +652,25 @@ mod tests {
     fn a_blocked_runtime_does_not_stretch_the_teardown_wait() {
         use std::sync::mpsc;
 
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         // Runs first, once the runtime is driven, and blocks it until the
         // call is back. Were the call to wait for the runtime, this would
         // give up and let the teardown run, and the call report it over.
         let (release, released) = mpsc::channel::<()>();
-        runtime.spawn(async move { let _ = released.recv_timeout(HELD); });
+        runtime.spawn(async move {
+            let _ = released.recv_timeout(HELD);
+        });
         let (done, finished) = mpsc::channel();
         let teardown = async move { done.send(()).unwrap() };
-        assert!(!tear_down_runtime(runtime, teardown, Duration::from_millis(20), "test-teardown"));
+        assert!(!tear_down_runtime(
+            runtime,
+            teardown,
+            Duration::from_millis(20),
+            "test-teardown"
+        ));
         assert!(finished.try_recv().is_err(), "the runtime is still blocked");
         release.send(()).unwrap();
         finished
@@ -634,7 +685,10 @@ mod tests {
     fn a_teardown_without_its_thread_shuts_the_runtime_down_at_once() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         // Blocking work that goes on until the call is back. Were the call
         // to wait for it, it would give up and be over by then.
         let (running, is_running) = mpsc::channel();
@@ -655,7 +709,10 @@ mod tests {
             Err(std::io::Error::other("no threads left"))
         });
         assert!(!over);
-        assert!(finished.try_recv().is_err(), "did not wait for the blocking work");
+        assert!(
+            finished.try_recv().is_err(),
+            "did not wait for the blocking work"
+        );
         assert!(!ran.load(Ordering::SeqCst), "the teardown was not run");
         release.send(()).unwrap();
     }
@@ -664,10 +721,18 @@ mod tests {
     /// thread without one.
     #[test]
     fn a_teardown_runs_under_a_thread_name_with_a_nul_byte() {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let (done, finished) = mpsc::channel();
         let teardown = async move { done.send(()).unwrap() };
-        assert!(tear_down_runtime(runtime, teardown, Duration::from_secs(10), "test\0teardown"));
+        assert!(tear_down_runtime(
+            runtime,
+            teardown,
+            Duration::from_secs(10),
+            "test\0teardown"
+        ));
         finished.try_recv().expect("over when the call returns");
     }
 
@@ -741,7 +806,9 @@ mod tests {
         let waiting = closes.clone();
         let mut finished = tokio::spawn(async move { waiting.finished().await });
         assert!(
-            tokio::time::timeout(Duration::from_secs(60), &mut finished).await.is_err(),
+            tokio::time::timeout(Duration::from_secs(60), &mut finished)
+                .await
+                .is_err(),
             "the close is still running"
         );
         release.send(()).unwrap();
@@ -771,7 +838,9 @@ mod tests {
         let waiting = closes.clone();
         let mut finished = tokio::spawn(async move { waiting.finished().await });
         assert!(
-            tokio::time::timeout(Duration::from_secs(60), &mut finished).await.is_err(),
+            tokio::time::timeout(Duration::from_secs(60), &mut finished)
+                .await
+                .is_err(),
             "the close is still running, and still kept"
         );
         release.send(()).unwrap();
@@ -820,7 +889,9 @@ mod tests {
             release
         };
         async fn still_waiting(finished: &mut JoinHandle<()>) -> bool {
-            tokio::time::timeout(Duration::from_secs(60), finished).await.is_err()
+            tokio::time::timeout(Duration::from_secs(60), finished)
+                .await
+                .is_err()
         }
 
         // Two waiters at once.
@@ -829,8 +900,14 @@ mod tests {
         let (first, second) = (closes.clone(), closes.clone());
         let mut first = tokio::spawn(async move { first.finished().await });
         let mut second = tokio::spawn(async move { second.finished().await });
-        assert!(still_waiting(&mut first).await, "the close is still running");
-        assert!(still_waiting(&mut second).await, "for the second waiter too");
+        assert!(
+            still_waiting(&mut first).await,
+            "the close is still running"
+        );
+        assert!(
+            still_waiting(&mut second).await,
+            "for the second waiter too"
+        );
         release.send(()).unwrap();
         first.await.unwrap();
         second.await.unwrap();
@@ -839,12 +916,17 @@ mod tests {
         let closes = PendingCloses::new();
         let release = slow_close(&closes);
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), closes.finished()).await.is_err(),
+            tokio::time::timeout(Duration::from_secs(1), closes.finished())
+                .await
+                .is_err(),
             "the close is still running"
         );
         let again = closes.clone();
         let mut again = tokio::spawn(async move { again.finished().await });
-        assert!(still_waiting(&mut again).await, "and still is for the next wait");
+        assert!(
+            still_waiting(&mut again).await,
+            "and still is for the next wait"
+        );
         release.send(()).unwrap();
         again.await.unwrap();
     }

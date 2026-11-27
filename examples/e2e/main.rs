@@ -256,7 +256,10 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let authorized = flexaccess_keys::load_authorized_keys(&args.authorized_keys)
         .map_err(anyhow::Error::from)?;
     if authorized.is_empty() {
-        warn!("{} holds no keys; every client will be rejected", args.authorized_keys.display());
+        warn!(
+            "{} holds no keys; every client will be rejected",
+            args.authorized_keys.display()
+        );
     }
     let relay_config = args.relay.resolve()?;
     let secret = match &args.secret {
@@ -268,10 +271,8 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let builder = endpoint_builder(&relay_config, args.relay.options(true))
         .alpns(vec![ALPN.to_vec()])
         .secret_key(secret);
-    let CreatedEndpoint {
-        endpoint,
-        relays,
-    } = create_endpoint(&relay_config, builder, &PendingCloses::new()).await?;
+    let CreatedEndpoint { endpoint, relays } =
+        create_endpoint(&relay_config, builder, &PendingCloses::new()).await?;
     info!("Waiting for clients to connect");
 
     let authorized = Arc::new(authorized);
@@ -384,7 +385,9 @@ fn authenticate(
         .parse()
         .map_err(|e| format!("invalid endpoint id: {e}"))?;
     if claimed != *remote {
-        return Err(format!("claimed endpoint id {claimed} is not the connection's {remote}"));
+        return Err(format!(
+            "claimed endpoint id {claimed} is not the connection's {remote}"
+        ));
     }
     if !verify_endpoint_id_signature(&public, AUTH_CONTEXT, remote, signature) {
         return Err(format!("invalid signature for {public}"));
@@ -456,9 +459,19 @@ async fn exchange(
     );
     let conn = tokio::time::timeout(timeout, endpoint.connect(addr, ALPN))
         .await
-        .map_err(|_| anyhow::anyhow!("connection to {} timed out after {}s", args.server_id, timeout.as_secs()))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "connection to {} timed out after {}s",
+                args.server_id,
+                timeout.as_secs()
+            )
+        })?
         .context("connecting to the server")?;
-    info!("Connected to {} via {}", args.server_id, describe_paths(&conn));
+    info!(
+        "Connected to {} via {}",
+        args.server_id,
+        describe_paths(&conn)
+    );
 
     let id = endpoint.id();
     let signature = key.sign_endpoint_id(AUTH_CONTEXT, &id);
@@ -516,7 +529,9 @@ async fn report_quic_addr_discovery(label: &str, endpoint: &Endpoint, wait: Dura
     match answered {
         Ok(report) => info!(
             "{label}: QUIC address discovery answered (public address {})",
-            report.global_v4.map_or_else(|| "none".to_string(), |addr| addr.to_string())
+            report
+                .global_v4
+                .map_or_else(|| "none".to_string(), |addr| addr.to_string())
         ),
         Err(_) => info!(
             "{label}: QUIC address discovery did not answer within {}s",
@@ -547,7 +562,10 @@ async fn hold_open(conn: &Connection, args: &ClientArgs, hold: Duration) -> Resu
             .with_context(|| format!("echo #{echoes} failed (paths: {})", describe_paths(conn)))?;
         info!("Echo #{echoes} OK via {}", describe_paths(conn));
     }
-    info!("Held the connection open for {}s ({echoes} further echoes)", hold.as_secs());
+    info!(
+        "Held the connection open for {}s ({echoes} further echoes)",
+        hold.as_secs()
+    );
     Ok(())
 }
 
