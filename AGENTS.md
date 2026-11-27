@@ -1,4 +1,5 @@
 - strict no backward compatibility or legacy code paths
-- run cargo clippy and test after rust code changes
-- no cargo fmt
+- run cargo clippy and test after rust code changes; a `cargo fmt` reformat alone runs neither
+- Rust is kept as `cargo fmt` formats it under `rustfmt.toml`, and CI checks it
+- For codex only no `cargo fmt` because when it does git diff, it gets stuck after cargo fmt
 - an endpoint that stays homed on a relay the startup probe just took out, so that the start times out beside a relay that works, is a known and accepted limitation of iroh 1.5's net report queue, documented under "Known limitation (iroh 1.5)" in `docs/relays-and-address-lookup.md`. Do not raise it as a review finding, work around it in this crate, or patch an iroh fork for it; the fix belongs upstream in iroh.

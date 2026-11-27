@@ -140,8 +140,14 @@ mod tests {
             let relay: RelayUrl = relay.parse().unwrap();
             relay_healthz_url(&relay).unwrap().to_string()
         };
-        assert_eq!(healthz("https://relay.example.com"), "https://relay.example.com/healthz");
-        assert_eq!(healthz("https://relay.example.com/"), "https://relay.example.com/healthz");
+        assert_eq!(
+            healthz("https://relay.example.com"),
+            "https://relay.example.com/healthz"
+        );
+        assert_eq!(
+            healthz("https://relay.example.com/"),
+            "https://relay.example.com/healthz"
+        );
         assert_eq!(
             healthz("https://relay.example.com/vpn/"),
             "https://relay.example.com/vpn/healthz"
@@ -179,8 +185,9 @@ mod tests {
                     } else {
                         "404 Not Found"
                     };
-                    let response =
-                        format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
                     let _ = stream.write_all(response.as_bytes()).await;
                 });
             }
@@ -190,7 +197,11 @@ mod tests {
 
     #[tokio::test]
     async fn default_relays_have_nothing_to_check() {
-        assert!(probe_custom_relay_health(&RelayConfig::Default).await.is_empty());
+        assert!(
+            probe_custom_relay_health(&RelayConfig::Default)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -224,7 +235,11 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_relay_is_reported_as_not_working() {
         // Bind and drop a listener to get a port nothing listens on.
-        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
         let origin = spawn_http_server(&["/healthz"]).await;
         let config = RelayConfig::from_urls(&[origin, format!("http://{closed}")]).unwrap();
 

@@ -118,7 +118,9 @@ pub async fn fail_over_home_relay(
         .filter(|url| {
             let configured = urls.contains(url);
             if !configured {
-                log::error!("{url} was taken out at startup but is not a configured relay; ignoring it");
+                log::error!(
+                    "{url} was taken out at startup but is not a configured relay; ignoring it"
+                );
             }
             configured
         })
@@ -130,7 +132,10 @@ pub async fn fail_over_home_relay(
              every {}s: {}",
             out.len(),
             RELAY_RESTORE_INTERVAL.as_secs(),
-            out.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            out.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     let mut endpoint_relays = EndpointRelays {
@@ -217,7 +222,9 @@ impl EndpointRelays<'_> {
     /// Put `url` into the endpoint's relay map as it is configured.
     async fn insert(&self, url: &RelayUrl) {
         let entry = relay_entry(url, self.auth_token.as_deref(), self.quic_addr_discovery);
-        self.endpoint.insert_relay(url.clone(), Arc::new(entry)).await;
+        self.endpoint
+            .insert_relay(url.clone(), Arc::new(entry))
+            .await;
     }
 }
 
@@ -438,8 +445,12 @@ fn in_map(configured: &[RelayUrl], removed: &[RelayUrl]) -> Vec<RelayUrl> {
 /// The failover loop proper, generic over the status source and the relay
 /// map so tests can drive it with doubles. `out_at_start` are relays already
 /// out of the map when the loop starts.
-async fn run_failover<W, D, R>(mut watcher: W, describe: D, relays: &mut R, out_at_start: Vec<RelayUrl>)
-where
+async fn run_failover<W, D, R>(
+    mut watcher: W,
+    describe: D,
+    relays: &mut R,
+    out_at_start: Vec<RelayUrl>,
+) where
     W: Watcher,
     D: Fn(&W::Value) -> HomeRelay,
     R: FailoverRelays,
@@ -585,9 +596,19 @@ mod tests {
     /// What the loop did, with the (paused-clock) time since the test began.
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Action {
-        Remove { url: RelayUrl, at: Duration },
-        Nudge { url: RelayUrl, at: Duration },
-        Restore { url: RelayUrl, restored: bool, at: Duration },
+        Remove {
+            url: RelayUrl,
+            at: Duration,
+        },
+        Nudge {
+            url: RelayUrl,
+            at: Duration,
+        },
+        Restore {
+            url: RelayUrl,
+            restored: bool,
+            at: Duration,
+        },
     }
 
     #[derive(Clone)]
@@ -912,10 +933,7 @@ mod tests {
                 status.set(Status::DownOnA).ok();
             }
         };
-        tokio::join!(
-            run_for(&status, &mut relays, 300 * SEC),
-            flipper
-        );
+        tokio::join!(run_for(&status, &mut relays, 300 * SEC), flipper);
         assert_eq!(
             relays.actions(),
             vec![
@@ -1141,7 +1159,10 @@ mod tests {
             run_with_a_slow_restore(&mut relays, &status, after, flips, at + 100 * SEC).await;
             let warnings = warnings();
             assert_eq!(warnings.len(), 1, "{warnings:?}");
-            assert!(warnings[0].starts_with("No connected home relay"), "{warnings:?}");
+            assert!(
+                warnings[0].starts_with("No connected home relay"),
+                "{warnings:?}"
+            );
             assert_eq!(relays.map_changes(), Vec::new());
         }
     }
@@ -1165,11 +1186,19 @@ mod tests {
             }
         };
         tokio::join!(
-            run_for_with(&status, &mut relays, at + 20 * SEC, vec![relay_b(), relay_c()]),
+            run_for_with(
+                &status,
+                &mut relays,
+                at + 20 * SEC,
+                vec![relay_b(), relay_c()]
+            ),
             flips
         );
         let warnings = warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("Failing over to another relay"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("Failing over to another relay"),
+            "{warnings:?}"
+        );
     }
 }
